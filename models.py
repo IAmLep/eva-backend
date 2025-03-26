@@ -52,7 +52,7 @@ class Note(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     def __repr__(self):
-        return f"Note(id={self.id}, title={self.title[:20]}..., timestamp={self.timestamp})"
+        return f"Note(id={self.id}, title={self.title[:20] if len(self.title) > 20 else self.title}, timestamp={self.timestamp})"
 
 class User(Base):
     """Database model for users."""
@@ -77,7 +77,7 @@ class MessageRequest(BaseModel):
     model: str = "gemini-2.0-flash"  # Updated to latest model version
     
     class Config:
-        json_schema_extra = {"example": {"content": "Hello, how can I help you?"}}
+        schema_extra = {"example": {"content": "Hello, how can I help you?"}}
 
 class MessageResponse(BaseModel):
     """Schema for message responses."""
@@ -86,7 +86,7 @@ class MessageResponse(BaseModel):
     created_at: str
     
     class Config:
-        json_schema_extra = {"example": {"conversation_id": "123", "message": "Hi there!", "created_at": "2025-03-26T14:47:21Z"}}
+        schema_extra = {"example": {"conversation_id": "123", "message": "Hi there!", "created_at": "2025-03-26T14:47:21Z"}}
 
 class ConversationRequest(BaseModel):
     """Schema for conversation requests."""
@@ -111,7 +111,7 @@ class UserCreate(UserBase):
     password: str
     
     class Config:
-        json_schema_extra = {"example": {"username": "johndoe", "email": "john@example.com", "password": "securepassword"}}
+        schema_extra = {"example": {"username": "johndoe", "email": "john@example.com", "password": "securepassword"}}
 
 class UserResponse(UserBase):
     """Schema for user responses."""
@@ -120,5 +120,5 @@ class UserResponse(UserBase):
     created_at: datetime
     
     class Config:
-        orm_mode = True  # Keep the original orm_mode for compatibility
-        json_schema_extra = {"example": {"id": 1, "username": "johndoe", "email": "john@example.com", "is_active": True, "created_at": "2025-03-26T14:47:21"}}
+        orm_mode = True  # Older version of Pydantic
+        schema_extra = {"example": {"id": 1, "username": "johndoe", "email": "john@example.com", "is_active": True, "created_at": "2025-03-26T14:47:21"}}

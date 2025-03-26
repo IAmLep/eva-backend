@@ -13,6 +13,7 @@ python-multipart>=0.0.6
 cryptography>=40.0.0
 certifi>=2023.5.7
 bcrypt>=4.0.1
+passlib[bcrypt]>=1.7.4  # Added passlib with bcrypt extension
 
 # Configuration & Data Validation
 pydantic>=2.0.0
@@ -22,6 +23,7 @@ python-dotenv>=1.0.0
 # Database
 sqlalchemy>=2.0.0
 tenacity>=8.2.0
+aiosqlite>=0.17.0  # SQLite async database driver
 
 # Redis Caching
 redis>=4.5.0
@@ -31,7 +33,7 @@ google-generativeai>=0.3.0
 openai>=1.0.0
 
 # Google Cloud
-google-cloud-secret-manager>=2.16.0
+google-cloud-secret-manager>=2.16.0  # Corrected package name
 google-cloud-logging>=3.5.0
 google-cloud-storage>=2.9.0
 
@@ -39,6 +41,7 @@ google-cloud-storage>=2.9.0
 httpx>=0.24.0
 requests>=2.28.0
 websockets>=10.4
+aiofiles>=0.8.0  # Added for async file operations
 
 # Date & Time Handling
 python-dateutil>=2.8.2

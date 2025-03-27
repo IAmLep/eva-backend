@@ -23,7 +23,7 @@ def get_secret(secret_id, default_value=None):
     """Get secret preferably from environment variables, fallback to Secret Manager."""
     # Always check environment variables first
     env_value = os.getenv(secret_id)
-    if env_value is not None:
+    if (env_value is not None):
         return env_value
         
     # Only look in Secret Manager for truly sensitive secrets in production
@@ -163,6 +163,10 @@ class Settings(BaseSettings):
     })
     OAUTH_CLIENTS: Dict[str, Dict] = Field(default=OAUTH_CLIENTS)
     
+    # API settings
+    API_V1_PREFIX: str = Field(default="/api/v1")
+    DEBUG: bool = Field(default=os.getenv("DEBUG", "False").lower() == "true")
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -190,3 +194,23 @@ except Exception as e:
     print(f"Error during settings initialization: {e}")
     traceback.print_exc()
     sys.exit(1)
+
+class Settings:
+    # API settings
+    API_V1_PREFIX = "/api/v1"
+    
+    # Google Cloud settings
+    PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    
+    # Gemini API
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    
+    # Database
+    DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./app.db")
+    
+    # Security
+    SECRET_KEY = os.environ.get("SECRET_KEY", "dev_secret_key_replace_in_production")
+    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+
+settings = Settings()

@@ -1,216 +1,637 @@
-"""
-Configuration settings for the Eva LLM Application.
-"""
-import os
-import sys
-from dotenv import load_dotenv
-from pydantic_settings import BaseSettings
-from pydantic import Field
-from typing import Optional, List, Dict
-from google.cloud import secretmanager
-import secrets
-from functools import lru_cache
-import traceback
+import time
+import asyncio
+import logging
+import json
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+import uuid
 
-load_dotenv()
+from jose import JWTError
+import jwt
+import redis.asyncio as redis
+from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect, Header, status
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select, desc
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
+from pydantic import ValidationError, BaseModel
+from sqlalchemy.exc import SQLAlchemyError
 
-# Environment setup
-IS_PRODUCTION = os.getenv("ENVIRONMENT", "development") == "production"
-print(f"Running in {'production' if IS_PRODUCTION else 'development'} mode")
+from auth import verify_token, get_current_user
+from config import DEVICE_TOKEN, config
+from database import get_db, Message, ChatMessage, ConversationSummary, Conversation, User, Device
+from models import ChatMessage, ConversationSummary, MessageRequest, MessageResponse, ConversationRequest
+from schemas import ChatRequest, ChatResponse, SyncRequest, SyncResponse
+from exceptions import GeminiAPIError, AuthenticationError
+import google.generativeai as genai
+from rate_limiter import limiter, rate_limit
+from redis_manager import cache_conversation, get_cached_conversation
+from llm_service import generate_response, generate_streaming_response
+from websocket_manager import manager
 
-# Secret management - prioritize environment variables
-def get_secret(secret_id, default_value=None):
-    """Get secret preferably from environment variables, fallback to Secret Manager."""
-    # Always check environment variables first
-    env_value = os.getenv(secret_id)
-    if (env_value is not None):
-        return env_value
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Eva LLM API")
+
+router = APIRouter(tags=["chat"])
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, restrict this to specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup_event():
+    # Start the heartbeat task
+    asyncio.create_task(manager.broadcast_heartbeat())
+
+# Initialize the Gemini client.
+genai.configure(api_key=config.GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel(config.GEMINI_MODEL)
+chat_session = gemini_model.start_chat(history=[])
+
+# Create a Redis client instance.
+redis_client = redis.Redis(
+    host=config.REDIS_HOST, port=config.REDIS_PORT, db=0, decode_responses=True
+)
+
+class ChatRequest(BaseModel):
+    text: str
+    mode: str = "text"
+    device_id: str
+
+@app.post("/api/chat", response_model=MessageResponse)
+@rate_limit(limit=20, period=60)  # 20 requests per minute
+async def chat_endpoint(
+    message_request: MessageRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Session = Depends(get_db),
+    auth_data: Dict[str, Any] = Depends(verify_token)
+):
+    device_id = auth_data.get("sub")  # "sub" contains user/device ID in JWT tokens
+    
+    # Register device if not exists
+    device = db.query(Device).filter(Device.device_id == device_id).first()
+    if not device:
+        device = Device(device_id=device_id, device_name=f"Device-{device_id[:8]}")
+        db.add(device)
+        db.commit()
+    else:
+        # Update last sync time
+        device.last_sync = datetime.utcnow()
+        db.commit()
+    
+    # Get or create conversation
+    conversation_id = message_request.conversation_id
+    if conversation_id:
+        conversation = db.query(Conversation).filter(
+            Conversation.id == conversation_id
+        ).first()
         
-    # Only look in Secret Manager for truly sensitive secrets in production
-    if IS_PRODUCTION and secret_id in ["GEMINI_API_KEY", "SECRET_KEY", "OPENAI_API_KEY"]:
-        try:
-            client = secretmanager.SecretManagerServiceClient()
-            project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
-            if not project_id:
-                print(f"WARNING: GOOGLE_CLOUD_PROJECT not set, using hardcoded project ID")
-                project_id = "eva-ai-454545"  # Using your project ID
-            name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
-            response = client.access_secret_version(name=name)
-            return response.payload.data.decode("UTF-8")
-        except Exception as e:
-            print(f"Error retrieving secret {secret_id}: {e}")
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    else:
+        conversation = Conversation(
+            title=message_request.content[:50] if message_request.content else "New conversation",
+            last_synced_device=device_id
+        )
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+        conversation_id = conversation.id
     
-    return default_value
-
-# Generate a persistent SECRET_KEY or use environment variable
-SECRET_KEY = get_secret("SECRET_KEY", secrets.token_hex(32))
-
-# API Keys
-GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY", "")  # Added OpenAI API key
-
-# App settings
-APP_NAME = "Eva AI Assistant"
-DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", secrets.token_hex(8))
-
-# Database settings
-DB_CONNECTION_STRING = os.getenv("DATABASE_URL", os.getenv("database_url", "sqlite:///./sqlite.db"))
-if IS_PRODUCTION and not DB_CONNECTION_STRING:
-    DB_CONNECTION_STRING = "sqlite:////mnt/eva-memory/eva.db"
-
-# Redis settings - ONLY use environment variables, never secrets
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-# Fixed typo in env var name
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", os.getenv("REDIS_PASSOWRD", ""))
-
-# WebSocket settings
-WS_HEARTBEAT_INTERVAL = 30  # seconds
-
-# Token configuration
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
-JWT_ALGORITHM = "HS256"
-
-# OAuth2 client configuration
-OAUTH2_CLIENT_ID = os.getenv("OAUTH2_CLIENT_ID", "evacore-client")
-OAUTH2_CLIENT_SECRET = os.getenv("OAUTH2_CLIENT_SECRET", secrets.token_hex(24))
-
-# OAuth2 registered clients
-OAUTH_CLIENTS = {
-    OAUTH2_CLIENT_ID: {
-        "client_id": OAUTH2_CLIENT_ID,
-        "client_secret": OAUTH2_CLIENT_SECRET,
-        "client_name": "Eva Core Client",
-        "redirect_uris": [
-            "https://eva-ai-app.web.app/auth/callback",
-            "http://localhost:3000/auth/callback",
-            "app://eva-auth-callback"
-        ],
-        "grant_types": ["authorization_code", "refresh_token", "password"],
-        "response_types": ["code"],
-        "scope": "chat:read chat:write profile:read",
-        "token_endpoint_auth_method": "client_secret_basic"
-    }
-}
-
-# LLM settings
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")  # "gemini" or "openai"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
-
-class Settings(BaseSettings):
-    """Configuration settings for the application."""
-    # Database settings
-    DATABASE_URL: str = Field(default=DB_CONNECTION_STRING)
+    # Update conversation metadata
+    conversation.last_synced_device = device_id
+    conversation.updated_at = datetime.utcnow()
+    db.commit()
     
-    # Redis settings
-    REDIS_HOST: str = Field(default=REDIS_HOST)
-    REDIS_PORT: int = Field(default=REDIS_PORT)
-    REDIS_DB: int = Field(default=0)
-    REDIS_PASSWORD: str = Field(default=REDIS_PASSWORD)
-    REDIS_RETRY_ON_STARTUP: bool = Field(default=True)
-    REDIS_MAX_RETRIES: int = Field(default=5)
-    REDIS_RETRY_INTERVAL: int = Field(default=2)  # seconds
+    # Get conversation history
+    conversation_history = get_cached_conversation(str(conversation_id))
+    if not conversation_history:
+        messages = db.query(ChatMessage).filter(
+            ChatMessage.conversation_id == conversation_id
+        ).order_by(ChatMessage.created_at).all()
+        
+        conversation_history = [
+            {"role": msg.role, "content": msg.content} for msg in messages
+        ]
     
-    # Gemini AI
-    GEMINI_API_KEY: Optional[str] = Field(default=GEMINI_API_KEY)
-    GEMINI_MODEL: str = Field(default=GEMINI_MODEL)
-    GEMINI_MAX_TOKENS: int = Field(default=int(os.getenv("GEMINI_MAX_TOKENS", "150")))
-    GEMINI_TEMPERATURE: float = Field(default=float(os.getenv("GEMINI_TEMPERATURE", "0.7")))
-    GEMINI_TOP_P: float = Field(default=float(os.getenv("GEMINI_TOP_P", "1.0")))
+    # Save user message
+    user_message = ChatMessage(
+        conversation_id=conversation_id,
+        role="user",
+        content=message_request.content,
+        device_id=device_id
+    )
+    db.add(user_message)
+    db.commit()
     
-    # OpenAI
-    OPENAI_API_KEY: Optional[str] = Field(default=OPENAI_API_KEY)
-    OPENAI_MODEL: str = Field(default=OPENAI_MODEL)
-    OPENAI_MAX_TOKENS: int = Field(default=int(os.getenv("OPENAI_MAX_TOKENS", "150")))
-    OPENAI_TEMPERATURE: float = Field(default=float(os.getenv("OPENAI_TEMPERATURE", "0.7")))
+    # Add user message to history
+    conversation_history.append({"role": "user", "content": message_request.content})
     
-    # LLM settings
-    LLM_PROVIDER: str = Field(default=LLM_PROVIDER)
+    # Generate response using the LLM
+    llm_response = generate_response(conversation_history, message_request.model)
     
-    # Rate Limiting
-    RATELIMIT_PER_MINUTE: int = Field(default=60)
-    RATELIMIT_ENABLED: bool = Field(default=True)
-    RATELIMIT_STORAGE_URI: str = Field(default="memory://")
+    # Save assistant message
+    assistant_message = ChatMessage(
+        conversation_id=conversation_id,
+        role="assistant",
+        content=llm_response,
+        device_id="system"
+    )
+    db.add(assistant_message)
+    db.commit()
     
-    # Server
-    HOST: str = Field(default="0.0.0.0")
-    PORT: int = Field(default=8080)
-    DEBUG: bool = Field(default=not IS_PRODUCTION)
-    CORS_ORIGINS: List[str] = Field(default=["*"])
-    LOG_LEVEL: str = Field(default="info")
+    # Update conversation history and cache it
+    conversation_history.append({"role": "assistant", "content": llm_response})
+    background_tasks.add_task(cache_conversation, str(conversation_id), conversation_history)
     
-    # Authentication
-    SECRET_KEY: str = Field(default=SECRET_KEY)
-    JWT_ALGORITHM: str = Field(default=JWT_ALGORITHM)
-    JWT_EXPIRATION_DAYS: int = Field(default=30)
-    VERIFICATION_TIMEOUT: int = Field(default=300)
+    # Broadcast to other connected devices
+    background_tasks.add_task(
+        manager.broadcast_to_conversation,
+        str(conversation_id),
+        {
+            "type": "new_message",
+            "conversation_id": str(conversation_id),
+            "message": {
+                "role": "assistant",
+                "content": llm_response,
+                "created_at": datetime.utcnow().isoformat()
+            }
+        }
+    )
     
-    # Memory Management
-    MEMORY_CLEANUP_INTERVAL: int = Field(default=3600)  # seconds
-    MAX_MEMORY_AGE: int = Field(default=86400)  # seconds
-    
-    # OAuth2 Settings
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=ACCESS_TOKEN_EXPIRE_MINUTES)
-    REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=REFRESH_TOKEN_EXPIRE_DAYS)
-    OAUTH2_CLIENT_ID: str = Field(default=OAUTH2_CLIENT_ID)
-    OAUTH2_CLIENT_SECRET: str = Field(default=OAUTH2_CLIENT_SECRET)
-    OAUTH2_SCOPES: Dict[str, str] = Field(default={
-        "chat:read": "Read access to chat data",
-        "chat:write": "Write access to chat data",
-        "profile:read": "Read access to profile data"
-    })
-    OAUTH_CLIENTS: Dict[str, Dict] = Field(default=OAUTH_CLIENTS)
-    
-    # API settings
-    API_V1_PREFIX: str = Field(default="/api/v1")
-    DEBUG: bool = Field(default=os.getenv("DEBUG", "False").lower() == "true")
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
-        case_sensitive = True
+    return MessageResponse(
+        conversation_id=str(conversation_id),
+        message=llm_response,
+        created_at=datetime.utcnow().isoformat()
+    )
 
-@lru_cache()
-def get_settings():
-    """Get settings singleton instance."""
+@app.get("/api/conversations", response_model=List[ConversationRequest])
+async def get_conversations(
+    db: Session = Depends(get_db),
+    auth_data: Dict[str, Any] = Depends(verify_token)
+):
+    device_id = auth_data.get("sub")
+    
+    # Register device if not exists
+    device = db.query(Device).filter(Device.device_id == device_id).first()
+    if not device:
+        device = Device(device_id=device_id, device_name=f"Device-{device_id[:8]}")
+        db.add(device)
+        db.commit()
+    
+    # Get all conversations
+    conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).all()
+    
+    return [
+        ConversationRequest(
+            id=str(conv.id),
+            title=conv.title,
+            created_at=conv.created_at.isoformat(),
+            updated_at=conv.updated_at.isoformat()
+        ) for conv in conversations
+    ]
+
+@app.post("/api/voice", response_model=MessageResponse)
+@rate_limit(limit=5, period=60)  # 5 requests per minute - voice is more resource intensive
+async def voice_endpoint(
+    message_request: MessageRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(verify_token)
+):
+    # This is the same as chat_endpoint but could be optimized for voice interactions
+    # For now, we'll just call the chat endpoint
+    return await chat_endpoint(message_request, background_tasks, request, db, user_data)
+
+@app.websocket("/ws/voice/{conversation_id}")
+async def voice_websocket(
+    websocket: WebSocket, 
+    conversation_id: str,
+    device_id: str = None,
+    token: str = None
+):
+    if not device_id or not token:
+        await websocket.close(code=1008, reason="Missing device authentication")
+        return
+    
+    # Replace the direct token check with JWT verification
     try:
-        s = Settings()
-        print("Settings loaded successfully")
-        return s
+        # Verify token and extract device_id from it
+        payload = jwt.decode(token, config.SECRET_KEY, algorithms=[config.JWT_ALGORITHM])
+        token_device_id = payload.get("sub")
+        
+        # Verify the provided device_id matches the token
+        if token_device_id != device_id:
+            await websocket.close(code=1008, reason="Device ID mismatch")
+            return
+    except JWTError:
+        await websocket.close(code=1008, reason="Invalid token")
+        return
+    
+    # Accept the connection
+    await manager.connect(websocket, device_id)
+    manager.join_conversation(conversation_id, device_id)
+    
+    # Get DB session
+    db = next(get_db())
+    
+    try:
+        # Notify other devices about this connection
+        await manager.broadcast_to_conversation(
+            conversation_id,
+            {
+                "type": "device_connected",
+                "device_id": device_id,
+                "conversation_id": conversation_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+        
+        # Process messages
+        while True:
+            # Receive message from WebSocket
+            data = await websocket.receive_text()
+            message_data = json.loads(data)
+            
+            # Handle different message types
+            message_type = message_data.get("type", "")
+            
+            if message_type == "voice_input":
+                # Process voice input (text transcribed from voice)
+                user_input = message_data.get("content", "")
+                
+                # Get conversation history
+                conversation_history = get_cached_conversation(conversation_id)
+                if not conversation_history:
+                    messages = db.query(ChatMessage).filter(
+                        ChatMessage.conversation_id == conversation_id
+                    ).order_by(ChatMessage.created_at).all()
+                    
+                    conversation_history = [
+                        {"role": msg.role, "content": msg.content} for msg in messages
+                    ]
+                
+                # Save user message
+                user_message = ChatMessage(
+                    conversation_id=uuid.UUID(conversation_id),
+                    role="user",
+                    content=user_input,
+                    device_id=device_id
+                )
+                db.add(user_message)
+                db.commit()
+                
+                # Add to history
+                conversation_history.append({"role": "user", "content": user_input})
+                
+                # Broadcast user message to other devices
+                await manager.broadcast_to_conversation(
+                    conversation_id,
+                    {
+                        "type": "new_message",
+                        "conversation_id": conversation_id,
+                        "message": {
+                            "role": "user",
+                            "content": user_input,
+                            "device_id": device_id,
+                            "created_at": datetime.utcnow().isoformat()
+                        }
+                    }
+                )
+                
+                # Initialize full response for saving to database
+                full_response = ""
+                
+                # Generate streaming response
+                async def stream_callback(chunk):
+                    await manager.broadcast_to_conversation(
+                        conversation_id,
+                        {
+                            "type": "voice_chunk",
+                            "conversation_id": conversation_id,
+                            "content": chunk,
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                    )
+                
+                # Stream the response
+                async for chunk in generate_streaming_response(
+                    conversation_history, 
+                    message_data.get("model", "gemini-1.5-flash"),
+                    stream_callback
+                ):
+                    full_response += chunk
+                
+                # Save the complete assistant response to database
+                assistant_message = ChatMessage(
+                    conversation_id=uuid.UUID(conversation_id),
+                    role="assistant",
+                    content=full_response,
+                    device_id="system"
+                )
+                db.add(assistant_message)
+                db.commit()
+                
+                # Update conversation history and cache
+                conversation_history.append({"role": "assistant", "content": full_response})
+                cache_conversation(conversation_id, conversation_history)
+                
+                # Update conversation metadata
+                conversation = db.query(Conversation).filter(
+                    Conversation.id == uuid.UUID(conversation_id)
+                ).first()
+                if conversation:
+                    conversation.last_synced_device = device_id
+                    conversation.updated_at = datetime.utcnow()
+                    db.commit()
+                
+                # Send complete message notification
+                await manager.broadcast_to_conversation(
+                    conversation_id,
+                    {
+                        "type": "voice_response_complete",
+                        "conversation_id": conversation_id,
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                )
+                
+            elif message_type == "heartbeat":
+                # Respond to heartbeat
+                await websocket.send_json({
+                    "type": "heartbeat_ack",
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                
+            elif message_type == "leave":
+                # Leave conversation
+                break
+                
+    except WebSocketDisconnect:
+        # Handle disconnection
+        manager.disconnect(device_id)
+        manager.leave_conversation(conversation_id, device_id)
+        await manager.broadcast_to_conversation(
+            conversation_id,
+            {
+                "type": "device_disconnected",
+                "device_id": device_id,
+                "conversation_id": conversation_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+    
+    finally:
+        # Clean up
+        db.close()
+        manager.disconnect(device_id)
+        manager.leave_conversation(conversation_id, device_id)
+
+# Create a helper function to verify devices
+async def verify_device(device_id: str) -> bool:
+    """Verify a device is registered and authorized"""
+    key = f"device:{device_id}"
+    device_data_json = await redis_client.get(key)
+    if not device_data_json:
+        logger.warning(f"Unauthorized device: {device_id}")
+        return False
+    
+    device_data = json.loads(device_data_json)
+    if not device_data.get("verified"):
+        logger.warning(f"Device not verified: {device_id}")
+        return False
+    
+    return True
+
+@router.post("/chat", response_model=ChatResponse)
+@limiter.limit("5/minute")
+async def chat_endpoint(
+    request: Request,
+    request_data: ChatRequest,
+    token: str = Depends(verify_token),
+    db: AsyncSession = Depends(get_db)
+) -> ChatResponse:
+    """
+    Handle chat requests by sending user text to the Gemini API.
+    Uses token-based authentication.
+    """
+    try:
+        logger.debug(f"Received chat request with text: {request_data.text}")
+        user_text = request_data.text.strip()
+        if not user_text:
+            raise HTTPException(status_code=400, detail="Empty message not allowed.")
+        
+        # Check that the device is verified.
+        key = f"device:{request_data.device_id}"
+        device_data_json = await redis_client.get(key)
+        if not device_data_json:
+            logger.warning(f"Unauthorized device: {request_data.device_id}")
+            raise AuthenticationError(detail="Device not authorized")
+        device_data = json.loads(device_data_json)
+        if not device_data.get("verified"):
+            logger.warning(f"Device not verified: {request_data.device_id}")
+            raise AuthenticationError(detail="Device not authorized")
+        
+        timestamp = int(time.time() * 1000)
+        
+        # Save the user message.
+        new_message = ChatMessage(message=user_text, is_user=True, timestamp=timestamp)
+        db.add(new_message)
+        
+        # Retrieve conversation summaries.
+        scalar_result = await db.execute(select(ConversationSummary))
+        summaries = scalar_result.scalars().all()
+        aggregated_memory = "; ".join([f"{s.label}: {s.summary}" for s in summaries]) if summaries else ""
+        logger.debug(f"Aggregated memory: {aggregated_memory}")
+        
+        # Build the prompt for the Gemini API.
+        prompt = f"Remember: {aggregated_memory}\nUser: {user_text}" if aggregated_memory else f"User: {user_text}"
+        logger.debug(f"Constructed prompt: {prompt}")
+        
+        # Call the Gemini API asynchronously.
+        ai_response = await call_gemini_text_async(prompt)
+        logger.debug(f"Received AI response: {ai_response}")
+        
+        # Save the assistant's message.
+        new_assistant_message = ChatMessage(message=ai_response, is_user=False, timestamp=timestamp)
+        db.add(new_assistant_message)
+        await db.commit()
+        logger.info("Chat messages saved successfully.")
+        
+        return ChatResponse(answer=ai_response, memory_updated=False)
+    except HTTPException as http_ex:
+        raise http_ex
+    except ValidationError as validation_error:
+        logger.error(f"Validation Error: {validation_error}", exc_info=True)
+        raise HTTPException(status_code=422, detail=validation_error.errors()) from validation_error
+    except SQLAlchemyError as e:
+        logger.error(f"Database error in chat endpoint: {e}", exc_info=True)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}") from e
+    except GeminiAPIError as e:
+        logger.error(f"Gemini API error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Gemini API error: {e}") from e
     except Exception as e:
-        print(f"Error loading settings: {e}")
-        traceback.print_exc()
-        sys.exit(1)
+        logger.error(f"Error in chat endpoint: {e}", exc_info=True)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="Internal Server Error in chat endpoint") from e
 
-# Initialize settings
-try:
-    settings = get_settings()
-    # For backward compatibility
-    config = settings
-except Exception as e:
-    print(f"Error during settings initialization: {e}")
-    traceback.print_exc()
-    sys.exit(1)
+async def call_gemini_text_async(prompt: str) -> str:
+    """Call the Gemini API for a text response asynchronously."""
+    logger.debug(f"Calling Gemini API with prompt: {prompt}")
+    try:
+        response = await asyncio.to_thread(chat_session.send_message, prompt)
+        answer = response.text
+        logger.debug(f"Gemini API returned answer: {answer}")
+        return answer
+    except Exception as e:
+        logger.error(f"Error calling Gemini API: {e}", exc_info=True)
+        raise GeminiAPIError(detail=f"Error calling Gemini API: {e}")
 
-class Settings:
-    # API settings
-    API_V1_PREFIX = "/api/v1"
-    
-    # Google Cloud settings
-    PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    
-    # Gemini API
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-    GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-    
-    # Database
-    DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./app.db")
-    
-    # Security
-    SECRET_KEY = os.environ.get("SECRET_KEY", "dev_secret_key_replace_in_production")
-    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+async def periodic_memory_sync() -> None:
+    """
+    Periodically synchronize conversation memory.
+    """
+    while True:
+        logger.debug("Running periodic memory sync.")
+        await asyncio.sleep(3600)
 
-settings = Settings()
+@router.post("/sync", response_model=SyncResponse)
+async def sync_device(
+    sync_request: SyncRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Synchronize data between device and backend
+    """
+    try:
+        # Get last sync timestamp from device
+        last_sync = sync_request.last_sync_timestamp
+        
+        # Fetch conversations updated since last sync
+        updated_conversations = await db.get_conversations_since(
+            user_id=current_user.id,
+            since_timestamp=last_sync
+        )
+        
+        # Fetch user settings updated since last sync
+        updated_settings = await db.get_settings_since(
+            user_id=current_user.id,
+            since_timestamp=last_sync
+        )
+        
+        # Process any pending updates from the device
+        if sync_request.local_changes:
+            await db.apply_device_changes(
+                user_id=current_user.id,
+                device_id=sync_request.device_id,
+                changes=sync_request.local_changes
+            )
+        
+        # Get current server timestamp for next sync
+        current_timestamp = datetime.utcnow().isoformat()
+        
+        return SyncResponse(
+            conversations=updated_conversations,
+            settings=updated_settings,
+            server_timestamp=current_timestamp
+        )
+    except Exception as e:
+        logger.error(f"Sync error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Synchronization failed"
+        )
+
+# Define request models
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+# Define response models
+class ChatResponse(BaseModel):
+    response: str
+    conversation_id: str
+
+# Test endpoint
+@router.get("/hello")
+async def hello():
+    """Simple test endpoint to verify API is working."""
+    return {"message": "Hello from Eva!"}
+
+# Basic chat endpoint
+@router.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Process a chat request and return a response."""
+    try:
+        # Simple mock response for now
+        return {
+            "response": f"You said: {request.message}",
+            "conversation_id": request.conversation_id or "new_conversation_123"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat processing error: {str(e)}")
+
+# Get logger
+logger = logging.getLogger()
+
+# Create router
+router = APIRouter()
+
+# Models
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    conversation_id: str
+
+# Test endpoint
+@router.get("/hello")
+async def hello():
+    logger.info("Test endpoint called")
+    return {"message": "Eva AI Assistant is operational"}
+
+# Chat endpoint
+@router.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    try:
+        logger.info(f"Processing chat request with message: '{request.message[:30]}...'")
+        
+        # Placeholder for actual implementation
+        # This will be replaced with your LLM service call
+        
+        response = {
+            "response": f"Echo: {request.message}",
+            "conversation_id": request.conversation_id or "new_conversation"
+        }
+        
+        logger.info(f"Successfully processed chat request")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error processing chat request: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+from fastapi import APIRouter, HTTPException, Depends
+# ...other imports...
+
+# Create router with tags for documentation
+router = APIRouter(tags=["chat"])
+
+# Example simple test endpoint
+@router.get("/hello")
+async def hello():
+    """Test endpoint to verify API is working."""
+    return {"message": "Hello from Eva!"}
+
+# Your other endpoints...

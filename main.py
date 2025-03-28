@@ -8,6 +8,10 @@ import time
 from database import initialize_database, init_db, engine, Base
 from api import router as chat_router, periodic_memory_sync
 from api_sync import router as sync_router
+from auth_router import router as auth_router
+from secrets_router import router as secrets_router
+from rate_limiter import setup_limiter
+from error_middleware import setup_error_handlers
 
 # Configure structured logging for Google Cloud
 class CloudRunFormatter(logging.Formatter):
@@ -34,14 +38,34 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Configure CORS
+# Configure CORS - restrict to specific origins in production
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    "https://eva-app.example.com",  # Change to your actual domain
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust for production
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-Device-Token"],
 )
+
+# Add security headers middleware
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    
+    # Add security headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    
+    return response
 
 # Add logging middleware
 @app.middleware("http")
@@ -64,6 +88,14 @@ async def health_check():
 # Include routers with proper API versioning
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(sync_router, prefix="/api/v1/sync", tags=["sync"])
+app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(secrets_router, prefix="/api/v1/secrets", tags=["secrets"])
+
+# Set up rate limiter
+setup_limiter(app)
+
+# Set up error handlers
+setup_error_handlers(app)
 
 # Initialize database on startup
 @app.on_event("startup")

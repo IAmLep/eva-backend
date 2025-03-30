@@ -87,7 +87,7 @@ class DeviceAuthRequest(BaseModel):
     """Request for device authentication."""
     device_id: str
     device_name: str
-    device_model: Optional[str] = None
+    device_model: Optional[str] = None  # Keep this for backward compatibility, but don't use it
     initial_secret: str
     
     class Config:

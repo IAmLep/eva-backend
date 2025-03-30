@@ -6,14 +6,14 @@ from datetime import datetime, timedelta
 
 from jose import JWTError
 import jwt
-import redis.asyncio as redis
 from fastapi import APIRouter, HTTPException, Depends, Form, Request, Response, status, Header
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from config import REDIS_HOST, REDIS_PORT, SECRET_KEY, JWT_ALGORITHM, VERIFICATION_TIMEOUT
+from config import SECRET_KEY, JWT_ALGORITHM, VERIFICATION_TIMEOUT
+from config import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from schemas import AuthRequest
 from auth import (
     verify_token, create_access_token, create_refresh_token, Token,
@@ -22,26 +22,109 @@ from auth import (
 )
 from rate_limiter import limiter, rate_limit
 from database import get_db, Device
-from sqlalchemy.ext.asyncio import AsyncSession
-from redis_manager import get_redis_client
+from sqlalchemy.orm import Session
+from firestore_manager import store_document, get_document, delete_document
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Create a Redis client instance.
-redis_client = get_redis_client()
-
 # Apply rate limiting to auth endpoints
 auth_limiter = Limiter(key_func=get_remote_address, default_limits=["5/minute"])
 
-# Helper function to store device data.
+# Collection names for Firestore
+DEVICES_COLLECTION = "devices"
+VERIFICATIONS_COLLECTION = "verifications"
+TOKENS_COLLECTION = "tokens"
+
+# Helper function to store device data in Firestore
 async def store_device_data(device_id: str, data: Dict[str, Any]) -> None:
     try:
-        await redis_client.set(f"device:{device_id}", json.dumps(data))
+        # Include timestamp for TTL if needed
+        data["updated_at"] = datetime.utcnow().isoformat()
+        await store_document(DEVICES_COLLECTION, device_id, data)
         logger.info(f"Stored device data for device: {device_id}")
     except Exception as e:
         logger.error(f"Error storing device data: {e}")
+
+# Helper function to get device data from Firestore
+async def get_device_data(device_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        data = await get_document(DEVICES_COLLECTION, device_id)
+        return data
+    except Exception as e:
+        logger.error(f"Error retrieving device data: {e}")
+        return None
+
+# Helper function to store verification code with expiry
+async def store_verification_code(device_id: str, code: str, expires_in_seconds: int) -> None:
+    try:
+        expiry = datetime.utcnow() + timedelta(seconds=expires_in_seconds)
+        data = {
+            "code": code,
+            "expires_at": expiry.isoformat(),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        await store_document(VERIFICATIONS_COLLECTION, device_id, data)
+        logger.info(f"Stored verification code for device: {device_id}")
+    except Exception as e:
+        logger.error(f"Error storing verification code: {e}")
+
+# Helper function to get and validate verification code
+async def get_verification_code(device_id: str) -> Optional[str]:
+    try:
+        data = await get_document(VERIFICATIONS_COLLECTION, device_id)
+        if not data:
+            return None
+            
+        # Check if expired
+        expires_at = datetime.fromisoformat(data["expires_at"])
+        if datetime.utcnow() > expires_at:
+            # Clean up expired code
+            await delete_document(VERIFICATIONS_COLLECTION, device_id)
+            return None
+            
+        return data["code"]
+    except Exception as e:
+        logger.error(f"Error retrieving verification code: {e}")
+        return None
+
+# Helper function to store token data
+async def store_token_data(token_type: str, device_id: str, token: str, expires_in_seconds: int) -> None:
+    try:
+        expiry = datetime.utcnow() + timedelta(seconds=expires_in_seconds)
+        data = {
+            "token": token,
+            "expires_at": expiry.isoformat(),
+            "created_at": datetime.utcnow().isoformat(),
+            "device_id": device_id,
+            "type": token_type
+        }
+        doc_id = f"{token_type}:{device_id}"
+        await store_document(TOKENS_COLLECTION, doc_id, data)
+        logger.info(f"Stored {token_type} token for device: {device_id}")
+    except Exception as e:
+        logger.error(f"Error storing token data: {e}")
+
+# Helper function to get token data
+async def get_token_data(token_type: str, device_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        doc_id = f"{token_type}:{device_id}"
+        data = await get_document(TOKENS_COLLECTION, doc_id)
+        if not data:
+            return None
+            
+        # Check if expired
+        expires_at = datetime.fromisoformat(data["expires_at"])
+        if datetime.utcnow() > expires_at:
+            # Clean up expired token
+            await delete_document(TOKENS_COLLECTION, doc_id)
+            return None
+            
+        return data
+    except Exception as e:
+        logger.error(f"Error retrieving token data: {e}")
+        return None
 
 # Model for device registration
 class DeviceRegistration(BaseModel):
@@ -60,7 +143,7 @@ class RefreshRequest(BaseModel):
 # UPDATED PATH: Changed from /device/auth to /device to match versioned path
 @router.post("/device", response_model=DeviceToken)
 @rate_limit(limit=3, period=60)  # Strict rate limiting for authentication
-async def authenticate_device(request: DeviceAuthRequest, db: AsyncSession = Depends(get_db)):
+async def authenticate_device(request: DeviceAuthRequest, db: Session = Depends(get_db)):
     """
     Authenticate a device using the initial secret and issue a long-lived device token.
     """
@@ -81,24 +164,27 @@ async def authenticate_device(request: DeviceAuthRequest, db: AsyncSession = Dep
     )
     
     # Store device info in database
-    device = await db.query(Device).filter(Device.device_id == request.device_id).first()
+    device = db.query(Device).filter(Device.device_id == request.device_id).first()
     
     if not device:
+        # Only use fields that exist in the Device model
         device = Device(
             device_id=request.device_id,
-            device_name=request.device_name,
-            device_model=request.device_model,
-            token_jti=jti
+            device_name=request.device_name
         )
         db.add(device)
     else:
         device.device_name = request.device_name
         device.last_sync = datetime.utcnow()
-        device.token_jti = jti
-        if request.device_model:
-            device.device_model = request.device_model
     
-    await db.commit()
+    db.commit()
+    
+    # Store token JTI in Firestore
+    await store_document(TOKENS_COLLECTION, f"jti:{request.device_id}", {
+        "jti": jti,
+        "created_at": datetime.utcnow().isoformat(),
+        "expires_at": expire.isoformat()
+    })
     
     logger.info(f"Device authenticated successfully: {request.device_id}")
     
@@ -132,7 +218,7 @@ async def validate_device(
 @rate_limit(limit=5, period=60)
 async def revoke_device_token(
     token: str = Header(..., description="Device token to revoke"),
-    db: AsyncSession = Depends(get_db)
+    db: Session = Depends(get_db)
 ):
     """
     Revoke a device token.
@@ -157,10 +243,10 @@ async def revoke_device_token(
     
     # Update device record if found
     if validation.device_id:
-        device = await db.query(Device).filter(Device.device_id == validation.device_id).first()
+        device = db.query(Device).filter(Device.device_id == validation.device_id).first()
         if device:
             device.is_active = False
-            await db.commit()
+            db.commit()
     
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -175,14 +261,10 @@ async def register_device(device: DeviceRegistration) -> Dict[str, Any]:
     # Generate a verification code
     verification_code = "".join([str(secrets.randbelow(10)) for _ in range(6)])
     
-    # Store the code in Redis with expiry
-    await redis_client.setex(
-        f"verify:{device.device_id}",
-        VERIFICATION_TIMEOUT,
-        verification_code
-    )
+    # Store the code with expiry
+    await store_verification_code(device.device_id, verification_code, VERIFICATION_TIMEOUT)
     
-    # Store device info in Redis
+    # Store device info
     await store_device_data(
         device.device_id, 
         {
@@ -200,29 +282,32 @@ async def register_device(device: DeviceRegistration) -> Dict[str, Any]:
     }
 
 @router.post("/verify", response_model=Token)
-async def verify_device(verification: VerificationRequest, db: AsyncSession = Depends(get_db)) -> Token:
+async def verify_device(verification: VerificationRequest, db: Session = Depends(get_db)):
     """
     Verify the provided code and issue OAuth2 tokens
     """
-    stored_code = await redis_client.get(f"verify:{verification.device_id}")
+    stored_code = await get_verification_code(verification.device_id)
+    
     if not stored_code or stored_code != verification.code:
         raise HTTPException(status_code=401, detail="Invalid verification code")
     
-    # Mark the device as verified in Redis
-    await store_device_data(verification.device_id, {"verified": True})
+    # Mark the device as verified
+    device_data = await get_device_data(verification.device_id) or {}
+    device_data["verified"] = True
+    await store_device_data(verification.device_id, device_data)
     
     # Clean up the verification code
-    await redis_client.delete(f"verify:{verification.device_id}")
+    await delete_document(VERIFICATIONS_COLLECTION, verification.device_id)
     
     # Register device in database if not exists
-    device = await db.query(Device).filter(Device.device_id == verification.device_id).first()
+    device = db.query(Device).filter(Device.device_id == verification.device_id).first()
     if not device:
         device = Device(
             device_id=verification.device_id, 
             device_name=f"Device-{verification.device_id[:8]}"
         )
         db.add(device)
-        await db.commit()
+        db.commit()
     
     # Generate tokens
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -235,11 +320,12 @@ async def verify_device(verification: VerificationRequest, db: AsyncSession = De
         data={"sub": verification.device_id}
     )
     
-    # Store refresh token in Redis for later validation
-    await redis_client.setex(
-        f"refresh:{verification.device_id}",
-        REFRESH_TOKEN_EXPIRE_DAYS * 86400,  # Convert days to seconds
-        refresh_token
+    # Store refresh token with expiry
+    await store_token_data(
+        "refresh", 
+        verification.device_id, 
+        refresh_token, 
+        REFRESH_TOKEN_EXPIRE_DAYS * 86400  # Convert days to seconds
     )
     
     return Token(
@@ -257,16 +343,15 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     # In a real implementation, you would validate username/password
     # For this simplified version, we'll check if the device is verified
     device_id = form_data.username
-    device_data_json = await redis_client.get(f"device:{device_id}")
+    device_data = await get_device_data(device_id)
     
-    if not device_data_json:
+    if not device_data:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Device not registered",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    device_data = json.loads(device_data_json)
     if not device_data.get("verified", False):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -285,11 +370,12 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         data={"sub": device_id}
     )
     
-    # Store refresh token
-    await redis_client.setex(
-        f"refresh:{device_id}",
-        REFRESH_TOKEN_EXPIRE_DAYS * 86400,
-        refresh_token
+    # Store refresh token with expiry
+    await store_token_data(
+        "refresh", 
+        device_id, 
+        refresh_token, 
+        REFRESH_TOKEN_EXPIRE_DAYS * 86400  # Convert days to seconds
     )
     
     return Token(
@@ -325,8 +411,9 @@ async def refresh_access_token(refresh_request: RefreshRequest) -> Token:
             raise credentials_exception
         
         # Verify refresh token against stored token
-        stored_refresh_token = await redis_client.get(f"refresh:{device_id}")
-        if not stored_refresh_token or stored_refresh_token != refresh_request.refresh_token:
+        token_data = await get_token_data("refresh", device_id)
+        
+        if not token_data or token_data.get("token") != refresh_request.refresh_token:
             raise credentials_exception
         
         # Generate new access token

@@ -12,14 +12,10 @@ class Settings(BaseSettings):
     # Database settings
     DATABASE_URL: str = "sqlite+aiosqlite:///./evacore.db"
     
-    # Redis
-    REDIS_HOST: str = Field(default="localhost")
-    REDIS_PORT: int = Field(default=6379)
-    REDIS_DB: int = Field(default=0)
-    REDIS_PASSWORD: Optional[str] = Field(default="")  # Changed from None to empty string
-    REDIS_RETRY_ON_STARTUP: bool = Field(default=True)
-    REDIS_MAX_RETRIES: int = Field(default=5)
-    REDIS_RETRY_INTERVAL: int = Field(default=2)  # seconds
+    # Firestore Settings (replacing Redis)
+    FIRESTORE_PROJECT_ID: Optional[str] = Field(default=None)  # Optional explicit project ID
+    FIRESTORE_COLLECTION_PREFIX: str = Field(default="eva_")
+    FIRESTORE_EMULATOR_HOST: Optional[str] = Field(default=None)  # For local development
     
     # Gemini AI
     GEMINI_API_KEY: str = Field(default=os.getenv("GEMINI_API_KEY"))
@@ -50,6 +46,9 @@ class Settings(BaseSettings):
     MEMORY_CLEANUP_INTERVAL: int = Field(default=3600)  # seconds
     MAX_MEMORY_AGE: int = Field(default=86400)  # seconds
     
+    # Cache Settings
+    CACHE_DURATION: int = Field(default=300)  # 5 minutes
+    
     # OAuth2 Settings
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30)
     REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=30)
@@ -73,4 +72,4 @@ if __name__ == "__main__":
     print("Settings loaded successfully:")
     print(f"Host: {settings.HOST}")
     print(f"Port: {settings.PORT}")
-    print(f"Redis: {settings.REDIS_HOST}:{settings.REDIS_PORT}")
+    print(f"Firestore Collection Prefix: {settings.FIRESTORE_COLLECTION_PREFIX}")

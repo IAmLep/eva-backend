@@ -57,7 +57,7 @@ chat_session = gemini_model.start_chat(history=[])
 # Create a Redis client instance.
 redis_client = get_redis_client()
 
-@app.post("/api/chat", response_model=MessageResponse)
+@router.post("/chat", response_model=MessageResponse)
 @rate_limit(limit=20, period=60)  # 20 requests per minute
 async def chat_endpoint(
     message_request: MessageRequest,

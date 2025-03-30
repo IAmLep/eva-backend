@@ -88,7 +88,7 @@ async def health_check():
 # Include routers with proper API versioning
 app.include_router(chat_router, prefix="/api")  # Changed from /api/v1
 app.include_router(sync_router, prefix="/api/sync", tags=["sync"])  # Changed from /api/v1/sync
-app.include_router(auth_router, prefix="/auth", tags=["auth"])  # Changed from /api/v1/auth
+app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])  # Changed from /api/v1/auth
 app.include_router(secrets_router, prefix="/api/secrets", tags=["secrets"])  # Changed from /api/v1/secrets
 
 # Set up rate limiter

@@ -8,7 +8,6 @@ import uuid
 
 from jose import JWTError
 import jwt
-import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, desc
@@ -18,14 +17,15 @@ from pydantic import ValidationError, BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 
 from auth import verify_token, get_current_user
-from config import SECRET_KEY, JWT_ALGORITHM, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD, GEMINI_API_KEY, GEMINI_MODEL
+from config import SECRET_KEY, JWT_ALGORITHM, GEMINI_API_KEY, GEMINI_MODEL
 from database import get_db, Message, ChatMessage, ConversationSummary, Conversation, User, Device
 from models import MessageRequest, MessageResponse, ConversationRequest
 from schemas import ChatRequest, ChatResponse, SyncRequest, SyncResponse
 from exceptions import GeminiAPIError, AuthenticationError
 import google.generativeai as genai
 from rate_limiter import limiter, rate_limit
-from redis_manager import cache_conversation, get_cached_conversation, get_redis_client
+from cache_manager import cache_conversation, get_cached_conversation
+from firestore_manager import store_document, get_document, update_document
 from llm_service import generate_response, generate_streaming_response
 from websocket_manager import manager
 
@@ -48,14 +48,14 @@ app.add_middleware(
 async def startup_event():
     # Start the heartbeat task
     asyncio.create_task(manager.broadcast_heartbeat())
+    # Restore WebSocket connections from Firestore if implemented
+    if hasattr(manager, 'restore_from_firestore'):
+        asyncio.create_task(manager.restore_from_firestore())
 
 # Initialize the Gemini client.
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 chat_session = gemini_model.start_chat(history=[])
-
-# Create a Redis client instance.
-redis_client = get_redis_client()
 
 @router.post("/chat", response_model=MessageResponse)
 @rate_limit(limit=20, period=60)  # 20 requests per minute
@@ -104,7 +104,7 @@ async def chat_endpoint(
     db.commit()
     
     # Get conversation history
-    conversation_history = get_cached_conversation(str(conversation_id))
+    conversation_history = await get_cached_conversation(str(conversation_id))
     if not conversation_history:
         messages = db.query(ChatMessage).filter(
             ChatMessage.conversation_id == conversation_id
@@ -231,7 +231,7 @@ async def voice_websocket(
     
     # Accept the connection
     await manager.connect(websocket, device_id)
-    manager.join_conversation(conversation_id, device_id)
+    await manager.join_conversation(conversation_id, device_id)
     
     # Get DB session
     db = next(get_db())
@@ -262,7 +262,7 @@ async def voice_websocket(
                 user_input = message_data.get("content", "")
                 
                 # Get conversation history
-                conversation_history = get_cached_conversation(conversation_id)
+                conversation_history = await get_cached_conversation(conversation_id)
                 if not conversation_history:
                     messages = db.query(ChatMessage).filter(
                         ChatMessage.conversation_id == conversation_id
@@ -335,7 +335,7 @@ async def voice_websocket(
                 
                 # Update conversation history and cache
                 conversation_history.append({"role": "assistant", "content": full_response})
-                cache_conversation(conversation_id, conversation_history)
+                await cache_conversation(conversation_id, conversation_history)
                 
                 # Update conversation metadata
                 conversation = db.query(Conversation).filter(
@@ -369,8 +369,8 @@ async def voice_websocket(
                 
     except WebSocketDisconnect:
         # Handle disconnection
-        manager.disconnect(device_id)
-        manager.leave_conversation(conversation_id, device_id)
+        await manager.disconnect(device_id)
+        await manager.leave_conversation(conversation_id, device_id)
         await manager.broadcast_to_conversation(
             conversation_id,
             {
@@ -384,24 +384,26 @@ async def voice_websocket(
     finally:
         # Clean up
         db.close()
-        manager.disconnect(device_id)
-        manager.leave_conversation(conversation_id, device_id)
+        await manager.disconnect(device_id)
+        await manager.leave_conversation(conversation_id, device_id)
 
-# Create a helper function to verify devices
+# Create a helper function to verify devices using Firestore
 async def verify_device(device_id: str) -> bool:
-    """Verify a device is registered and authorized"""
-    key = f"device:{device_id}"
-    device_data_json = await redis_client.get(key)
-    if not device_data_json:
-        logger.warning(f"Unauthorized device: {device_id}")
+    """Verify a device is registered and authorized using Firestore"""
+    try:
+        device_data = await get_document("devices", device_id)
+        if not device_data:
+            logger.warning(f"Unauthorized device: {device_id}")
+            return False
+        
+        if not device_data.get("verified"):
+            logger.warning(f"Device not verified: {device_id}")
+            return False
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error verifying device {device_id}: {e}")
         return False
-    
-    device_data = json.loads(device_data_json)
-    if not device_data.get("verified"):
-        logger.warning(f"Device not verified: {device_id}")
-        return False
-    
-    return True
 
 @router.post("/chat", response_model=ChatResponse)
 @limiter.limit("5/minute")
@@ -421,13 +423,12 @@ async def chat_endpoint(
         if not user_text:
             raise HTTPException(status_code=400, detail="Empty message not allowed.")
         
-        # Check that the device is verified.
-        key = f"device:{request_data.device_id}"
-        device_data_json = await redis_client.get(key)
-        if not device_data_json:
+        # Check that the device is verified using Firestore
+        device_data = await get_document("devices", request_data.device_id)
+        if not device_data:
             logger.warning(f"Unauthorized device: {request_data.device_id}")
             raise AuthenticationError(detail="Device not authorized")
-        device_data = json.loads(device_data_json)
+        
         if not device_data.get("verified"):
             logger.warning(f"Device not verified: {request_data.device_id}")
             raise AuthenticationError(detail="Device not authorized")

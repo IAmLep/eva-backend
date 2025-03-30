@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from config import config
+from config import REDIS_HOST, REDIS_PORT, SECRET_KEY, JWT_ALGORITHM, VERIFICATION_TIMEOUT
 from schemas import AuthRequest
 from auth import (
     verify_token, create_access_token, create_refresh_token, Token,
@@ -23,15 +23,14 @@ from auth import (
 from rate_limiter import limiter, rate_limit
 from database import get_db, Device
 from sqlalchemy.ext.asyncio import AsyncSession
+from redis_manager import get_redis_client
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 # Create a Redis client instance.
-redis_client = redis.Redis(
-    host=config.REDIS_HOST, port=config.REDIS_PORT, db=0, decode_responses=True
-)
+redis_client = get_redis_client()
 
 # Apply rate limiting to auth endpoints
 auth_limiter = Limiter(key_func=get_remote_address, default_limits=["5/minute"])
@@ -58,7 +57,8 @@ class VerificationRequest(BaseModel):
 class RefreshRequest(BaseModel):
     refresh_token: str
 
-@router.post("/device/auth", response_model=DeviceToken)
+# UPDATED PATH: Changed from /device/auth to /device to match versioned path
+@router.post("/device", response_model=DeviceToken)
 @rate_limit(limit=3, period=60)  # Strict rate limiting for authentication
 async def authenticate_device(request: DeviceAuthRequest, db: AsyncSession = Depends(get_db)):
     """
@@ -113,6 +113,7 @@ async def authenticate_device(request: DeviceAuthRequest, db: AsyncSession = Dep
         device_id=request.device_id
     )
 
+# Paths for these remaining endpoints are fine as they already align with what we expect
 @router.post("/device/validate", response_model=DeviceValidationResponse)
 async def validate_device(
     token: str = Header(..., description="Device token to validate")
@@ -177,7 +178,7 @@ async def register_device(device: DeviceRegistration) -> Dict[str, Any]:
     # Store the code in Redis with expiry
     await redis_client.setex(
         f"verify:{device.device_id}",
-        config.VERIFICATION_TIMEOUT,
+        VERIFICATION_TIMEOUT,
         verification_code
     )
     
@@ -195,7 +196,7 @@ async def register_device(device: DeviceRegistration) -> Dict[str, Any]:
     return {
         "requires_verification": True,
         "verification_code": verification_code,  # In production, send via a separate channel like SMS
-        "expires_in": config.VERIFICATION_TIMEOUT
+        "expires_in": VERIFICATION_TIMEOUT
     }
 
 @router.post("/verify", response_model=Token)
@@ -224,27 +225,27 @@ async def verify_device(verification: VerificationRequest, db: AsyncSession = De
         await db.commit()
     
     # Generate tokens
-    access_token_expires = timedelta(minutes=config.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token, _, _ = create_access_token(
         data={"sub": verification.device_id, "scopes": ["chat:read", "chat:write"]},
         expires_delta=access_token_expires
     )
     
-    refresh_token = create_refresh_token(
+    refresh_token, _ = create_refresh_token(
         data={"sub": verification.device_id}
     )
     
     # Store refresh token in Redis for later validation
     await redis_client.setex(
         f"refresh:{verification.device_id}",
-        config.REFRESH_TOKEN_EXPIRE_DAYS * 86400,  # Convert days to seconds
+        REFRESH_TOKEN_EXPIRE_DAYS * 86400,  # Convert days to seconds
         refresh_token
     )
     
     return Token(
         access_token=access_token,
         token_type="bearer",
-        expires_in=config.ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert to seconds
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert to seconds
         refresh_token=refresh_token
     )
 
@@ -274,27 +275,27 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         )
     
     # Generate tokens
-    access_token_expires = timedelta(minutes=config.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token, _, _ = create_access_token(
         data={"sub": device_id, "scopes": form_data.scopes},
         expires_delta=access_token_expires
     )
     
-    refresh_token = create_refresh_token(
+    refresh_token, _ = create_refresh_token(
         data={"sub": device_id}
     )
     
     # Store refresh token
     await redis_client.setex(
         f"refresh:{device_id}",
-        config.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        REFRESH_TOKEN_EXPIRE_DAYS * 86400,
         refresh_token
     )
     
     return Token(
         access_token=access_token,
         token_type="bearer",
-        expires_in=config.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         refresh_token=refresh_token
     )
 
@@ -313,8 +314,8 @@ async def refresh_access_token(refresh_request: RefreshRequest) -> Token:
         # Decode token to get device_id
         payload = jwt.decode(
             refresh_request.refresh_token, 
-            config.SECRET_KEY, 
-            algorithms=[config.JWT_ALGORITHM]
+            SECRET_KEY, 
+            algorithms=[JWT_ALGORITHM]
         )
         
         device_id = payload.get("sub")
@@ -329,8 +330,8 @@ async def refresh_access_token(refresh_request: RefreshRequest) -> Token:
             raise credentials_exception
         
         # Generate new access token
-        access_token_expires = timedelta(minutes=config.ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token, _, _ = create_access_token(
             data={"sub": device_id, "scopes": payload.get("scopes", ["chat:read", "chat:write"])},
             expires_delta=access_token_expires
         )
@@ -338,7 +339,7 @@ async def refresh_access_token(refresh_request: RefreshRequest) -> Token:
         return Token(
             access_token=access_token,
             token_type="bearer",
-            expires_in=config.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
             refresh_token=refresh_request.refresh_token  # Return the same refresh token
         )
         

@@ -15,18 +15,12 @@ import base64
 import secrets
 import redis
 
-from models import User, UserCreate, UserResponse
-from database import get_db
+# Import User from database instead of models
+from database import get_db, User
+from models import UserCreate, UserResponse 
 from sqlalchemy.orm import Session
 import os
-from config import settings
-
-# Secret key for JWT signing - should match your config.py SECRET_KEY
-SECRET_KEY = settings.SECRET_KEY
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
-REFRESH_TOKEN_EXPIRE_DAYS = settings.REFRESH_TOKEN_EXPIRE_DAYS
-DEVICE_TOKEN_EXPIRE_DAYS = 365  # 1 year for device tokens
+from config import SECRET_KEY, JWT_ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 
 # Device authentication
 INITIAL_DEVICE_SECRET = os.environ.get("EVA_INITIAL_DEVICE_SECRET", "")
@@ -36,8 +30,8 @@ if not INITIAL_DEVICE_SECRET:
     print(f"WARNING: Using generated initial device secret: {INITIAL_DEVICE_SECRET}")
 
 # OAuth2 Client Credentials - for personal use
-OAUTH2_CLIENT_ID = settings.OAUTH2_CLIENT_ID
-OAUTH2_CLIENT_SECRET = settings.OAUTH2_CLIENT_SECRET
+OAUTH2_CLIENT_ID = os.environ.get("OAUTH2_CLIENT_ID", "evacore-client")
+OAUTH2_CLIENT_SECRET = os.environ.get("OAUTH2_CLIENT_SECRET", "")
 OAUTH2_SCOPES = {"chat:read": "Read chat messages", "chat:write": "Send chat messages"}
 
 # Token revocation storage
@@ -56,13 +50,8 @@ oauth2_scheme = OAuth2PasswordBearer(
 
 # Redis connection for token blacklist
 try:
-    redis_client = redis.Redis(
-        host=settings.REDIS_HOST, 
-        port=settings.REDIS_PORT, 
-        db=settings.REDIS_DB,
-        password=settings.REDIS_PASSWORD,
-        decode_responses=True
-    )
+    from redis_manager import get_redis_client
+    redis_client = get_redis_client()
 except Exception as e:
     print(f"Warning: Redis connection failed: {e}")
     redis_client = None
@@ -174,7 +163,7 @@ def verify_token(token: str) -> Optional[Dict[str, Any]]:
             token = token[7:]
             
         # Decode the token with explicit algorithm
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
         
         # Check if token has been revoked
         jti = payload.get("jti")
@@ -197,7 +186,7 @@ def validate_device_token(token: str) -> DeviceValidationResponse:
     """
     try:
         # Decode the token with explicit algorithm
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
         
         # Check if token is a device token
         token_type = payload.get("token_type")
@@ -270,7 +259,7 @@ def create_device_token(device_id: str, device_name: str) -> Tuple[str, datetime
         "scopes": ["chat:read", "chat:write"]  # Default scopes for devices
     }
     
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=JWT_ALGORITHM)
     
     return encoded_jwt, expire, jti
 
@@ -294,7 +283,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None, s
         "scopes": scopes or []
     })
     
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=JWT_ALGORITHM)
     
     return encoded_jwt, expire, jti
 
@@ -313,7 +302,7 @@ def create_refresh_token(data: dict, scopes: List[str] = None):
         "scopes": scopes or []
     })
     
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=JWT_ALGORITHM)
     return encoded_jwt, jti
 
 def revoke_token(token: str) -> bool:
@@ -328,7 +317,7 @@ def revoke_token(token: str) -> bool:
     """
     try:
         # Decode the token
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
         
         # Get token details
         jti = payload.get("jti")
@@ -358,5 +347,52 @@ def revoke_token(token: str) -> bool:
     except JWTError:
         return False
 
-# Rest of your functions...
-# create_tokens, get_client_credentials, validate_token_request, etc.
+async def get_current_user(security_scopes: SecurityScopes, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    """
+    Validate user token and return the current user.
+    
+    Args:
+        security_scopes: Required security scopes
+        token: JWT token from Authorization header
+        db: Database session
+        
+    Returns:
+        Current authenticated user
+    """
+    if security_scopes.scopes:
+        authenticate_value = f'Bearer scope="{security_scopes.scope_str}"'
+    else:
+        authenticate_value = "Bearer"
+        
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": authenticate_value},
+    )
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+            
+        token_scopes = payload.get("scopes", [])
+        token_data = TokenData(username=username, scopes=token_scopes)
+        
+    except JWTError:
+        raise credentials_exception
+        
+    user = db.query(User).filter(User.username == token_data.username).first()
+    if user is None:
+        raise credentials_exception
+        
+    # Check scopes
+    for scope in security_scopes.scopes:
+        if scope not in token_data.scopes:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not enough permissions",
+                headers={"WWW-Authenticate": authenticate_value},
+            )
+            
+    return user

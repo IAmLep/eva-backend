@@ -1,73 +1,11 @@
 """
-Database models and Pydantic schemas for Eva LLM Application.
+Pydantic schemas and Pydantic models for API requests/responses.
+SQLAlchemy database models are defined in database.py.
 """
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, Integer, String, Boolean, BigInteger, DateTime, Text, ForeignKey
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-
-# Import Base from database.py - use this as your single source of truth for Base
-from database import Base
-
-# SQLAlchemy Models
-class ChatMessage(Base):
-    """Database model for chat messages."""
-    __tablename__ = "chat_messages"
-    __table_args__ = {'extend_existing': True}  # Add this to handle duplicate registrations
-    
-    id = Column(Integer, primary_key=True, index=True)
-    message = Column(Text, nullable=False)
-    is_user = Column(Boolean, default=True, index=True)
-    timestamp = Column(BigInteger, nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    def __repr__(self):
-        return f"ChatMessage(id={self.id}, is_user={self.is_user}, timestamp={self.timestamp})"
-
-class ConversationSummary(Base):
-    """Database model for conversation summaries."""
-    __tablename__ = "conversation_summary"
-    __table_args__ = {'extend_existing': True}  # Add this to handle duplicate registrations
-    
-    id = Column(Integer, primary_key=True, index=True)
-    summary = Column(Text, nullable=False)
-    timestamp = Column(BigInteger, nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    def __repr__(self):
-        return f"ConversationSummary(id={self.id}, timestamp={self.timestamp})"
-
-class Note(Base):
-    """Database model for notes."""
-    __tablename__ = "notes"
-    __table_args__ = {'extend_existing': True}  # Add this to handle duplicate registrations
-    
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String, nullable=False, index=True)
-    content = Column(Text, nullable=False)
-    timestamp = Column(BigInteger, nullable=False, index=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
-    def __repr__(self):
-        return f"Note(id={self.id}, title={self.title[:20] if len(self.title) > 20 else self.title}, timestamp={self.timestamp})"
-
-class User(Base):
-    """Database model for users."""
-    __tablename__ = "users"
-    __table_args__ = {'extend_existing': True}  # Add this to handle duplicate registrations
-    
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
-    email = Column(String, unique=True, index=True, nullable=True)
-    hashed_password = Column(String, nullable=False)
-    is_active = Column(Boolean, default=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    def __repr__(self):
-        return f"User(id={self.id}, username={self.username}, email={self.email})"
 
 # Pydantic Models (API schemas)
 class MessageRequest(BaseModel):

@@ -18,14 +18,14 @@ from pydantic import ValidationError, BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 
 from auth import verify_token, get_current_user
-from config import DEVICE_TOKEN, config
+from config import SECRET_KEY, JWT_ALGORITHM, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD, GEMINI_API_KEY, GEMINI_MODEL
 from database import get_db, Message, ChatMessage, ConversationSummary, Conversation, User, Device
-from models import ChatMessage, ConversationSummary, MessageRequest, MessageResponse, ConversationRequest
+from models import MessageRequest, MessageResponse, ConversationRequest
 from schemas import ChatRequest, ChatResponse, SyncRequest, SyncResponse
 from exceptions import GeminiAPIError, AuthenticationError
 import google.generativeai as genai
 from rate_limiter import limiter, rate_limit
-from redis_manager import cache_conversation, get_cached_conversation
+from redis_manager import cache_conversation, get_cached_conversation, get_redis_client
 from llm_service import generate_response, generate_streaming_response
 from websocket_manager import manager
 
@@ -50,19 +50,12 @@ async def startup_event():
     asyncio.create_task(manager.broadcast_heartbeat())
 
 # Initialize the Gemini client.
-genai.configure(api_key=config.GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(config.GEMINI_MODEL)
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 chat_session = gemini_model.start_chat(history=[])
 
 # Create a Redis client instance.
-redis_client = redis.Redis(
-    host=config.REDIS_HOST, port=config.REDIS_PORT, db=0, decode_responses=True
-)
-
-class ChatRequest(BaseModel):
-    text: str
-    mode: str = "text"
-    device_id: str
+redis_client = get_redis_client()
 
 @app.post("/api/chat", response_model=MessageResponse)
 @rate_limit(limit=20, period=60)  # 20 requests per minute
@@ -225,7 +218,7 @@ async def voice_websocket(
     # Replace the direct token check with JWT verification
     try:
         # Verify token and extract device_id from it
-        payload = jwt.decode(token, config.SECRET_KEY, algorithms=[config.JWT_ALGORITHM])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
         token_device_id = payload.get("sub")
         
         # Verify the provided device_id matches the token

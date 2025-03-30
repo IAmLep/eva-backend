@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from .exceptions import BaseEvaException
+from exceptions import BaseEvaException  # Changed from .exceptions to absolute import
 import logging
 
 logger = logging.getLogger(__name__)

@@ -8,10 +8,14 @@ from functools import wraps
 import redis
 from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
 
+# Initialize the limiter at module level and make it available for import
 limiter = Limiter(
     key_func=get_remote_address,
-    default_limits=[f"{settings.RATELIMIT_PER_MINUTE}/minute"]  # Fixed name to match settings
+    default_limits=[f"{settings.RATELIMIT_PER_MINUTE}/minute"]
 )
+
+# Add __all__ to explicitly export these names
+__all__ = ['limiter', 'rate_limit', 'setup_limiter', 'get_redis_client']
 
 redis_client = None
 

@@ -2,7 +2,7 @@ import os
 import json
 import google.generativeai as genai
 import openai
-from config import GEMINI_API_KEY, OPENAI_API_KEY
+from config import GEMINI_API_KEY, OPENAI_API_KEY, GEMINI_MODEL
 import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Callable
 
@@ -11,9 +11,9 @@ genai.configure(api_key=GEMINI_API_KEY)
 openai.api_key = OPENAI_API_KEY
 
 # Default model
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = GEMINI_MODEL
 
-def generate_response(conversation_history, model="gemini-1.5-flash"):
+def generate_response(conversation_history, model=GEMINI_MODEL):
     """Generate a complete response using Gemini"""
     try:
         # Configure the model
@@ -54,7 +54,7 @@ def generate_response(conversation_history, model="gemini-1.5-flash"):
 
 async def generate_streaming_response(
     conversation_history: List[Dict[str, str]], 
-    model: str = "gemini-1.5-flash",
+    model: str = GEMINI_MODEL,
     callback: Callable[[str], Any] = None
 ) -> AsyncGenerator[str, None]:
     """Stream a response using Gemini"""

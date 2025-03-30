@@ -12,6 +12,7 @@ from auth_router import router as auth_router
 from secrets_router import router as secrets_router
 from rate_limiter import setup_limiter
 from error_middleware import setup_error_handlers
+from firestore_manager import get_firestore_client  # Add this import
 
 # Configure structured logging for Google Cloud
 class CloudRunFormatter(logging.Formatter):
@@ -86,10 +87,10 @@ async def health_check():
     return {"status": "online", "service": "Eva AI Assistant"}
 
 # Include routers with proper API versioning
-app.include_router(chat_router, prefix="/api")  # Changed from /api/v1
-app.include_router(sync_router, prefix="/api/sync", tags=["sync"])  # Changed from /api/v1/sync
-app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])  # Changed from /api/v1/auth
-app.include_router(secrets_router, prefix="/api/secrets", tags=["secrets"])  # Changed from /api/v1/secrets
+app.include_router(chat_router, prefix="/api")
+app.include_router(sync_router, prefix="/api/sync", tags=["sync"])
+app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(secrets_router, prefix="/api/secrets", tags=["secrets"])
 
 # Set up rate limiter
 setup_limiter(app)
@@ -97,10 +98,16 @@ setup_limiter(app)
 # Set up error handlers
 setup_error_handlers(app)
 
-# Initialize database on startup
+# Initialize database and Firestore on startup
 @app.on_event("startup")
 async def startup_event():
     initialize_database()
+    try:
+        # Initialize Firestore client
+        get_firestore_client()
+        logger.info("Firestore initialized successfully")
+    except Exception as e:
+        logger.error(f"Firestore initialization failed: {e}")
 
 if __name__ == "__main__":
     import uvicorn

@@ -11,7 +11,6 @@ IS_CLOUD_ENVIRONMENT = os.environ.get("CLOUD_ENVIRONMENT", "false").lower() == "
 # Development secrets - only used if IS_CLOUD_ENVIRONMENT is False
 DEV_SECRETS = {
     "gemini-api-key": os.environ.get("GEMINI_API_KEY", ""),
-    "openai-api-key": os.environ.get("OPENAI_API_KEY", ""),
     # Add other development secrets as needed
 }
 

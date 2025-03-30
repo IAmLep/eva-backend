@@ -1,14 +1,12 @@
 import os
 import json
 import google.generativeai as genai
-import openai
-from config import GEMINI_API_KEY, OPENAI_API_KEY, GEMINI_MODEL
+from config import GEMINI_API_KEY, GEMINI_MODEL
 import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Callable
 
 # Configure API clients
 genai.configure(api_key=GEMINI_API_KEY)
-openai.api_key = OPENAI_API_KEY
 
 # Default model
 DEFAULT_MODEL = GEMINI_MODEL
@@ -104,76 +102,4 @@ async def generate_streaming_response(
         print(error_msg)
         if callback:
             await callback("I apologize, but I encountered an error processing your request.")
-        yield "I apologize, but I encountered an error while processing your request. Please try again later."
-
-def generate_openai_response(conversation_history, model="gpt-3.5-turbo"):
-    """Generate a complete response using OpenAI's models"""
-    
-    try:
-        # Format conversation for OpenAI
-        formatted_messages = []
-        for msg in conversation_history:
-            formatted_messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-        
-        # Generate response
-        response = openai.ChatCompletion.create(
-            model=model,
-            messages=formatted_messages,
-            temperature=0.7,
-            max_tokens=1024,
-            top_p=0.95,
-            frequency_penalty=0,
-            presence_penalty=0
-        )
-        
-        return response.choices[0].message.content
-    
-    except Exception as e:
-        print(f"Error generating OpenAI response: {e}")
-        return "I apologize, but I encountered an error while processing your request. Please try again later."
-
-async def stream_openai_response(conversation_history, model="gpt-3.5-turbo"):
-    """Stream a response using OpenAI's models"""
-    
-    try:
-        # Format conversation for OpenAI
-        formatted_messages = []
-        for msg in conversation_history:
-            formatted_messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-        
-        # Generate streaming response
-        response = openai.ChatCompletion.create(
-            model=model,
-            messages=formatted_messages,
-            temperature=0.7,
-            max_tokens=1024,
-            top_p=0.95,
-            frequency_penalty=0,
-            presence_penalty=0,
-            stream=True  # Enable streaming
-        )
-        
-        collected_chunks = []
-        collected_message = ""
-        
-        # Process each chunk as it arrives
-        for chunk in response:
-            if "choices" in chunk and len(chunk.choices) > 0:
-                content = chunk.choices[0].get("delta", {}).get("content", "")
-                if content:
-                    collected_chunks.append(content)
-                    collected_message += content
-                    yield content
-            
-            # Need to add a small delay to allow other async operations
-            await asyncio.sleep(0.01)
-            
-    except Exception as e:
-        print(f"Error streaming OpenAI response: {e}")
         yield "I apologize, but I encountered an error while processing your request. Please try again later."

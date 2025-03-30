@@ -20,7 +20,7 @@ from database import get_db, User
 from models import UserCreate, UserResponse 
 from sqlalchemy.orm import Session
 import os
-from config import SECRET_KEY, JWT_ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
+from config import config
 
 # Device authentication
 INITIAL_DEVICE_SECRET = os.environ.get("EVA_INITIAL_DEVICE_SECRET", "")
@@ -163,7 +163,7 @@ def verify_token(token: str) -> Optional[Dict[str, Any]]:
             token = token[7:]
             
         # Decode the token with explicit algorithm
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, config.SECRET_KEY, algorithms=[config.JWT_ALGORITHM])
         
         # Check if token has been revoked
         jti = payload.get("jti")
@@ -186,7 +186,7 @@ def validate_device_token(token: str) -> DeviceValidationResponse:
     """
     try:
         # Decode the token with explicit algorithm
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, config.SECRET_KEY, algorithms=[config.JWT_ALGORITHM])
         
         # Check if token is a device token
         token_type = payload.get("token_type")
@@ -244,7 +244,7 @@ def create_device_token(device_id: str, device_name: str) -> Tuple[str, datetime
     Returns:
         Tuple of (token, expiration datetime, jwt id)
     """
-    expire = datetime.utcnow() + timedelta(days=DEVICE_TOKEN_EXPIRE_DAYS)
+    expire = datetime.utcnow() + timedelta(days=config.DEVICE_TOKEN_EXPIRE_DAYS)
     
     # Generate a unique JWT ID
     jti = str(uuid.uuid4())
@@ -259,7 +259,7 @@ def create_device_token(device_id: str, device_name: str) -> Tuple[str, datetime
         "scopes": ["chat:read", "chat:write"]  # Default scopes for devices
     }
     
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=JWT_ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, config.SECRET_KEY, algorithm=config.JWT_ALGORITHM)
     
     return encoded_jwt, expire, jti
 
@@ -271,7 +271,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None, s
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.utcnow() + timedelta(minutes=config.ACCESS_TOKEN_EXPIRE_MINUTES)
     
     # Add token-specific claims
     jti = str(uuid.uuid4())
@@ -283,14 +283,14 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None, s
         "scopes": scopes or []
     })
     
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=JWT_ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, config.SECRET_KEY, algorithm=config.JWT_ALGORITHM)
     
     return encoded_jwt, expire, jti
 
 def create_refresh_token(data: dict, scopes: List[str] = None):
     """Create a new JWT refresh token with longer expiration."""
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    expire = datetime.utcnow() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS)
     
     # Add token-specific claims
     jti = str(uuid.uuid4())
@@ -302,7 +302,7 @@ def create_refresh_token(data: dict, scopes: List[str] = None):
         "scopes": scopes or []
     })
     
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=JWT_ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, config.SECRET_KEY, algorithm=config.JWT_ALGORITHM)
     return encoded_jwt, jti
 
 def revoke_token(token: str) -> bool:
@@ -317,7 +317,7 @@ def revoke_token(token: str) -> bool:
     """
     try:
         # Decode the token
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, config.SECRET_KEY, algorithms=[config.JWT_ALGORITHM])
         
         # Get token details
         jti = payload.get("jti")
@@ -371,7 +371,7 @@ async def get_current_user(security_scopes: SecurityScopes, token: str = Depends
     )
     
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, config.SECRET_KEY, algorithms=[config.JWT_ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception

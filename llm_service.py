@@ -1,105 +1,126 @@
 import os
-import json
+import logging
 import google.generativeai as genai
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from typing import Any, Dict, List, Optional, Callable, Awaitable
+import json
 import asyncio
-from typing import List, Dict, Any, AsyncGenerator, Callable
 
-# Configure API clients
-genai.configure(api_key=GEMINI_API_KEY)
+logger = logging.getLogger(__name__)
 
-# Default model
-DEFAULT_MODEL = GEMINI_MODEL
-
-def generate_response(conversation_history, model=GEMINI_MODEL):
-    """Generate a complete response using Gemini"""
-    try:
-        # Configure the model
-        generation_config = {
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "top_k": 40,
-            "max_output_tokens": 1024,
-        }
-        
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        ]
-        
-        model_instance = genai.GenerativeModel(
-            model_name=model,
-            generation_config=generation_config,
-            safety_settings=safety_settings
-        )
-        
-        # Format conversation for Gemini
-        formatted_history = []
-        for msg in conversation_history:
-            role = "user" if msg["role"] == "user" else "model"
-            formatted_history.append({"role": role, "parts": [msg["content"]]})
-        
-        convo = model_instance.start_chat(history=formatted_history[:-1])
-        response = convo.send_message(conversation_history[-1]["content"])
-        
-        return response.text
+class LLMService:
+    """Service for interacting with Gemini API"""
     
-    except Exception as e:
-        print(f"Error generating Gemini response: {e}")
-        return "I apologize, but I encountered an error while processing your request. Please try again later."
-
-async def generate_streaming_response(
-    conversation_history: List[Dict[str, str]], 
-    model: str = GEMINI_MODEL,
-    callback: Callable[[str], Any] = None
-) -> AsyncGenerator[str, None]:
-    """Stream a response using Gemini"""
-    try:
-        # Configure the model
-        generation_config = {
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "top_k": 40,
-            "max_output_tokens": 1024,
-        }
-        
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        ]
-        
-        model_instance = genai.GenerativeModel(
-            model_name=model,
-            generation_config=generation_config,
-            safety_settings=safety_settings
-        )
-        
-        # Format conversation for Gemini
-        formatted_history = []
-        for msg in conversation_history:
-            role = "user" if msg["role"] == "user" else "model"
-            formatted_history.append({"role": role, "parts": [msg["content"]]})
-        
-        convo = model_instance.start_chat(history=formatted_history[:-1])
-        
-        response_generator = convo.send_message_streaming(conversation_history[-1]["content"])
-        
-        for chunk in response_generator:
-            # Extract text from chunk
-            if chunk.text:
-                if callback:
-                    await callback(chunk.text)
-                yield chunk.text
-            # Small delay to allow other async operations
-            await asyncio.sleep(0.01)
+    def __init__(self):
+        # Set up Gemini API key
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.error("GEMINI_API_KEY not set in environment variables")
+            raise ValueError("GEMINI_API_KEY not set")
             
-    except Exception as e:
-        error_msg = f"Error streaming Gemini response: {e}"
-        print(error_msg)
-        if callback:
-            await callback("I apologize, but I encountered an error processing your request.")
-        yield "I apologize, but I encountered an error while processing your request. Please try again later."
+        genai.configure(api_key=api_key)
+        
+        # Get the model (Gemini 1.5 Flash)
+        self.model = genai.GenerativeModel('gemini-2.0-flash')
+    
+    async def generate_text(self, prompt: str, memory: str = "", max_tokens: int = 1024) -> str:
+        """Generate text with Gemini model"""
+        try:
+            # Include memory in the prompt if available
+            full_prompt = prompt
+            if memory:
+                full_prompt = f"MEMORY CONTEXT:\n{memory}\n\nUSER QUERY:\n{prompt}"
+            
+            # Generate the response
+            response = await asyncio.to_thread(
+                self.model.generate_content,
+                full_prompt,
+                generation_config={"max_output_tokens": max_tokens}
+            )
+            
+            return response.text
+            
+        except Exception as e:
+            logger.error(f"Error generating text: {str(e)}")
+            return f"I'm sorry, I encountered an error: {str(e)}"
+    
+    async def generate_text_streaming(
+        self, 
+        prompt: str, 
+        memory: str = "", 
+        callback: Optional[Callable[[str], Awaitable[None]]] = None
+    ) -> str:
+        """Generate text with streaming responses"""
+        try:
+            # Include memory in the prompt if available
+            full_prompt = prompt
+            if memory:
+                full_prompt = f"MEMORY CONTEXT:\n{memory}\n\nUSER QUERY:\n{prompt}"
+            
+            # Generate the response with streaming
+            stream = await asyncio.to_thread(
+                self.model.generate_content,
+                full_prompt,
+                stream=True
+            )
+            
+            full_response = ""
+            
+            # Process the streaming response
+            async for chunk in self._process_stream(stream):
+                full_response += chunk
+                if callback:
+                    await callback(chunk)
+            
+            return full_response
+            
+        except Exception as e:
+            logger.error(f"Error in streaming text generation: {str(e)}")
+            error_msg = f"I'm sorry, I encountered an error: {str(e)}"
+            if callback:
+                await callback(error_msg)
+            return error_msg
+    
+    async def _process_stream(self, stream):
+        """Process the streaming response from Gemini"""
+        for chunk in stream:
+            if chunk.text:
+                yield chunk.text
+            await asyncio.sleep(0)  # Allow other tasks to run
+    
+    async def generate_with_function_calling(self, prompt: str, tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Generate text with function calling capabilities"""
+        try:
+            # Configure the model with tools
+            model_with_tools = self.model.with_tools(tools)
+            
+            # Generate response
+            response = await asyncio.to_thread(
+                model_with_tools.generate_content,
+                prompt
+            )
+            
+            # Check if the response contains a function call
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'content') and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'function_call'):
+                            # Return the function call information
+                            return {
+                                "type": "function_call",
+                                "function_name": part.function_call.name,
+                                "arguments": json.loads(part.function_call.args)
+                            }
+            
+            # If no function call, return the text response
+            return {
+                "type": "text",
+                "content": response.text
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in function calling: {str(e)}")
+            return {
+                "type": "error",
+                "error": str(e)
+            }

@@ -11,6 +11,7 @@ from database import (
     process_incoming_sync_data, 
     get_sync_data_for_device
 )
+from auth import validate_device_token, get_device_from_token
 
 router = APIRouter()
 
@@ -25,23 +26,43 @@ class SyncResponse(BaseModel):
     data: Dict[str, List[Dict[str, Any]]]
 
 @router.post("/sync", response_model=SyncResponse)
-def sync_device_data(request: SyncRequest, db: Session = Depends(get_db)):
+def sync_device_data(
+    request: SyncRequest, 
+    db: Session = Depends(get_db),
+    device_info: dict = Depends(validate_device_token)
+):
     """
     Sync data between device and server:
     1. Receive changes from device
     2. Store those changes for other devices
     3. Send changes from other devices back to this device
     """
+    # Verify device ownership
+    if device_info["device_id"] != request.device_id:
+        raise HTTPException(
+            status_code=403, 
+            detail="Not authorized to sync this device"
+        )
+    
+    # Get user ID from the device token
+    user_id = device_info.get("user_id")
+    if not user_id:
+        raise HTTPException(
+            status_code=400, 
+            detail="Device not associated with user"
+        )
+    
     try:
         # Process data sent from device
         if request.data and any(len(records) > 0 for records in request.data.values()):
-            process_incoming_sync_data(db, request.data, request.device_id)
+            process_incoming_sync_data(db, request.data, request.device_id, user_id)
         
         # Get data to send back to device
         data_for_device = get_sync_data_for_device(
             db, 
             request.device_id, 
-            request.last_sync_time
+            request.last_sync_time,
+            user_id
         )
         
         # Current time for the device to use as last_sync_time in next request
@@ -56,10 +77,28 @@ def sync_device_data(request: SyncRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
 
 @router.get("/pending", response_model=Dict[str, List[Dict[str, Any]]])
-def get_pending_sync(device_id: str, db: Session = Depends(get_db)):
+def get_pending_sync(
+    device_id: str, 
+    db: Session = Depends(get_db),
+    device_info: dict = Depends(validate_device_token)
+):
     """Get all pending sync records for a device"""
+    # Verify device ownership
+    if device_info["device_id"] != device_id:
+        raise HTTPException(
+            status_code=403, 
+            detail="Not authorized to access this device's data"
+        )
+    
+    user_id = device_info.get("user_id")
+    if not user_id:
+        raise HTTPException(
+            status_code=400, 
+            detail="Device not associated with user"
+        )
+    
     try:
-        return get_pending_sync_records(db, device_id)
+        return get_pending_sync_records(db, device_id, user_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get pending records: {str(e)}")
 
@@ -67,11 +106,19 @@ def get_pending_sync(device_id: str, db: Session = Depends(get_db)):
 def mark_synced(
     device_id: str, 
     records: Dict[str, List[Dict[str, Any]]], 
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    device_info: dict = Depends(validate_device_token)
 ):
     """Mark records as synced after successful sync"""
+    # Verify device ownership
+    if device_info["device_id"] != device_id:
+        raise HTTPException(
+            status_code=403, 
+            detail="Not authorized to modify this device's data"
+        )
+    
     try:
-        mark_records_as_synced(db, records)
+        mark_records_as_synced(db, records, device_info.get("user_id"))
         return {"status": "success", "message": "Records marked as synced"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to mark records: {str(e)}")

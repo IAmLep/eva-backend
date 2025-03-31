@@ -1,524 +1,174 @@
-import time
+from fastapi import APIRouter, WebSocket, Depends, HTTPException, WebSocketDisconnect, Request, status
+from typing import List, Dict, Any, Optional
+import json
 import asyncio
 import logging
-import json
-from typing import Optional, Dict, Any, List
 from datetime import datetime
 import uuid
 
-from jose import JWTError
-import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect, Header, status
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, desc
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
-from pydantic import ValidationError, BaseModel
-from sqlalchemy.exc import SQLAlchemyError
+from auth import validate_device_token
+from firestore_manager import FirestoreManager
+from websocket_manager import WebSocketManager
+from llm_service import LLMService
+from memory_extractor import MemoryExtractor
+from cache_manager import CacheManager
+from rate_limiter import RateLimiter
 
-from auth import verify_token, get_current_user
-from config import SECRET_KEY, JWT_ALGORITHM, GEMINI_API_KEY, GEMINI_MODEL
-from database import get_db, Message, ChatMessage, ConversationSummary, Conversation, User, Device
-from models import MessageRequest, MessageResponse, ConversationRequest
-from schemas import ChatRequest, ChatResponse, SyncRequest, SyncResponse
-from exceptions import GeminiAPIError, AuthenticationError
-import google.generativeai as genai
-from rate_limiter import limiter, rate_limit
-from cache_manager import cache_conversation, get_cached_conversation
-from firestore_manager import store_document, get_document, update_document
-from llm_service import generate_response, generate_streaming_response
-from websocket_manager import manager
+router = APIRouter()
+firestore = FirestoreManager()
+manager = WebSocketManager()
+llm_service = LLMService()
+memory_extractor = MemoryExtractor()
+cache_manager = CacheManager()
+rate_limiter = RateLimiter()
 
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app instance for router 
-router = APIRouter()
-
-# Initialize the Gemini client
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-chat_session = gemini_model.start_chat(history=[])
-
-# Main chat endpoint - changed to / so it becomes /api/
-@router.post("/", response_model=MessageResponse)
-@rate_limit(limit=20, period=60)  # 20 requests per minute
-async def chat_endpoint(
-    message_request: MessageRequest,
-    background_tasks: BackgroundTasks,
-    request: Request,
-    db: Session = Depends(get_db),
-    auth_data: Dict[str, Any] = Depends(verify_token)
-):
-    device_id = auth_data.get("sub")  # "sub" contains user/device ID in JWT tokens
-    
-    # Register device if not exists
-    device = db.query(Device).filter(Device.device_id == device_id).first()
-    if not device:
-        device = Device(device_id=device_id, device_name=f"Device-{device_id[:8]}")
-        db.add(device)
-        db.commit()
-    else:
-        # Update last sync time
-        device.last_sync = datetime.utcnow()
-        db.commit()
-    
-    # Get or create conversation
-    conversation_id = message_request.conversation_id
-    if conversation_id:
-        conversation = db.query(Conversation).filter(
-            Conversation.id == conversation_id
-        ).first()
-        
-        if not conversation:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-    else:
-        conversation = Conversation(
-            title=message_request.content[:50] if message_request.content else "New conversation",
-            last_synced_device=device_id
-        )
-        db.add(conversation)
-        db.commit()
-        db.refresh(conversation)
-        conversation_id = conversation.id
-    
-    # Update conversation metadata
-    conversation.last_synced_device = device_id
-    conversation.updated_at = datetime.utcnow()
-    db.commit()
-    
-    # Get conversation history from Firestore
-    conversation_history = await get_cached_conversation(str(conversation_id))
-    if not conversation_history:
-        messages = db.query(ChatMessage).filter(
-            ChatMessage.conversation_id == conversation_id
-        ).order_by(ChatMessage.created_at).all()
-        
-        conversation_history = [
-            {"role": msg.role, "content": msg.content} for msg in messages
-        ]
-    
-    # Save user message
-    user_message = ChatMessage(
-        conversation_id=conversation_id,
-        role="user",
-        content=message_request.content,
-        device_id=device_id
-    )
-    db.add(user_message)
-    db.commit()
-    
-    # Add user message to history
-    conversation_history.append({"role": "user", "content": message_request.content})
-    
-    # Generate response using the LLM
-    llm_response = generate_response(conversation_history, message_request.model)
-    
-    # Save assistant message
-    assistant_message = ChatMessage(
-        conversation_id=conversation_id,
-        role="assistant",
-        content=llm_response,
-        device_id="system"
-    )
-    db.add(assistant_message)
-    db.commit()
-    
-    # Update conversation history and cache it in Firestore
-    conversation_history.append({"role": "assistant", "content": llm_response})
-    background_tasks.add_task(cache_conversation, str(conversation_id), conversation_history)
-    
-    # Broadcast to other connected devices
-    background_tasks.add_task(
-        manager.broadcast_to_conversation,
-        str(conversation_id),
-        {
-            "type": "new_message",
-            "conversation_id": str(conversation_id),
-            "message": {
-                "role": "assistant",
-                "content": llm_response,
-                "created_at": datetime.utcnow().isoformat()
-            }
-        }
-    )
-    
-    return MessageResponse(
-        conversation_id=str(conversation_id),
-        message=llm_response,
-        created_at=datetime.utcnow().isoformat()
-    )
-
-# MOVED from app to router so path becomes /api/conversations
-@router.get("/conversations", response_model=List[ConversationRequest])
-async def get_conversations(
-    db: Session = Depends(get_db),
-    auth_data: Dict[str, Any] = Depends(verify_token)
-):
-    device_id = auth_data.get("sub")
-    
-    # Register device if not exists
-    device = db.query(Device).filter(Device.device_id == device_id).first()
-    if not device:
-        device = Device(device_id=device_id, device_name=f"Device-{device_id[:8]}")
-        db.add(device)
-        db.commit()
-    
-    # Get all conversations
-    conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).all()
-    
-    return [
-        ConversationRequest(
-            id=str(conv.id),
-            title=conv.title,
-            created_at=conv.created_at.isoformat(),
-            updated_at=conv.updated_at.isoformat()
-        ) for conv in conversations
-    ]
-
-# Move voice endpoint to router
-@router.post("/voice", response_model=MessageResponse)
-@rate_limit(limit=5, period=60)  # 5 requests per minute
-async def voice_endpoint(
-    message_request: MessageRequest,
-    background_tasks: BackgroundTasks,
-    request: Request,
-    db: Session = Depends(get_db),
-    user_data: dict = Depends(verify_token)
-):
-    # Call the chat endpoint
-    return await chat_endpoint(message_request, background_tasks, request, db, user_data)
-
-# Keep WebSocket path on router
-@router.websocket("/voice/{conversation_id}")
-async def voice_websocket(
-    websocket: WebSocket, 
-    conversation_id: str,
-    device_id: str = None,
-    token: str = None
-):
-    if not device_id or not token:
-        await websocket.close(code=1008, reason="Missing device authentication")
+@router.websocket("/voice")
+async def voice_websocket(websocket: WebSocket):
+    """WebSocket endpoint for voice conversations"""
+    # Get the token from the query params
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=1008, reason="Missing token")
         return
     
-    # JWT verification
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        token_device_id = payload.get("sub")
-        
-        if token_device_id != device_id:
-            await websocket.close(code=1008, reason="Device ID mismatch")
-            return
-    except JWTError:
-        await websocket.close(code=1008, reason="Invalid token")
+    # Connect with token validation
+    connection_id = await manager.connect_with_token(websocket, token)
+    if not connection_id:
+        # Connection failed, websocket already closed
         return
     
-    # Accept the connection
-    await manager.connect(websocket, device_id)
-    await manager.join_conversation(conversation_id, device_id)
-    
-    # Get DB session
-    db = next(get_db())
-    
     try:
-        # Notify other devices about this connection
-        await manager.broadcast_to_conversation(
-            conversation_id,
-            {
-                "type": "device_connected",
-                "device_id": device_id,
-                "conversation_id": conversation_id,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        )
+        device_id = manager.device_ids.get(connection_id)
+        user_id = manager.user_ids.get(connection_id)
         
-        # Process messages
+        # Start conversation or use existing one
+        conversation_id = websocket.query_params.get("conversation_id")
+        if not conversation_id:
+            conversation_id = str(uuid.uuid4())
+            
+            # Create new conversation in Firestore
+            await firestore.add_or_update_conversation(
+                conversation_id, 
+                user_id,
+                {
+                    "title": "Voice conversation",
+                    "created_at": firestore.server_timestamp(),
+                    "updated_at": firestore.server_timestamp(),
+                    "messages": []
+                }
+            )
+        
+        # Send initial connection confirmation
+        await manager.send_message(connection_id, json.dumps({
+            "type": "connected",
+            "conversation_id": conversation_id
+        }))
+        
+        # Rate limiting check
+        await rate_limiter.check_rate_limit(user_id or device_id)
+        
+        # Main message loop
         while True:
-            data = await websocket.receive_text()
-            message_data = json.loads(data)
-            
-            message_type = message_data.get("type", "")
-            
-            if message_type == "voice_input":
-                # Process voice input (text transcribed from voice)
-                user_input = message_data.get("content", "")
+            try:
+                # Wait for message from user
+                data = await websocket.receive_text()
+                message_data = json.loads(data)
                 
-                # Get conversation history from Firestore
-                conversation_history = await get_cached_conversation(conversation_id)
-                if not conversation_history:
-                    messages = db.query(ChatMessage).filter(
-                        ChatMessage.conversation_id == conversation_id
-                    ).order_by(ChatMessage.created_at).all()
+                # Extract message content and type
+                content = message_data.get("content", "")
+                message_type = message_data.get("type", "text")
+                
+                # Validate rate limiting for each message
+                if not await rate_limiter.record_request(user_id or device_id):
+                    await manager.send_message(connection_id, json.dumps({
+                        "type": "error",
+                        "error": "Rate limit exceeded"
+                    }))
+                    continue
+                
+                # Store user message
+                message = {
+                    "role": "user",
+                    "content": content,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "type": message_type
+                }
+                
+                # Retrieve conversation memory
+                memory = await memory_extractor.get_conversation_memory(conversation_id, user_id)
+                
+                # Generate response using Gemini
+                # For streaming voice, we might want to send partial results
+                response_text = await llm_service.generate_text_streaming(
+                    content,
+                    memory=memory,
+                    callback=lambda chunk: manager.send_message(connection_id, json.dumps({
+                        "type": "partial_response",
+                        "content": chunk
+                    }))
+                )
+                
+                # Store assistant message
+                assistant_message = {
+                    "role": "assistant",
+                    "content": response_text,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "type": "text"  # Assuming text response
+                }
+                
+                # Update conversation in Firestore with both messages
+                conversation = await firestore.get_conversation(conversation_id, user_id)
+                if conversation:
+                    messages = conversation.get("messages", [])
+                    messages.append(message)
+                    messages.append(assistant_message)
                     
-                    conversation_history = [
-                        {"role": msg.role, "content": msg.content} for msg in messages
-                    ]
-                
-                # Save user message
-                user_message = ChatMessage(
-                    conversation_id=uuid.UUID(conversation_id),
-                    role="user",
-                    content=user_input,
-                    device_id=device_id
-                )
-                db.add(user_message)
-                db.commit()
-                
-                # Add to history
-                conversation_history.append({"role": "user", "content": user_input})
-                
-                # Broadcast user message to other devices
-                await manager.broadcast_to_conversation(
-                    conversation_id,
-                    {
-                        "type": "new_message",
-                        "conversation_id": conversation_id,
-                        "message": {
-                            "role": "user",
-                            "content": user_input,
-                            "device_id": device_id,
-                            "created_at": datetime.utcnow().isoformat()
-                        }
-                    }
-                )
-                
-                # Initialize full response for saving to database
-                full_response = ""
-                
-                # Generate streaming response
-                async def stream_callback(chunk):
-                    await manager.broadcast_to_conversation(
+                    # Update title if this is the first message
+                    title_update = {}
+                    if len(messages) <= 2:
+                        title = content[:30] + "..." if len(content) > 30 else content
+                        title_update = {"title": title}
+                    
+                    await firestore.add_or_update_conversation(
                         conversation_id,
+                        user_id,
                         {
-                            "type": "voice_chunk",
-                            "conversation_id": conversation_id,
-                            "content": chunk,
-                            "timestamp": datetime.utcnow().isoformat()
+                            "messages": messages,
+                            "updated_at": firestore.server_timestamp(),
+                            **title_update
                         }
                     )
                 
-                # Stream the response
-                async for chunk in generate_streaming_response(
-                    conversation_history, 
-                    message_data.get("model", "gemini-1.5-flash"),
-                    stream_callback
-                ):
-                    full_response += chunk
+                # Send complete response
+                await manager.send_message(connection_id, json.dumps({
+                    "type": "response",
+                    "content": response_text,
+                    "conversation_id": conversation_id
+                }))
                 
-                # Save the complete assistant response to database
-                assistant_message = ChatMessage(
-                    conversation_id=uuid.UUID(conversation_id),
-                    role="assistant",
-                    content=full_response,
-                    device_id="system"
-                )
-                db.add(assistant_message)
-                db.commit()
+                # Periodically extract memory (e.g., every 5 messages)
+                if len(messages) % 5 == 0:
+                    asyncio.create_task(memory_extractor.extract_key_info(conversation_id, user_id))
                 
-                # Update conversation history and cache in Firestore
-                conversation_history.append({"role": "assistant", "content": full_response})
-                await cache_conversation(conversation_id, conversation_history)
-                
-                # Update conversation metadata
-                conversation = db.query(Conversation).filter(
-                    Conversation.id == uuid.UUID(conversation_id)
-                ).first()
-                if conversation:
-                    conversation.last_synced_device = device_id
-                    conversation.updated_at = datetime.utcnow()
-                    db.commit()
-                
-                # Send complete message notification
-                await manager.broadcast_to_conversation(
-                    conversation_id,
-                    {
-                        "type": "voice_response_complete",
-                        "conversation_id": conversation_id,
-                        "timestamp": datetime.utcnow().isoformat()
-                    }
-                )
-                
-            elif message_type == "heartbeat":
-                # Respond to heartbeat
-                await websocket.send_json({
-                    "type": "heartbeat_ack",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-                
-            elif message_type == "leave":
-                # Leave conversation
-                break
-                
-    except WebSocketDisconnect:
-        # Handle disconnection
-        await manager.disconnect(device_id)
-        await manager.leave_conversation(conversation_id, device_id)
-        await manager.broadcast_to_conversation(
-            conversation_id,
-            {
-                "type": "device_disconnected",
-                "device_id": device_id,
-                "conversation_id": conversation_id,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        )
+            except json.JSONDecodeError:
+                await manager.send_message(connection_id, json.dumps({
+                    "type": "error",
+                    "error": "Invalid JSON"
+                }))
+            except Exception as e:
+                logger.error(f"Error in voice websocket: {str(e)}")
+                await manager.send_message(connection_id, json.dumps({
+                    "type": "error",
+                    "error": f"Server error: {str(e)}"
+                }))
     
-    finally:
-        # Clean up
-        db.close()
-        await manager.disconnect(device_id)
-        await manager.leave_conversation(conversation_id, device_id)
-
-# Verify a device using Firestore
-async def verify_device(device_id: str) -> bool:
-    """Verify a device is registered and authorized using Firestore"""
-    try:
-        # Get device data from Firestore
-        device_data = await get_document("devices", device_id)
-        if not device_data:
-            logger.warning(f"Unauthorized device: {device_id}")
-            return False
-        
-        if not device_data.get("verified"):
-            logger.warning(f"Device not verified: {device_id}")
-            return False
-        
-        return True
+    except WebSocketDisconnect:
+        manager.disconnect(connection_id)
     except Exception as e:
-        logger.error(f"Error verifying device: {e}")
-        return False
-
-# This is causing a route conflict - change to a different path
-@router.post("/gemini", response_model=ChatResponse)
-@limiter.limit("5/minute")
-async def gemini_chat(
-    request: Request,
-    request_data: ChatRequest,
-    token: str = Depends(verify_token),
-    db: AsyncSession = Depends(get_db)
-) -> ChatResponse:
-    """
-    Handle chat requests by sending user text to the Gemini API.
-    Uses token-based authentication.
-    """
-    try:
-        logger.debug(f"Received chat request with text: {request_data.text}")
-        user_text = request_data.text.strip()
-        if not user_text:
-            raise HTTPException(status_code=400, detail="Empty message not allowed.")
-        
-        # Check that the device is verified using Firestore
-        device_verified = await verify_device(request_data.device_id)
-        if not device_verified:
-            raise AuthenticationError(detail="Device not authorized")
-        
-        timestamp = int(time.time() * 1000)
-        
-        # Save the user message.
-        new_message = ChatMessage(message=user_text, is_user=True, timestamp=timestamp)
-        db.add(new_message)
-        
-        # Retrieve conversation summaries.
-        scalar_result = await db.execute(select(ConversationSummary))
-        summaries = scalar_result.scalars().all()
-        aggregated_memory = "; ".join([f"{s.label}: {s.summary}" for s in summaries]) if summaries else ""
-        logger.debug(f"Aggregated memory: {aggregated_memory}")
-        
-        # Build the prompt for the Gemini API.
-        prompt = f"Remember: {aggregated_memory}\nUser: {user_text}" if aggregated_memory else f"User: {user_text}"
-        logger.debug(f"Constructed prompt: {prompt}")
-        
-        # Call the Gemini API asynchronously.
-        ai_response = await call_gemini_text_async(prompt)
-        logger.debug(f"Received AI response: {ai_response}")
-        
-        # Save the assistant's message.
-        new_assistant_message = ChatMessage(message=ai_response, is_user=False, timestamp=timestamp)
-        db.add(new_assistant_message)
-        await db.commit()
-        logger.info("Chat messages saved successfully.")
-        
-        return ChatResponse(answer=ai_response, memory_updated=False)
-    except HTTPException as http_ex:
-        raise http_ex
-    except ValidationError as validation_error:
-        logger.error(f"Validation Error: {validation_error}", exc_info=True)
-        raise HTTPException(status_code=422, detail=validation_error.errors()) from validation_error
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in chat endpoint: {e}", exc_info=True)
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {e}") from e
-    except GeminiAPIError as e:
-        logger.error(f"Gemini API error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Gemini API error: {e}") from e
-    except Exception as e:
-        logger.error(f"Error in chat endpoint: {e}", exc_info=True)
-        await db.rollback()
-        raise HTTPException(status_code=500, detail="Internal Server Error in chat endpoint") from e
-
-async def call_gemini_text_async(prompt: str) -> str:
-    """Call the Gemini API for a text response asynchronously."""
-    logger.debug(f"Calling Gemini API with prompt: {prompt}")
-    try:
-        response = await asyncio.to_thread(chat_session.send_message, prompt)
-        answer = response.text
-        logger.debug(f"Gemini API returned answer: {answer}")
-        return answer
-    except Exception as e:
-        logger.error(f"Error calling Gemini API: {e}", exc_info=True)
-        raise GeminiAPIError(detail=f"Error calling Gemini API: {e}")
-
-async def periodic_memory_sync() -> None:
-    """
-    Periodically synchronize conversation memory.
-    """
-    while True:
-        logger.debug("Running periodic memory sync.")
-        await asyncio.sleep(3600)
-
-@router.post("/sync", response_model=SyncResponse)
-async def sync_device(
-    sync_request: SyncRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Synchronize data between device and backend
-    """
-    try:
-        # Get last sync timestamp from device
-        last_sync = sync_request.last_sync_timestamp
-        
-        # Fetch conversations updated since last sync
-        updated_conversations = await db.get_conversations_since(
-            user_id=current_user.id,
-            since_timestamp=last_sync
-        )
-        
-        # Fetch user settings updated since last sync
-        updated_settings = await db.get_settings_since(
-            user_id=current_user.id,
-            since_timestamp=last_sync
-        )
-        
-        # Process any pending updates from the device
-        if sync_request.local_changes:
-            await db.apply_device_changes(
-                user_id=current_user.id,
-                device_id=sync_request.device_id,
-                changes=sync_request.local_changes
-            )
-        
-        # Get current server timestamp for next sync
-        current_timestamp = datetime.utcnow().isoformat()
-        
-        return SyncResponse(
-            conversations=updated_conversations,
-            settings=updated_settings,
-            server_timestamp=current_timestamp
-        )
-    except Exception as e:
-        logger.error(f"Sync error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Synchronization failed"
-        )
+        logger.error(f"Unexpected error in voice websocket: {str(e)}")
+        try:
+            manager.disconnect(connection_id)
+        except:
+            pass

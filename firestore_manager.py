@@ -1,239 +1,175 @@
-"""
-Firestore client manager for Eva backend.
-Provides functions for interacting with Firestore collections.
-"""
+import firebase_admin
+from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
+from typing import Dict, Any, List, Optional
+import os
 import logging
-import asyncio
-from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime, timedelta
-from functools import wraps
+from datetime import datetime
 
-from google.cloud import firestore
-from config import FIRESTORE_COLLECTION_PREFIX
-
-logger = logging.getLogger(__name__)
-
-# Singleton firestore client
-_firestore_client = None
-
-def get_firestore_client() -> firestore.Client:
-    """Get or create the Firestore client."""
-    global _firestore_client
-    if _firestore_client is None:
-        try:
-            _firestore_client = firestore.Client()
-            logger.info("Firestore client initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize Firestore client: {e}")
-            raise
-    return _firestore_client
-
-def _get_collection_name(collection: str) -> str:
-    """Add prefix to collection name if configured."""
-    if FIRESTORE_COLLECTION_PREFIX:
-        return f"{FIRESTORE_COLLECTION_PREFIX}{collection}"
-    return collection
-
-def _handle_firestore_errors(func):
-    """Decorator to handle Firestore errors."""
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Firestore operation failed: {func.__name__} - {str(e)}")
-            return None if "get" in func.__name__ else False
-    return wrapper
-
-@_handle_firestore_errors
-async def store_document(collection: str, document_id: str, data: Dict[str, Any]) -> bool:
-    """Store a document in Firestore."""
-    client = get_firestore_client()
-    collection_name = _get_collection_name(collection)
+class FirestoreManager:
+    _instance = None
     
-    # Add metadata
-    data["updated_at"] = datetime.utcnow().isoformat()
-    if "created_at" not in data:
-        data["created_at"] = datetime.utcnow().isoformat()
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(FirestoreManager, cls).__new__(cls)
+            
+            # Initialize only once
+            try:
+                # Check if already initialized
+                firebase_admin.get_app()
+            except ValueError:
+                # Initialize with credentials
+                cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                if cred_path and os.path.exists(cred_path):
+                    cred = credentials.Certificate(cred_path)
+                    firebase_admin.initialize_app(cred)
+                else:
+                    # Use application default credentials
+                    firebase_admin.initialize_app()
+            
+            cls._instance.db = firestore.client()
+            cls._instance.logger = logging.getLogger(__name__)
+            
+        return cls._instance
     
-    # Run in a thread to avoid blocking
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: client.collection(collection_name).document(document_id).set(data)
-    )
+    def server_timestamp(self):
+        """Return a server timestamp object"""
+        return firestore.SERVER_TIMESTAMP
     
-    logger.debug(f"Stored document in {collection_name}/{document_id}")
-    return True
-
-@_handle_firestore_errors
-async def get_document(collection: str, document_id: str) -> Optional[Dict[str, Any]]:
-    """Get a document from Firestore."""
-    client = get_firestore_client()
-    collection_name = _get_collection_name(collection)
+    # Device methods
+    async def add_or_update_device(self, device_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Add or update a device in Firestore"""
+        device_ref = self.db.collection("devices").document(device_id)
+        device_ref.set(data, merge=True)
+        return data
     
-    # Run in a thread to avoid blocking
-    loop = asyncio.get_event_loop()
-    doc_snapshot = await loop.run_in_executor(
-        None, 
-        lambda: client.collection(collection_name).document(document_id).get()
-    )
+    async def get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """Get a device from Firestore"""
+        device_ref = self.db.collection("devices").document(device_id)
+        device = device_ref.get()
+        return device.to_dict() if device.exists else None
     
-    if doc_snapshot.exists:
-        return doc_snapshot.to_dict()
-    return None
-
-@_handle_firestore_errors
-async def update_document(collection: str, document_id: str, data: Dict[str, Any]) -> bool:
-    """Update specific fields in a document."""
-    client = get_firestore_client()
-    collection_name = _get_collection_name(collection)
+    async def delete_device(self, device_id: str) -> bool:
+        """Delete a device from Firestore"""
+        self.db.collection("devices").document(device_id).delete()
+        return True
     
-    # Add updated timestamp
-    data["updated_at"] = datetime.utcnow().isoformat()
+    # Token management
+    async def add_active_token(self, device_id: str, jti: str, expiry: datetime) -> None:
+        """Add an active token to Firestore"""
+        token_ref = self.db.collection("tokens").document(jti)
+        token_ref.set({
+            "device_id": device_id,
+            "expires_at": expiry,
+            "revoked": False,
+            "created_at": self.server_timestamp()
+        })
     
-    # Run in a thread to avoid blocking
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: client.collection(collection_name).document(document_id).update(data)
-    )
+    async def revoke_token(self, jti: str, device_id: str) -> None:
+        """Revoke a token in Firestore"""
+        token_ref = self.db.collection("tokens").document(jti)
+        token_ref.set({"revoked": True}, merge=True)
     
-    logger.debug(f"Updated document {collection_name}/{document_id}")
-    return True
-
-@_handle_firestore_errors
-async def delete_document(collection: str, document_id: str) -> bool:
-    """Delete a document from Firestore."""
-    client = get_firestore_client()
-    collection_name = _get_collection_name(collection)
+    async def is_token_revoked(self, jti: str) -> bool:
+        """Check if a token is revoked"""
+        token_ref = self.db.collection("tokens").document(jti)
+        token = token_ref.get()
+        if not token.exists:
+            return True
+        return token.to_dict().get("revoked", False)
     
-    # Run in a thread to avoid blocking
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: client.collection(collection_name).document(document_id).delete()
-    )
-    
-    logger.debug(f"Deleted document {collection_name}/{document_id}")
-    return True
-
-@_handle_firestore_errors
-async def add_to_collection(collection: str, data: Dict[str, Any]) -> Optional[str]:
-    """Add a document to a collection with auto-generated ID."""
-    client = get_firestore_client()
-    collection_name = _get_collection_name(collection)
-    
-    # Add metadata
-    data["created_at"] = datetime.utcnow().isoformat()
-    data["updated_at"] = datetime.utcnow().isoformat()
-    
-    # Run in a thread to avoid blocking
-    loop = asyncio.get_event_loop()
-    doc_ref = await loop.run_in_executor(
-        None,
-        lambda: client.collection(collection_name).add(data)[1]
-    )
-    
-    logger.debug(f"Added document to {collection_name} with ID {doc_ref.id}")
-    return doc_ref.id
-
-@_handle_firestore_errors
-async def query_collection(
-    collection: str, 
-    filters: List[Tuple[str, str, Any]], 
-    limit: int = 100,
-    order_by: Optional[str] = None,
-    direction: str = "DESCENDING"
-) -> List[Dict[str, Any]]:
-    """
-    Query documents in a collection with multiple filters.
-    
-    Args:
-        collection: Name of the collection
-        filters: List of (field, operator, value) tuples
-        limit: Maximum number of results
-        order_by: Field to order by
-        direction: "ASCENDING" or "DESCENDING"
+    # Conversation methods
+    async def add_or_update_conversation(self, conversation_id: str, user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Add or update a conversation in Firestore"""
+        # Include user_id in the conversation data
+        data["user_id"] = user_id
         
-    Returns:
-        List of documents matching the query
-    """
-    client = get_firestore_client()
-    collection_name = _get_collection_name(collection)
+        conversation_ref = self.db.collection("conversations").document(conversation_id)
+        conversation_ref.set(data, merge=True)
+        return data
     
-    # Create query
-    query = client.collection(collection_name)
+    async def get_conversation(self, conversation_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get a conversation from Firestore"""
+        conversation_ref = self.db.collection("conversations").document(conversation_id)
+        conversation = conversation_ref.get()
+        
+        if not conversation.exists:
+            return None
+            
+        data = conversation.to_dict()
+        
+        # Verify ownership
+        if data.get("user_id") != user_id:
+            self.logger.warning(f"User {user_id} attempted to access conversation {conversation_id} owned by {data.get('user_id')}")
+            return None
+            
+        return data
     
-    # Add filters
-    for field, operator, value in filters:
-        query = query.where(field, operator, value)
+    async def get_conversations_by_user(self, user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get conversations by user ID"""
+        conversations = []
+        
+        query = (
+            self.db.collection("conversations")
+            .where(filter=FieldFilter("user_id", "==", user_id))
+            .order_by("updated_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+        )
+        
+        results = query.stream()
+        
+        for doc in results:
+            conversation = doc.to_dict()
+            conversation["id"] = doc.id
+            conversations.append(conversation)
+            
+        return conversations
     
-    # Add ordering
-    if order_by:
-        direction_obj = firestore.Query.DESCENDING if direction == "DESCENDING" else firestore.Query.ASCENDING
-        query = query.order_by(order_by, direction=direction_obj)
-    
-    # Add limit
-    query = query.limit(limit)
-    
-    # Run query in a thread to avoid blocking
-    loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(None, lambda: query.stream())
-    
-    return [doc.to_dict() for doc in results]
+    async def delete_conversation(self, conversation_id: str, user_id: str) -> bool:
+        """Delete a conversation from Firestore (soft delete)"""
+        # Get the conversation to verify ownership
+        conversation = await self.get_conversation(conversation_id, user_id)
+        
+        if not conversation:
+            return False
+            
+        # Soft delete by updating the status
+        conversation_ref = self.db.collection("conversations").document(conversation_id)
+        conversation_ref.set({
+            "deleted": True,
+            "updated_at": self.server_timestamp()
+        }, merge=True)
+        
+        return True
 
-@_handle_firestore_errors
-async def document_exists(collection: str, document_id: str) -> bool:
-    """Check if a document exists."""
-    client = get_firestore_client()
-    collection_name = _get_collection_name(collection)
+    # Sync methods
+    async def add_sync_record(self, record_data: Dict[str, Any], user_id: str) -> str:
+        """Add a sync record to Firestore"""
+        # Add user_id to the record
+        record_data["user_id"] = user_id
+        record_data["timestamp"] = self.server_timestamp()
+        
+        record_ref = self.db.collection("sync_records").document()
+        record_ref.set(record_data)
+        
+        return record_ref.id
     
-    # Run in a thread to avoid blocking
-    loop = asyncio.get_event_loop()
-    doc_snapshot = await loop.run_in_executor(
-        None, 
-        lambda: client.collection(collection_name).document(document_id).get()
-    )
-    
-    return doc_snapshot.exists
-
-# Specialized functions for authentication
-
-async def store_with_expiry(collection: str, doc_id: str, data: Dict[str, Any], 
-                           expires_in_seconds: int) -> bool:
-    """Store a document with expiration time."""
-    expiry = datetime.utcnow() + timedelta(seconds=expires_in_seconds)
-    data["expires_at"] = expiry.isoformat()
-    return await store_document(collection, doc_id, data)
-
-async def get_if_not_expired(collection: str, doc_id: str) -> Optional[Dict[str, Any]]:
-    """Get a document if it hasn't expired."""
-    data = await get_document(collection, doc_id)
-    if not data or "expires_at" not in data:
-        return None
-    
-    expires_at = datetime.fromisoformat(data["expires_at"])
-    if datetime.utcnow() > expires_at:
-        # Expired - delete it
-        await delete_document(collection, doc_id)
-        return None
-    
-    return data
-
-async def get_rate_limit(key: str) -> Tuple[int, datetime]:
-    """Get current rate limit count and expiry for a key."""
-    data = await get_document("rate_limits", key)
-    if not data:
-        return 0, datetime.utcnow()
-    
-    count = data.get("count", 0)
-    expires_at = datetime.fromisoformat(data.get("expires_at"))
-    return count, expires_at
-
-async def update_rate_limit(key: str, count: int, expires_at: datetime) -> bool:
-    """Update rate limit data."""
-    return await store_document("rate_limits", key, {
-        "count": count,
-        "expires_at": expires_at.isoformat()
-    })
+    async def get_sync_records_for_device(self, device_id: str, user_id: str) -> List[Dict[str, Any]]:
+        """Get sync records for a device that are not created by the device"""
+        records = []
+        
+        query = (
+            self.db.collection("sync_records")
+            .where(filter=FieldFilter("user_id", "==", user_id))
+            .where(filter=FieldFilter("origin_device_id", "!=", device_id))
+            .order_by("timestamp")
+        )
+        
+        results = query.stream()
+        
+        for doc in results:
+            record = doc.to_dict()
+            record["id"] = doc.id
+            records.append(record)
+            
+        return records

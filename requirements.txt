@@ -3,40 +3,37 @@ fastapi>=0.100.0
 uvicorn>=0.23.0
 gunicorn>=20.1.0
 
-# Rate Limiting
-slowapi>=0.1.5
-
 # Authentication & Security
 python-jose[cryptography]>=3.3.0
 pyjwt>=2.6.0
 python-multipart>=0.0.6
 cryptography>=40.0.0
-certifi>=2023.5.7
 bcrypt>=4.0.1
 passlib>=1.7.4
 
-# Configuration & Data Validation
+# Data Validation & Configuration
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 python-dotenv>=1.0.0
 
 # Database
 sqlalchemy>=2.0.0
-tenacity>=8.2.0
 aiosqlite>=0.17.0
+tenacity>=8.2.0
 
-# Firestore (replacing Redis)
+# Google Cloud
+google-cloud-core>=2.0.0 # Ensure compatibility with PermissionDenied
 google-cloud-firestore>=2.11.0
+google-cloud-secret-manager>=2.16.0
+google-cloud-logging>=3.5.0
+google-cloud-storage>=2.9.0
+google-auth>=2.17.0
+firebase-admin>=6.1.0
 
 # AI/ML Services
 google-generativeai>=0.3.1
 
-# Google Cloud
-google-cloud-secret-manager>=2.16.0
-google-cloud-logging>=3.5.0
-google-cloud-storage>=2.9.0
-
-# Networking & API Clients
+# Networking & HTTP Clients
 httpx>=0.24.0
 requests>=2.28.0
 websockets>=10.4
@@ -50,3 +47,7 @@ pytz>=2023.3
 orjson>=3.8.0
 backoff>=2.2.1
 structlog>=23.1.0
+
+# Other
+certifi>=2023.5.7 # General purpose certificate library
+slowapi>=0.1.5 # Rate Limiting

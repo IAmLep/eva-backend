@@ -3,13 +3,49 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 import uuid
 from firebase_admin import firestore
-from google.cloud.exceptions import NotFound, PermissionDenied, ServerError
+from google.cloud.exceptions import NotFound
+from google.api_core.exceptions import PermissionDenied, ServerError
 
 class FirestoreManager:
+    """Manager for Firestore database operations with lazy initialization"""
+    
+    _instance = None
+    _db = None
+    
+    def __new__(cls):
+        """Ensure singleton pattern"""
+        if cls._instance is None:
+            cls._instance = super(FirestoreManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
     def __init__(self):
-        """Initialize Firestore manager with database connection"""
-        self.db = firestore.client()
-        self.logger = logging.getLogger(__name__)
+        """Initialize the manager (but not the client yet)"""
+        if not self._initialized:
+            self.logger = logging.getLogger(__name__)
+            self.logger.info("FirestoreManager initialized (client will be created on first use)")
+            self._initialized = True
+    
+    @property
+    def db(self):
+        """Lazy-initialized Firestore client property
+        
+        Only creates the client when actually accessed, allowing Firebase to be
+        initialized before the client is created.
+        """
+        if FirestoreManager._db is None:
+            self.logger.info("Creating Firestore client")
+            try:
+                FirestoreManager._db = firestore.client()
+                self.logger.info("Firestore client created successfully")
+            except ValueError as e:
+                self.logger.error(f"Firebase not initialized: {str(e)}")
+                self.logger.error("Make sure firebase_admin.initialize_app() is called before accessing Firestore")
+                raise ValueError("Firebase not initialized. Call firebase_admin.initialize_app() first") from e
+            except Exception as e:
+                self.logger.error(f"Failed to create Firestore client: {str(e)}")
+                raise
+        return FirestoreManager._db
 
     # Helper method for validating conversation ownership
     async def verify_conversation_ownership(self, conversation_id: str, user_id: str) -> bool:
@@ -334,3 +370,6 @@ class FirestoreManager:
         except Exception as e:
             self.logger.error(f"Error marking sync record {record_id} as synced: {str(e)}")
             return False
+
+# Create a singleton instance
+firestore_manager = FirestoreManager()

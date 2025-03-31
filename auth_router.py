@@ -13,7 +13,6 @@ from auth import (
 )
 from firestore_manager import firestore_manager
 from api_tools import verify_device
-from logging_config import setup_logging
 
 # Setup logging
 logger = logging.getLogger(__name__)

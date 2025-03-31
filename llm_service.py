@@ -3,7 +3,6 @@ import google.generativeai as genai
 import logging
 from typing import Dict, List, Any, Optional, Callable, AsyncGenerator
 import asyncio
-from logging_config import setup_logging
 
 # Setup logging
 logger = logging.getLogger(__name__)

@@ -14,7 +14,6 @@ from llm_service import llm_service
 from memory_extractor import memory_extractor
 from firestore_manager import firestore_manager
 from rate_limiter import RateLimiter
-from logging_config import setup_logging
 from error_middleware import ErrorMiddleware
 
 # Setup logging

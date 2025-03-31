@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 import os
 import uuid
 import logging
-from logging_config import setup_logging
 from firestore_manager import firestore_manager
 
 # Setup logging

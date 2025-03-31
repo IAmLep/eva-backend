@@ -5,7 +5,6 @@ from datetime import datetime
 
 from llm_service import llm_service
 from firestore_manager import firestore_manager
-from logging_config import setup_logging
 
 # Setup logging
 logger = logging.getLogger(__name__)

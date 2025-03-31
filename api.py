@@ -31,33 +31,16 @@ from websocket_manager import manager
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Eva LLM API")
-
+# Create FastAPI app instance for router 
 router = APIRouter()
 
-# CORS configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this to specific origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("startup")
-async def startup_event():
-    # Start the heartbeat task
-    asyncio.create_task(manager.broadcast_heartbeat())
-    # Restore WebSocket connections from Firestore if implemented
-    if hasattr(manager, 'restore_from_firestore'):
-        asyncio.create_task(manager.restore_from_firestore())
-
-# Initialize the Gemini client.
+# Initialize the Gemini client
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 chat_session = gemini_model.start_chat(history=[])
 
-@router.post("/chat", response_model=MessageResponse)
+# Main chat endpoint - changed to / so it becomes /api/
+@router.post("/", response_model=MessageResponse)
 @rate_limit(limit=20, period=60)  # 20 requests per minute
 async def chat_endpoint(
     message_request: MessageRequest,
@@ -103,7 +86,7 @@ async def chat_endpoint(
     conversation.updated_at = datetime.utcnow()
     db.commit()
     
-    # Get conversation history
+    # Get conversation history from Firestore
     conversation_history = await get_cached_conversation(str(conversation_id))
     if not conversation_history:
         messages = db.query(ChatMessage).filter(
@@ -140,7 +123,7 @@ async def chat_endpoint(
     db.add(assistant_message)
     db.commit()
     
-    # Update conversation history and cache it
+    # Update conversation history and cache it in Firestore
     conversation_history.append({"role": "assistant", "content": llm_response})
     background_tasks.add_task(cache_conversation, str(conversation_id), conversation_history)
     
@@ -165,7 +148,8 @@ async def chat_endpoint(
         created_at=datetime.utcnow().isoformat()
     )
 
-@app.get("/api/conversations", response_model=List[ConversationRequest])
+# MOVED from app to router so path becomes /api/conversations
+@router.get("/conversations", response_model=List[ConversationRequest])
 async def get_conversations(
     db: Session = Depends(get_db),
     auth_data: Dict[str, Any] = Depends(verify_token)
@@ -191,8 +175,9 @@ async def get_conversations(
         ) for conv in conversations
     ]
 
-@app.post("/api/voice", response_model=MessageResponse)
-@rate_limit(limit=5, period=60)  # 5 requests per minute - voice is more resource intensive
+# Move voice endpoint to router
+@router.post("/voice", response_model=MessageResponse)
+@rate_limit(limit=5, period=60)  # 5 requests per minute
 async def voice_endpoint(
     message_request: MessageRequest,
     background_tasks: BackgroundTasks,
@@ -200,11 +185,11 @@ async def voice_endpoint(
     db: Session = Depends(get_db),
     user_data: dict = Depends(verify_token)
 ):
-    # This is the same as chat_endpoint but could be optimized for voice interactions
-    # For now, we'll just call the chat endpoint
+    # Call the chat endpoint
     return await chat_endpoint(message_request, background_tasks, request, db, user_data)
 
-@app.websocket("/ws/voice/{conversation_id}")
+# Keep WebSocket path on router
+@router.websocket("/voice/{conversation_id}")
 async def voice_websocket(
     websocket: WebSocket, 
     conversation_id: str,
@@ -215,13 +200,11 @@ async def voice_websocket(
         await websocket.close(code=1008, reason="Missing device authentication")
         return
     
-    # Replace the direct token check with JWT verification
+    # JWT verification
     try:
-        # Verify token and extract device_id from it
         payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
         token_device_id = payload.get("sub")
         
-        # Verify the provided device_id matches the token
         if token_device_id != device_id:
             await websocket.close(code=1008, reason="Device ID mismatch")
             return
@@ -250,18 +233,16 @@ async def voice_websocket(
         
         # Process messages
         while True:
-            # Receive message from WebSocket
             data = await websocket.receive_text()
             message_data = json.loads(data)
             
-            # Handle different message types
             message_type = message_data.get("type", "")
             
             if message_type == "voice_input":
                 # Process voice input (text transcribed from voice)
                 user_input = message_data.get("content", "")
                 
-                # Get conversation history
+                # Get conversation history from Firestore
                 conversation_history = await get_cached_conversation(conversation_id)
                 if not conversation_history:
                     messages = db.query(ChatMessage).filter(
@@ -333,7 +314,7 @@ async def voice_websocket(
                 db.add(assistant_message)
                 db.commit()
                 
-                # Update conversation history and cache
+                # Update conversation history and cache in Firestore
                 conversation_history.append({"role": "assistant", "content": full_response})
                 await cache_conversation(conversation_id, conversation_history)
                 
@@ -387,10 +368,11 @@ async def voice_websocket(
         await manager.disconnect(device_id)
         await manager.leave_conversation(conversation_id, device_id)
 
-# Create a helper function to verify devices using Firestore
+# Verify a device using Firestore
 async def verify_device(device_id: str) -> bool:
     """Verify a device is registered and authorized using Firestore"""
     try:
+        # Get device data from Firestore
         device_data = await get_document("devices", device_id)
         if not device_data:
             logger.warning(f"Unauthorized device: {device_id}")
@@ -402,12 +384,13 @@ async def verify_device(device_id: str) -> bool:
         
         return True
     except Exception as e:
-        logger.error(f"Error verifying device {device_id}: {e}")
+        logger.error(f"Error verifying device: {e}")
         return False
 
-@router.post("/chat", response_model=ChatResponse)
+# This is causing a route conflict - change to a different path
+@router.post("/gemini", response_model=ChatResponse)
 @limiter.limit("5/minute")
-async def chat_endpoint(
+async def gemini_chat(
     request: Request,
     request_data: ChatRequest,
     token: str = Depends(verify_token),
@@ -424,13 +407,8 @@ async def chat_endpoint(
             raise HTTPException(status_code=400, detail="Empty message not allowed.")
         
         # Check that the device is verified using Firestore
-        device_data = await get_document("devices", request_data.device_id)
-        if not device_data:
-            logger.warning(f"Unauthorized device: {request_data.device_id}")
-            raise AuthenticationError(detail="Device not authorized")
-        
-        if not device_data.get("verified"):
-            logger.warning(f"Device not verified: {request_data.device_id}")
+        device_verified = await verify_device(request_data.device_id)
+        if not device_verified:
             raise AuthenticationError(detail="Device not authorized")
         
         timestamp = int(time.time() * 1000)

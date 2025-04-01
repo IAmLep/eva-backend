@@ -15,14 +15,41 @@ import json
 import logging
 import os
 import uuid
+import time
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union, Callable
+from typing import Any, Dict, List, Optional, Tuple, Union, Callable, AsyncGenerator
 
 import google.generativeai as genai
-from google.generativeai.types import FunctionDeclaration, Tool
-from google.generativeai.types.generation_types import GenerationConfig
+from google.api_core.exceptions import GoogleAPIError
 from pydantic import BaseModel, Field
+from fastapi import HTTPException, status
+
+# Update imports for compatibility with latest google-generativeai SDK
+try:
+    # First try the newer import path (0.3.0+)
+    from google.generativeai.types import FunctionDeclaration, Tool
+    from google.generativeai.types.generation_types import GenerationConfig
+except ImportError:
+    try:
+        # Fall back to alternative import paths
+        from google.generativeai.types.generation_types import FunctionDeclaration, Tool, GenerationConfig
+    except ImportError:
+        # If both fail, use direct dictionary objects instead of these classes
+        logging.warning("Could not import Tool types, using dict-based format instead")
+        # Define placeholder classes that we'll use in the code
+        class FunctionDeclaration(dict):
+            def __init__(self, name, description, parameters):
+                super().__init__(name=name, description=description, parameters=parameters)
+                
+        class Tool(dict):
+            def __init__(self, function_declarations):
+                super().__init__(function_declarations=function_declarations)
+        
+        # Also create a placeholder for GenerationConfig
+        class GenerationConfig(dict):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
 
 from cache_manager import cached
 from config import get_settings

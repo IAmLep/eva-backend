@@ -16,7 +16,7 @@ from enum import Enum
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, cast
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 
 from config import get_settings

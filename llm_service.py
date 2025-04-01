@@ -4,8 +4,8 @@ LLM Service module for EVA backend.
 This module provides integration with Gemini API for text generation,
 transcription, and function calling capabilities.
 
-Last updated: 2025-04-01 10:17:14
-Version: v1.8.7
+Last updated: 2025-04-01 12:34:32
+Version: v1.8.8
 Created by: IAmLep
 """
 
@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, Callable, AsyncGener
 import google.generativeai as genai
 from google.api_core.exceptions import GoogleAPIError
 from pydantic import BaseModel, Field
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, Response, status
 
 # Update imports for compatibility with latest google-generativeai SDK
 try:
@@ -444,6 +444,36 @@ async def transcribe_audio(audio_data: bytes) -> Optional[str]:
     except Exception as e:
         logger.error(f"Audio transcription error: {str(e)}")
         raise LLMServiceError(f"Failed to transcribe audio: {str(e)}")
+
+
+# Add the missing process_audio_stream function that websocket_manager imports
+async def process_audio_stream(audio_data: bytes) -> str:
+    """
+    Process audio stream data and transcribe to text.
+    
+    This function is used by the websocket manager to handle audio streams.
+    
+    Args:
+        audio_data: Raw audio data as bytes
+        
+    Returns:
+        str: Transcribed text
+        
+    Raises:
+        LLMServiceError: If processing fails
+    """
+    try:
+        # Use the existing transcribe function
+        transcription = await transcribe_audio(audio_data)
+        if not transcription:
+            raise LLMServiceError("Failed to transcribe audio: Empty result")
+        
+        logger.info(f"Successfully processed audio stream of {len(audio_data)} bytes")
+        return transcription
+    
+    except Exception as e:
+        logger.error(f"Error processing audio stream: {str(e)}")
+        raise LLMServiceError(f"Failed to process audio stream: {str(e)}")
 
 
 @cached(ttl=3600, key_prefix="voice_generation")

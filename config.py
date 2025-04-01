@@ -5,15 +5,16 @@ This module provides settings and configuration management
 using environment variables with Pydantic settings validation.
 
 Last updated: 2025-04-01
-Version: v1.6 (firestore integrations)
+Version: v1.6.1 (firestore integrations)
 """
 
+import json
 import logging
 import os
 from functools import lru_cache
 from typing import List, Optional, Union, Dict, Any
 
-from pydantic import AnyHttpUrl, Field, computed_field
+from pydantic import AnyHttpUrl, Field, computed_field, validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Logger configuration
@@ -62,9 +63,11 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30, description="Token expiration time in minutes")
     
     # CORS settings
-    CORS_ORIGINS: List[AnyHttpUrl] = Field(
-        default_factory=list,
-        description="List of allowed CORS origins"
+    # Fixed: Use a string instead of List[AnyHttpUrl] to avoid JSON parsing issues
+    CORS_ORIGINS_STR: Optional[str] = Field(
+        default=None,
+        description="List of allowed CORS origins as a comma-separated string",
+        env="CORS_ORIGINS"  # Map to the same env variable
     )
     
     # Firestore settings
@@ -104,6 +107,25 @@ class Settings(BaseSettings):
         default="INFO", 
         description="Logging level"
     )
+    
+    @computed_field
+    @property
+    def CORS_ORIGINS(self) -> List[str]:
+        """
+        Get parsed CORS origins.
+        
+        Returns:
+            List[str]: List of allowed CORS origins
+        """
+        if not self.CORS_ORIGINS_STR:
+            return []
+        
+        try:
+            # First try to parse as JSON
+            return json.loads(self.CORS_ORIGINS_STR)
+        except json.JSONDecodeError:
+            # If that fails, try to parse as comma-separated string
+            return [origin.strip() for origin in self.CORS_ORIGINS_STR.split(",") if origin.strip()]
     
     @computed_field
     @property
@@ -176,21 +198,27 @@ def get_settings() -> Settings:
     Returns:
         Settings: Application settings
     """
-    settings = Settings()
-    log_level = getattr(logging, settings.LOG_LEVEL, logging.INFO)
-    
-    # Setup basic logging config
-    if not logging.getLogger().handlers:
-        logging.basicConfig(
-            level=log_level,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        )
-    
-    # Log settings when in development mode
-    if settings.is_development:
-        logger.info(f"Loaded settings for {settings.ENVIRONMENT} environment")
-        # Log non-sensitive settings
-        safe_settings = settings.model_dump(exclude={"SECRET_KEY", "GEMINI_API_KEY"})
-        logger.debug(f"Settings: {safe_settings}")
-    
-    return settings
+    try:
+        settings = Settings()
+        log_level = getattr(logging, settings.LOG_LEVEL, logging.INFO)
+        
+        # Setup basic logging config
+        if not logging.getLogger().handlers:
+            logging.basicConfig(
+                level=log_level,
+                format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            )
+        
+        # Log settings when in development mode
+        if settings.is_development:
+            logger.info(f"Loaded settings for {settings.ENVIRONMENT} environment")
+            # Log non-sensitive settings
+            safe_settings = settings.model_dump(exclude={"SECRET_KEY", "GEMINI_API_KEY"})
+            logger.debug(f"Settings: {safe_settings}")
+        
+        return settings
+    except Exception as e:
+        # Add robust error handling to help diagnose settings issues
+        logger.error(f"Error loading settings: {str(e)}")
+        # Provide a fallback settings object with defaults
+        return Settings()

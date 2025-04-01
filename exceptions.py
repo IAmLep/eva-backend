@@ -4,8 +4,8 @@ Exceptions module for EVA backend.
 This module provides custom exception classes for consistent
 error handling throughout the application.
 
-Last updated: 2025-04-01 10:28:09
-Version: v1.8.6
+Last updated: 2025-04-01 12:57:16
+Version: v1.8.7
 Created by: IAmLep
 """
 
@@ -423,5 +423,41 @@ class SyncError(CustomException):
             detail=detail,
             code=code,
             status_code=409,
+            headers=headers
+        )
+
+
+class FunctionCallError(CustomException):
+    """
+    Function call-related errors.
+    
+    Raised when function calls made through the API tools fail.
+    
+    Examples:
+        - Invalid function arguments
+        - Function execution failed
+        - Unsupported function
+    """
+    def __init__(
+        self, 
+        detail: str = "Function call failed", 
+        code: str = "function_call_error",
+        function_name: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None
+    ):
+        """
+        Initialize function call error.
+        
+        Args:
+            detail: Human-readable error description
+            code: Machine-readable error code
+            function_name: Optional name of the failed function
+            headers: Optional response headers
+        """
+        self.function_name = function_name
+        super().__init__(
+            detail=detail,
+            code=code,
+            status_code=400,
             headers=headers
         )

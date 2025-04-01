@@ -1,4 +1,16 @@
+"""
+Main application module for EVA backend.
+
+This module sets up the FastAPI application with middleware, routes,
+and configuration.
+
+Last updated: 2025-04-01 19:50:00
+Version: v1.8.8 (Fixed API Router)
+Created by: IAmLep
+"""
+
 import logging
+import sys
 from contextlib import asynccontextmanager
 from typing import List
 
@@ -8,15 +20,48 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
-from auth import router as auth_router
-from auth_router import router as auth_api_router
 from config import get_settings
 from error_middleware import ErrorHandlerMiddleware
 from exceptions import CustomException
 from logging_config import configure_logging
-from memory_extractor import router as memory_router
-from secrets_router import router as secrets_router
-from websocket_manager import router as websocket_router
+
+# Import routers with error handling
+try:
+    from auth import router as auth_router
+except ImportError as e:
+    logging.warning(f"Unable to import auth router: {str(e)}")
+    auth_router = None
+
+try:
+    from auth_router import router as auth_api_router
+except ImportError as e:
+    logging.warning(f"Unable to import auth_api router: {str(e)}")
+    auth_api_router = None
+
+try:
+    from memory_extractor import router as memory_router
+except ImportError as e:
+    logging.warning(f"Unable to import memory router: {str(e)}")
+    memory_router = None
+
+try:
+    from secrets_router import router as secrets_router
+except ImportError as e:
+    logging.warning(f"Unable to import secrets router: {str(e)}")
+    secrets_router = None
+
+try:
+    from websocket_manager import router as websocket_router
+except ImportError as e:
+    logging.warning(f"Unable to import websocket router: {str(e)}")
+    websocket_router = None
+
+# Add import for the API router from api.py
+try:
+    from api import router as api_router
+except ImportError as e:
+    logging.warning(f"Unable to import API router: {str(e)}")
+    api_router = None
 
 
 @asynccontextmanager
@@ -54,7 +99,7 @@ def create_app() -> FastAPI:
     # Configure CORS
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
+        allow_origins=settings.CORS_ORIGINS or ["*"],  # Fallback to allow all if None
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -74,12 +119,38 @@ def create_app() -> FastAPI:
             content={"detail": exc.detail, "code": exc.code},
         )
     
-    # Register routers
-    app.include_router(auth_router.router, prefix="/auth", tags=["Authentication"])
-    app.include_router(auth_api_router, prefix="/api/auth", tags=["Auth API"])
-    app.include_router(secrets_router, prefix="/api/secrets", tags=["Secrets"])
-    app.include_router(memory_router, prefix="/api/memory", tags=["Memory"])
-    app.include_router(websocket_router, prefix="/ws", tags=["WebSocket"])
+    # Register routers with error handling
+    if auth_router:
+        app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
+    else:
+        logging.warning("Auth router not loaded")
+    
+    if auth_api_router:
+        app.include_router(auth_api_router, prefix="/api/auth", tags=["Auth API"])
+    else:
+        logging.warning("Auth API router not loaded")
+    
+    if secrets_router:
+        app.include_router(secrets_router, prefix="/api/secrets", tags=["Secrets"])
+    else:
+        logging.warning("Secrets router not loaded")
+    
+    if memory_router:
+        app.include_router(memory_router, prefix="/api/memory", tags=["Memory"])
+    else:
+        logging.warning("Memory router not loaded")
+    
+    if websocket_router:
+        app.include_router(websocket_router, prefix="/ws", tags=["WebSocket"])
+    else:
+        logging.warning("WebSocket router not loaded")
+    
+    # Add the API router from api.py
+    if api_router:
+        app.include_router(api_router, prefix="/api", tags=["API"])
+        logging.info("API router loaded successfully")
+    else:
+        logging.warning("API router not loaded")
     
     @app.get("/health")
     async def health_check():
@@ -89,7 +160,13 @@ def create_app() -> FastAPI:
     return app
 
 
-app = create_app()
+# Use a try-except block for the app creation to provide a clear error message
+try:
+    app = create_app()
+except Exception as e:
+    logging.error(f"Error creating app: {str(e)}")
+    # Exit with an error code if app creation fails
+    sys.exit(1)
 
 if __name__ == "__main__":
     uvicorn.run(

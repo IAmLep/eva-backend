@@ -49,7 +49,7 @@ class LLMService:
             
         except genai.types.BlockedPromptException as e:
             logger.error(f"Blocked prompt error: {str(e)}")
-            return f"I'm sorry, but I cannot respond to this prompt because it violates content safety guidelines."
+            return "I'm sorry, but I cannot respond to this prompt because it violates content safety guidelines."
         
         except genai.types.GenerateContentResponseError as e:
             logger.error(f"Error generating content: {str(e)}")
@@ -57,15 +57,15 @@ class LLMService:
         
         except genai.types.LimitExceededException as e:
             logger.error(f"API limit exceeded: {str(e)}")
-            return f"I'm sorry, the service is currently at capacity. Please try again later."
+            return "I'm sorry, the service is currently at capacity. Please try again later."
         
         except ConnectionError as e:
             logger.error(f"Connection error: {str(e)}")
-            return f"I'm sorry, there was a problem connecting to the AI service. Please check your internet connection."
+            return "I'm sorry, there was a problem connecting to the AI service. Please check your internet connection."
         
         except Exception as e:
             logger.error(f"Unexpected error in generate_text: {str(e)}")
-            return f"I'm sorry, I encountered an unexpected error. Please try again later."
+            return "I'm sorry, I encountered an unexpected error. Please try again later."
     
     async def generate_text_streaming(
         self, 
@@ -103,9 +103,9 @@ class LLMService:
                     # Continue streaming even if callback fails
             
             return full_response
-            
+                        
         except genai.types.BlockedPromptException as e:
-            error_msg = f"I'm sorry, but I cannot respond to this prompt because it violates content safety guidelines."
+            error_msg = "I'm sorry, but I cannot respond to this prompt because it violates content safety guidelines."
             logger.error(f"Blocked prompt error: {str(e)}")
             callback(error_msg)
             yield error_msg
@@ -117,19 +117,19 @@ class LLMService:
             yield error_msg
         
         except genai.types.LimitExceededException as e:
-            error_msg = f"I'm sorry, the service is currently at capacity. Please try again later."
+            error_msg = "I'm sorry, the service is currently at capacity. Please try again later."
             logger.error(f"API limit exceeded: {str(e)}")
             callback(error_msg)
             yield error_msg
         
         except ConnectionError as e:
-            error_msg = f"I'm sorry, there was a problem connecting to the AI service. Please check your internet connection."
+            error_msg = "I'm sorry, there was a problem connecting to the AI service. Please check your internet connection."
             logger.error(f"Connection error: {str(e)}")
             callback(error_msg)
             yield error_msg
         
         except Exception as e:
-            error_msg = f"I'm sorry, I encountered an unexpected error. Please try again later."
+            error_msg = "I'm sorry, I encountered an unexpected error. Please try again later."
             logger.error(f"Unexpected error in generate_text_streaming: {str(e)}")
             callback(error_msg)
             yield error_msg
@@ -191,7 +191,7 @@ class LLMService:
             return {
                 "type": "error",
                 "error_type": "blocked_prompt",
-                "response_text": f"I'm sorry, but I cannot respond to this prompt because it violates content safety guidelines."
+                "response_text": "I'm sorry, but I cannot respond to this prompt because it violates content safety guidelines."
             }
         
         except genai.types.GenerateContentResponseError as e:
@@ -207,7 +207,7 @@ class LLMService:
             return {
                 "type": "error",
                 "error_type": "limit_exceeded",
-                "response_text": f"I'm sorry, the service is currently at capacity. Please try again later."
+                "response_text": "I'm sorry, the service is currently at capacity. Please try again later."
             }
         
         except ConnectionError as e:
@@ -215,7 +215,7 @@ class LLMService:
             return {
                 "type": "error",
                 "error_type": "connection_error",
-                "response_text": f"I'm sorry, there was a problem connecting to the AI service. Please check your internet connection."
+                "response_text": "I'm sorry, there was a problem connecting to the AI service. Please check your internet connection."
             }
         
         except Exception as e:
@@ -223,7 +223,7 @@ class LLMService:
             return {
                 "type": "error",
                 "error_type": "unexpected",
-                "response_text": f"I'm sorry, I encountered an unexpected error. Please try again later."
+                "response_text": "I'm sorry, I encountered an unexpected error. Please try again later."
             }
 
 # Create a singleton instance

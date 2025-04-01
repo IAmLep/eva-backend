@@ -9,7 +9,7 @@ from datetime import datetime
 from auth import validate_device_token
 from firestore_manager import FirestoreManager
 
-class WebSocketManager:
+class ConnectionManager:  # Changed from WebSocketManager to ConnectionManager
     def __init__(self):
         self.active_connections: Dict[str, Set[WebSocket]] = {}
         self.client_info: Dict[WebSocket, Dict[str, Any]] = {}

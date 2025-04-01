@@ -1,55 +1,196 @@
 """
-Configuration settings for the Eva backend application.
+Configuration module for EVA backend.
+
+This module provides settings and configuration management
+using environment variables with Pydantic settings validation.
+
+Last updated: 2025-04-01
+Version: v1.6 (firestore integrations)
 """
+
+import logging
 import os
-from settings import settings
+from functools import lru_cache
+from typing import List, Optional, Union, Dict, Any
 
-class Config:
-    # JWT Settings
-    SECRET_KEY = settings.SECRET_KEY
-    JWT_ALGORITHM = settings.JWT_ALGORITHM
-    ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
-    REFRESH_TOKEN_EXPIRE_DAYS = settings.REFRESH_TOKEN_EXPIRE_DAYS
-    DEVICE_TOKEN_EXPIRE_DAYS = 365  # 1 year for device tokens
+from pydantic import AnyHttpUrl, Field, computed_field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-    # Firestore Settings
-    FIRESTORE_COLLECTION_PREFIX = "eva_"  # Prefix for all collections
+# Logger configuration
+logger = logging.getLogger(__name__)
 
-    # API Keys
-    GEMINI_API_KEY = settings.GEMINI_API_KEY
-    GEMINI_MODEL = settings.GEMINI_MODEL
 
-    # WebSocket Settings
-    WS_HEARTBEAT_INTERVAL = 30  # seconds
+class Settings(BaseSettings):
+    """
+    Application settings loaded from environment variables.
+    
+    This class defines all configurable settings for the application,
+    with default values that can be overridden by environment variables.
+    
+    Attributes:
+        APP_NAME: Name of the application
+        APP_VERSION: Current version of the application
+        DEBUG: Debug mode flag
+        ENVIRONMENT: Running environment (development, testing, production)
+        SECRET_KEY: Secret key for JWT token generation
+        ALGORITHM: Algorithm for JWT token generation
+        ACCESS_TOKEN_EXPIRE_MINUTES: Expiration time for access tokens
+        CORS_ORIGINS: List of allowed CORS origins
+        DATABASE_URL: Database connection URL
+        GOOGLE_CLOUD_PROJECT: Google Cloud project ID
+        FIRESTORE_EMULATOR_HOST: Optional Firestore emulator host for local development
+        REDIS_HOST: Redis host address
+        REDIS_PORT: Redis port
+        REDIS_PASSWORD: Redis password
+        REDIS_SSL: Whether to use SSL for Redis connection
+        GEMINI_API_KEY: Gemini API key
+        RATE_LIMIT_PER_MINUTE: Rate limit for API requests per minute
+        RATE_LIMIT_PER_DAY: Rate limit for API requests per day
+        MEMORY_MAX_TOKENS: Maximum number of tokens to use for memory context
+        LOG_LEVEL: Logging level
+    """
+    
+    # General settings
+    APP_NAME: str = "EVA Backend"
+    APP_VERSION: str = "1.8.6"
+    DEBUG: bool = Field(default=False)
+    ENVIRONMENT: str = Field(default="production")
+    
+    # Security settings
+    SECRET_KEY: str = Field(default="", description="Secret key for JWT tokens")
+    ALGORITHM: str = Field(default="HS256", description="Algorithm for JWT token generation")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30, description="Token expiration time in minutes")
+    
+    # CORS settings
+    CORS_ORIGINS: List[AnyHttpUrl] = Field(
+        default_factory=list,
+        description="List of allowed CORS origins"
+    )
+    
+    # Firestore settings
+    GOOGLE_CLOUD_PROJECT: Optional[str] = Field(
+        default=None, 
+        description="Google Cloud project ID"
+    )
+    FIRESTORE_EMULATOR_HOST: Optional[str] = Field(
+        default=None, 
+        description="Optional Firestore emulator host for local development"
+    )
+    
+    # API settings
+    GEMINI_API_KEY: Optional[str] = Field(
+        default=None, 
+        description="Gemini API key"
+    )
+    
+    # Rate limiting
+    RATE_LIMIT_PER_MINUTE: int = Field(
+        default=60, 
+        description="Rate limit for API requests per minute"
+    )
+    RATE_LIMIT_PER_DAY: int = Field(
+        default=1000, 
+        description="Rate limit for API requests per day"
+    )
+    
+    # Memory settings
+    MEMORY_MAX_TOKENS: int = Field(
+        default=2000, 
+        description="Maximum number of tokens to use for memory context"
+    )
+    
+    # Logging settings
+    LOG_LEVEL: str = Field(
+        default="INFO", 
+        description="Logging level"
+    )
+    
+    @computed_field
+    @property
+    def is_production(self) -> bool:
+        """
+        Check if environment is production.
+        
+        Returns:
+            bool: True if production environment
+        """
+        return self.ENVIRONMENT.lower() == "production"
+    
+    @computed_field
+    @property
+    def is_development(self) -> bool:
+        """
+        Check if environment is development.
+        
+        Returns:
+            bool: True if development environment
+        """
+        return self.ENVIRONMENT.lower() == "development"
+    
+    @computed_field
+    @property
+    def is_testing(self) -> bool:
+        """
+        Check if environment is testing.
+        
+        Returns:
+            bool: True if testing environment
+        """
+        return self.ENVIRONMENT.lower() == "testing"
+    
+    @computed_field
+    @property
+    def firestore_settings(self) -> Dict[str, Any]:
+        """
+        Get Firestore settings.
+        
+        Returns:
+            Dict[str, Any]: Firestore configuration dictionary
+        """
+        settings = {}
+        
+        if self.GOOGLE_CLOUD_PROJECT:
+            settings["project_id"] = self.GOOGLE_CLOUD_PROJECT
+        
+        if self.FIRESTORE_EMULATOR_HOST:
+            settings["emulator_host"] = self.FIRESTORE_EMULATOR_HOST
+        
+        return settings
+    
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        validate_default=True,
+        extra="ignore",
+    )
 
-    # CORS Settings
-    CORS_ORIGINS = settings.CORS_ORIGINS
 
-    # Cache Settings
-    CACHE_DURATION = 300  # 5 minutes
-
-    # Verification Settings
-    VERIFICATION_TIMEOUT = settings.VERIFICATION_TIMEOUT
-
-    # OAuth2 Settings
-    OAUTH2_CLIENT_ID = settings.OAUTH2_CLIENT_ID
-    OAUTH2_CLIENT_SECRET = settings.OAUTH2_CLIENT_SECRET
-
-# Create a single instance of the config
-config = Config()
-
-# For backwards compatibility, expose all config variables at the module level
-SECRET_KEY = config.SECRET_KEY
-JWT_ALGORITHM = config.JWT_ALGORITHM
-ACCESS_TOKEN_EXPIRE_MINUTES = config.ACCESS_TOKEN_EXPIRE_MINUTES
-REFRESH_TOKEN_EXPIRE_DAYS = config.REFRESH_TOKEN_EXPIRE_DAYS
-DEVICE_TOKEN_EXPIRE_DAYS = config.DEVICE_TOKEN_EXPIRE_DAYS
-FIRESTORE_COLLECTION_PREFIX = config.FIRESTORE_COLLECTION_PREFIX
-GEMINI_API_KEY = config.GEMINI_API_KEY
-GEMINI_MODEL = config.GEMINI_MODEL
-WS_HEARTBEAT_INTERVAL = config.WS_HEARTBEAT_INTERVAL
-CORS_ORIGINS = config.CORS_ORIGINS
-CACHE_DURATION = config.CACHE_DURATION
-VERIFICATION_TIMEOUT = config.VERIFICATION_TIMEOUT
-OAUTH2_CLIENT_ID = config.OAUTH2_CLIENT_ID
-OAUTH2_CLIENT_SECRET = config.OAUTH2_CLIENT_SECRET
+@lru_cache()
+def get_settings() -> Settings:
+    """
+    Get cached settings instance.
+    
+    Uses LRU cache to avoid reloading settings on every call.
+    
+    Returns:
+        Settings: Application settings
+    """
+    settings = Settings()
+    log_level = getattr(logging, settings.LOG_LEVEL, logging.INFO)
+    
+    # Setup basic logging config
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        )
+    
+    # Log settings when in development mode
+    if settings.is_development:
+        logger.info(f"Loaded settings for {settings.ENVIRONMENT} environment")
+        # Log non-sensitive settings
+        safe_settings = settings.model_dump(exclude={"SECRET_KEY", "GEMINI_API_KEY"})
+        logger.debug(f"Settings: {safe_settings}")
+    
+    return settings

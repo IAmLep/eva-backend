@@ -1,453 +1,456 @@
-import logging
-from typing import Generator, Optional, List, Dict, Any
-from sqlalchemy import create_engine, Index, event
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, BigInteger, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship
-import uuid
-from datetime import datetime
-import os
-import time
-import warnings
-import json
+"""
+Database module for EVA backend application.
 
+This module provides database operations for the offline-first approach,
+supporting local device storage as primary and Firestore as backup/sync.
+
+Last updated: 2025-04-01
+Version: v1.2
+"""
+
+import logging
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional, Set, Tuple, Union
+
+from fastapi import HTTPException
+from firebase_admin import firestore
+from pydantic import BaseModel
+
+from config import get_settings
+from exceptions import DatabaseError, NotFoundException
+from firestore_manager import get_firestore_client
+from models import User, UserInDB, Memory, SyncState
+
+# Logger configuration
 logger = logging.getLogger(__name__)
 
-# Base class for SQLAlchemy models
-Base = declarative_base()
 
-# Sync mixin that can be added to all models requiring sync
-class SyncMixin:
-    last_modified = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    sync_status = Column(String(20), default="pending_sync")  # pending_sync, synced
-    device_id = Column(String(100), nullable=True)  # Device that last modified this record
-
-# User model definition
-class User(Base, SyncMixin):
-    __tablename__ = "users"
+class DatabaseManager:
+    """
+    Database manager for handling data operations.
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    username = Column(String(50), unique=True, nullable=False)
-    email = Column(String(100), unique=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
-
-    def __repr__(self):
-        return f"<User {self.username}>"
+    This class implements the offline-first approach with local
+    data store as primary and Firestore for synchronization.
+    """
     
-    def to_dict(self):
-        return {
-            "id": str(self.id),
-            "username": self.username,
-            "email": self.email,
-            "created_at": self.created_at.isoformat(),
-            "last_modified": self.last_modified.isoformat(),
-            "sync_status": self.sync_status,
-            "device_id": self.device_id
-        }
-
-# Message model definition
-class Message(Base, SyncMixin):
-    __tablename__ = "messages"
+    def __init__(self):
+        """Initialize database manager with Firestore client."""
+        self.settings = get_settings()
+        self.firestore_client = get_firestore_client()
+        self.users_collection = "users"
+        self.memories_collection = "memories"
+        self.sync_states_collection = "sync_states"
+        logger.info("Database manager initialized")
     
-    id = Column(Integer, primary_key=True, index=True)
-    device_id = Column(String, index=True)
-    text = Column(Text)
-    response = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    def __repr__(self):
-        return f"<Message {self.id}>"
-    
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "device_id": self.device_id,
-            "text": self.text,
-            "response": self.response,
-            "created_at": self.created_at.isoformat(),
-            "last_modified": self.last_modified.isoformat(),
-            "sync_status": self.sync_status
-        }
-
-# Device model definition
-class Device(Base, SyncMixin):
-    __tablename__ = "devices"
-    
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    device_name = Column(String(50), nullable=False)
-    device_id = Column(String(100), unique=True, nullable=False)
-    last_sync = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    def __repr__(self):
-        return f"<Device {self.device_name}>"
-    
-    def to_dict(self):
-        return {
-            "id": str(self.id),
-            "device_name": self.device_name,
-            "device_id": self.device_id,
-            "last_sync": self.last_sync.isoformat(),
-            "created_at": self.created_at.isoformat(),
-            "last_modified": self.last_modified.isoformat(),
-            "sync_status": self.sync_status
-        }
-
-# Conversation model definition
-class Conversation(Base, SyncMixin):
-    __tablename__ = "conversations"
-    
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    title = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    last_synced_device = Column(String(100), nullable=True)
-    user = relationship("User", back_populates="conversations")
-    messages = relationship("ChatMessage", back_populates="conversation", cascade="all, delete-orphan")
-    summary = relationship("ConversationSummary", uselist=False, back_populates="conversation", cascade="all, delete-orphan")
-
-    def __repr__(self):
-        return f"<Conversation {self.id}: {self.title}>"
-    
-    def to_dict(self):
-        return {
-            "id": str(self.id),
-            "user_id": str(self.user_id),
-            "title": self.title,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-            "last_synced_device": self.last_synced_device,
-            "last_modified": self.last_modified.isoformat(),
-            "sync_status": self.sync_status,
-            "device_id": self.device_id
-        }
-
-# ChatMessage model definition
-class ChatMessage(Base, SyncMixin):
-    __tablename__ = "chat_messages"
-    
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=False)
-    role = Column(String(20), nullable=False)  # "user" or "assistant"
-    content = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    conversation = relationship("Conversation", back_populates="messages")
-
-    __table_args__ = (
-        Index('idx_chat_message_conversation_id', 'conversation_id'),
-    )
-
-    def __repr__(self):
-        return f"<ChatMessage {self.id}: {self.role}>"
-    
-    def to_dict(self):
-        return {
-            "id": str(self.id),
-            "conversation_id": str(self.conversation_id),
-            "role": self.role,
-            "content": self.content,
-            "created_at": self.created_at.isoformat(),
-            "device_id": self.device_id,
-            "last_modified": self.last_modified.isoformat(),
-            "sync_status": self.sync_status
-        }
-
-# ConversationSummary model definition
-class ConversationSummary(Base, SyncMixin):
-    __tablename__ = "conversation_summaries"
-    
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), unique=True)
-    summary = Column(Text, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    conversation = relationship("Conversation", back_populates="summary")
-
-    def __repr__(self):
-        return f"<ConversationSummary {self.id}>"
-    
-    def to_dict(self):
-        return {
-            "id": str(self.id),
-            "conversation_id": str(self.conversation_id),
-            "summary": self.summary,
-            "updated_at": self.updated_at.isoformat(),
-            "last_modified": self.last_modified.isoformat(),
-            "sync_status": self.sync_status,
-            "device_id": self.device_id
-        }
-
-# In-memory sync record storage for the server
-class SyncRecord(Base):
-    """Temporary storage for sync data on the server"""
-    __tablename__ = "sync_records"
-    
-    id = Column(String, primary_key=True)  # Record UUID/ID
-    table_name = Column(String(50), nullable=False)  # Which table this belongs to
-    record_data = Column(Text, nullable=False)  # JSON data of the record
-    device_id = Column(String(100), nullable=False)  # Device that sent this record
-    timestamp = Column(DateTime, default=datetime.utcnow)  # When this record was received
-    processed = Column(Boolean, default=False)  # Whether this has been processed
-    
-    __table_args__ = (
-        Index('idx_sync_record_table_device', 'table_name', 'device_id'),
-    )
-    
-    def __repr__(self):
-        return f"<SyncRecord {self.id} from {self.device_id}>"
-
-# For local SQLite database on devices and in-memory on server
-DB_URL = os.environ.get("database_url", "sqlite:///./sqlite.db")
-logger.info(f"Using database URL: {DB_URL}")
-
-# Add connection retries
-def get_engine():
-    """Creates and returns a SQLAlchemy engine"""
-    retries = 3
-    for attempt in range(retries):
+    @asynccontextmanager
+    async def transaction(self):
+        """
+        Context manager for database transactions.
+        
+        Yields:
+            transaction: Transaction object
+        
+        Raises:
+            DatabaseError: If transaction fails
+        """
+        transaction = self.firestore_client.transaction()
         try:
-            engine = create_engine(
-                DB_URL, 
-                connect_args={"check_same_thread": False},
-                pool_pre_ping=True
+            yield transaction
+            # Transaction automatically committed on context exit
+        except Exception as e:
+            logger.error(f"Transaction failed: {str(e)}")
+            raise DatabaseError(f"Database transaction failed: {str(e)}")
+    
+    async def get_user_by_id(self, user_id: str) -> Optional[User]:
+        """
+        Get user by ID.
+        
+        Args:
+            user_id: User ID to retrieve
+            
+        Returns:
+            Optional[User]: User if found, None otherwise
+        """
+        try:
+            doc_ref = self.firestore_client.collection(self.users_collection).document(user_id)
+            doc = doc_ref.get()
+            
+            if not doc.exists:
+                logger.info(f"User not found: {user_id}")
+                return None
+                
+            user_data = doc.to_dict()
+            return User(**user_data)
+        except Exception as e:
+            logger.error(f"Error retrieving user {user_id}: {str(e)}")
+            raise DatabaseError(f"Failed to retrieve user: {str(e)}")
+    
+    async def get_user_by_username(self, username: str) -> Optional[UserInDB]:
+        """
+        Get user by username.
+        
+        Args:
+            username: Username to retrieve
+            
+        Returns:
+            Optional[UserInDB]: User if found, None otherwise
+        """
+        try:
+            query = (
+                self.firestore_client.collection(self.users_collection)
+                .where("username", "==", username)
+                .limit(1)
             )
             
-            # Test connection
-            with engine.connect() as conn:
-                pass
+            docs = query.stream()
+            user_doc = next(docs, None)
+            
+            if not user_doc:
+                logger.info(f"User not found by username: {username}")
+                return None
                 
-            logger.info("Database connection established successfully")
-            return engine
+            user_data = user_doc.to_dict()
+            return UserInDB(**user_data)
         except Exception as e:
-            if attempt < retries - 1:
-                wait_time = 2 ** attempt
-                logger.warning(f"Database connection attempt {attempt+1} failed: {e}. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
+            logger.error(f"Error retrieving user by username {username}: {str(e)}")
+            raise DatabaseError(f"Failed to retrieve user by username: {str(e)}")
+    
+    async def create_user(self, user: UserInDB) -> str:
+        """
+        Create a new user.
+        
+        Args:
+            user: User to create
+            
+        Returns:
+            str: ID of created user
+            
+        Raises:
+            DatabaseError: If user creation fails
+        """
+        try:
+            # Check if username already exists
+            existing_user = await self.get_user_by_username(user.username)
+            if existing_user:
+                logger.warning(f"Username already exists: {user.username}")
+                raise DatabaseError("Username already exists")
+            
+            # Add user to Firestore
+            user_ref = self.firestore_client.collection(self.users_collection).document()
+            user_data = user.model_dump()
+            user_ref.set(user_data)
+            
+            logger.info(f"Created user: {user.username} with ID: {user_ref.id}")
+            return user_ref.id
+        except DatabaseError:
+            # Re-raise database errors
+            raise
+        except Exception as e:
+            logger.error(f"Error creating user {user.username}: {str(e)}")
+            raise DatabaseError(f"Failed to create user: {str(e)}")
+    
+    async def update_user(self, user_id: str, user_data: Dict) -> bool:
+        """
+        Update user data.
+        
+        Args:
+            user_id: User ID to update
+            user_data: Updated user data
+            
+        Returns:
+            bool: True if successful
+            
+        Raises:
+            NotFoundException: If user not found
+            DatabaseError: If update fails
+        """
+        try:
+            # Verify user exists
+            user_ref = self.firestore_client.collection(self.users_collection).document(user_id)
+            user_doc = user_ref.get()
+            
+            if not user_doc.exists:
+                logger.warning(f"User not found for update: {user_id}")
+                raise NotFoundException(f"User {user_id} not found")
+            
+            # Update user
+            user_ref.update(user_data)
+            logger.info(f"Updated user: {user_id}")
+            return True
+        except NotFoundException:
+            # Re-raise not found exception
+            raise
+        except Exception as e:
+            logger.error(f"Error updating user {user_id}: {str(e)}")
+            raise DatabaseError(f"Failed to update user: {str(e)}")
+    
+    async def delete_user(self, user_id: str) -> bool:
+        """
+        Delete a user.
+        
+        Args:
+            user_id: User ID to delete
+            
+        Returns:
+            bool: True if successful
+            
+        Raises:
+            NotFoundException: If user not found
+            DatabaseError: If deletion fails
+        """
+        try:
+            # Verify user exists
+            user_ref = self.firestore_client.collection(self.users_collection).document(user_id)
+            user_doc = user_ref.get()
+            
+            if not user_doc.exists:
+                logger.warning(f"User not found for deletion: {user_id}")
+                raise NotFoundException(f"User {user_id} not found")
+            
+            # Delete user
+            user_ref.delete()
+            logger.info(f"Deleted user: {user_id}")
+            return True
+        except NotFoundException:
+            # Re-raise not found exception
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting user {user_id}: {str(e)}")
+            raise DatabaseError(f"Failed to delete user: {str(e)}")
+    
+    async def sync_memories(self, user_id: str, memories: List[Memory], 
+                           device_id: str) -> Tuple[List[Memory], SyncState]:
+        """
+        Synchronize memories between local device and Firestore.
+        
+        Implements the offline-first approach, merging changes and
+        tracking sync state to prevent duplicates.
+        
+        Args:
+            user_id: User ID owning the memories
+            memories: List of memories from device
+            device_id: Device ID for sync tracking
+            
+        Returns:
+            Tuple[List[Memory], SyncState]: 
+                - Updated memories list
+                - New sync state
+                
+        Raises:
+            DatabaseError: If sync fails
+        """
+        try:
+            # Get current sync state
+            sync_ref = (self.firestore_client
+                        .collection(self.sync_states_collection)
+                        .document(f"{user_id}_{device_id}"))
+            sync_doc = sync_ref.get()
+            
+            current_sync: Optional[SyncState] = None
+            if sync_doc.exists:
+                current_sync = SyncState(**sync_doc.to_dict())
             else:
-                logger.error(f"Database connection failed after {retries} attempts: {e}")
-                raise
-
-# Create engine and session factory
-try:
-    engine = get_engine()
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-except Exception as e:
-    logger.critical(f"Fatal error initializing database engine: {e}")
-    engine = None
-    SessionLocal = None
-
-def get_db() -> Generator[Session, None, None]:
-    """Dependency function that provides a database session"""
-    if SessionLocal is None:
-        raise RuntimeError("Database connection not established")
-    
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def initialize_database():
-    """Create all database tables if they don't exist"""
-    if engine is None:
-        logger.error("Cannot initialize database: engine is None")
-        raise RuntimeError("Database engine not initialized")
-    
-    try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("Database tables created successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
-        raise
-
-def init_db():
-    """Legacy initialization function for backward compatibility"""
-    warnings.warn(
-        "init_db() is deprecated. Please use initialize_database() instead.",
-        DeprecationWarning, 
-        stacklevel=2
-    )
-    return initialize_database()
-
-# Sync functions
-def get_pending_sync_records(db: Session, device_id: str) -> Dict[str, List[Dict]]:
-    """Get all records pending sync from this device"""
-    result = {
-        "users": [],
-        "conversations": [],
-        "chat_messages": [],
-        "conversation_summaries": [],
-        "devices": [],
-        "messages": []
-    }
-    
-    # Get pending sync records for each table
-    pending_users = db.query(User).filter(
-        User.sync_status == "pending_sync",
-        User.device_id == device_id
-    ).all()
-    result["users"] = [user.to_dict() for user in pending_users]
-    
-    pending_conversations = db.query(Conversation).filter(
-        Conversation.sync_status == "pending_sync",
-        Conversation.device_id == device_id
-    ).all()
-    result["conversations"] = [conv.to_dict() for conv in pending_conversations]
-    
-    pending_messages = db.query(ChatMessage).filter(
-        ChatMessage.sync_status == "pending_sync",
-        ChatMessage.device_id == device_id
-    ).all()
-    result["chat_messages"] = [msg.to_dict() for msg in pending_messages]
-    
-    pending_summaries = db.query(ConversationSummary).filter(
-        ConversationSummary.sync_status == "pending_sync",
-        ConversationSummary.device_id == device_id
-    ).all()
-    result["conversation_summaries"] = [summary.to_dict() for summary in pending_summaries]
-    
-    pending_devices = db.query(Device).filter(
-        Device.sync_status == "pending_sync",
-        Device.device_id == device_id
-    ).all()
-    result["devices"] = [device.to_dict() for device in pending_devices]
-    
-    pending_legacy_messages = db.query(Message).filter(
-        Message.sync_status == "pending_sync",
-        Message.device_id == device_id
-    ).all()
-    result["messages"] = [msg.to_dict() for msg in pending_legacy_messages]
-    
-    return result
-
-def mark_records_as_synced(db: Session, records: Dict[str, List[Dict]]):
-    """Mark records as synced after successful sync"""
-    # Update users
-    for user_data in records.get("users", []):
-        user = db.query(User).filter(User.id == uuid.UUID(user_data["id"])).first()
-        if user:
-            user.sync_status = "synced"
-    
-    # Update conversations
-    for conv_data in records.get("conversations", []):
-        conv = db.query(Conversation).filter(Conversation.id == uuid.UUID(conv_data["id"])).first()
-        if conv:
-            conv.sync_status = "synced"
-    
-    # Update chat messages
-    for msg_data in records.get("chat_messages", []):
-        msg = db.query(ChatMessage).filter(ChatMessage.id == uuid.UUID(msg_data["id"])).first()
-        if msg:
-            msg.sync_status = "synced"
-    
-    # Update conversation summaries
-    for summary_data in records.get("conversation_summaries", []):
-        summary = db.query(ConversationSummary).filter(ConversationSummary.id == uuid.UUID(summary_data["id"])).first()
-        if summary:
-            summary.sync_status = "synced"
-    
-    # Update devices
-    for device_data in records.get("devices", []):
-        device = db.query(Device).filter(Device.id == uuid.UUID(device_data["id"])).first()
-        if device:
-            device.sync_status = "synced"
-    
-    # Update legacy messages
-    for msg_data in records.get("messages", []):
-        msg = db.query(Message).filter(Message.id == msg_data["id"]).first()
-        if msg:
-            msg.sync_status = "synced"
-    
-    db.commit()
-
-def process_incoming_sync_data(db: Session, sync_data: Dict[str, List[Dict]], source_device_id: str):
-    """Process incoming sync data from devices"""
-    # Store each record for processing
-    for table_name, records in sync_data.items():
-        for record in records:
-            # Store in sync_records table
-            sync_record = SyncRecord(
-                id=record.get("id"),
-                table_name=table_name,
-                record_data=json.dumps(record),
-                device_id=source_device_id,
-                timestamp=datetime.utcnow(),
-                processed=False
+                current_sync = SyncState(
+                    user_id=user_id,
+                    device_id=device_id,
+                    last_sync=None,
+                    synced_memory_ids=[]
+                )
+            
+            # Get server memories
+            query = (self.firestore_client
+                     .collection(self.memories_collection)
+                     .where("user_id", "==", user_id))
+            server_memories = [Memory(**doc.to_dict()) for doc in query.stream()]
+            
+            # Merge memories (server and device)
+            # Skip duplicates based on memory_id in synced_memory_ids
+            merged_memories: List[Memory] = []
+            synced_ids: Set[str] = set(current_sync.synced_memory_ids)
+            
+            # Add server memories not in device
+            for server_mem in server_memories:
+                if server_mem.memory_id not in [m.memory_id for m in memories]:
+                    merged_memories.append(server_mem)
+                    synced_ids.add(server_mem.memory_id)
+            
+            # Add device memories not yet synced
+            for device_mem in memories:
+                if device_mem.memory_id not in synced_ids:
+                    # Add to Firestore
+                    mem_ref = (self.firestore_client
+                              .collection(self.memories_collection)
+                              .document(device_mem.memory_id))
+                    mem_ref.set(device_mem.model_dump())
+                    synced_ids.add(device_mem.memory_id)
+                
+                # Always include device memories in result
+                merged_memories.append(device_mem)
+            
+            # Update sync state
+            new_sync = SyncState(
+                user_id=user_id,
+                device_id=device_id,
+                last_sync=firestore.SERVER_TIMESTAMP,
+                synced_memory_ids=list(synced_ids)
             )
-            db.add(sync_record)
+            sync_ref.set(new_sync.model_dump())
+            
+            logger.info(f"Synced {len(memories)} memories for user {user_id}, device {device_id}")
+            return merged_memories, new_sync
+        except Exception as e:
+            logger.error(f"Error syncing memories for user {user_id}: {str(e)}")
+            raise DatabaseError(f"Failed to sync memories: {str(e)}")
     
-    db.commit()
-    return {"status": "received", "record_count": sum(len(records) for records in sync_data.values())}
+    async def delete_memory(self, user_id: str, memory_id: str) -> bool:
+        """
+        Delete a memory.
+        
+        Args:
+            user_id: User ID owning the memory
+            memory_id: Memory ID to delete
+            
+        Returns:
+            bool: True if successful
+            
+        Raises:
+            NotFoundException: If memory not found
+            DatabaseError: If deletion fails
+        """
+        try:
+            # Verify memory exists and belongs to user
+            mem_ref = self.firestore_client.collection(self.memories_collection).document(memory_id)
+            mem_doc = mem_ref.get()
+            
+            if not mem_doc.exists:
+                logger.warning(f"Memory not found for deletion: {memory_id}")
+                raise NotFoundException(f"Memory {memory_id} not found")
+            
+            mem_data = mem_doc.to_dict()
+            if mem_data["user_id"] != user_id:
+                logger.warning(f"Unauthorized deletion attempt for memory {memory_id} by user {user_id}")
+                raise HTTPException(status_code=403, detail="Not authorized to delete this memory")
+            
+            # Delete memory
+            mem_ref.delete()
+            
+            # Update sync states to remove this memory ID
+            sync_query = (self.firestore_client
+                         .collection(self.sync_states_collection)
+                         .where("user_id", "==", user_id))
+            
+            for sync_doc in sync_query.stream():
+                sync_data = sync_doc.to_dict()
+                if memory_id in sync_data["synced_memory_ids"]:
+                    synced_ids = set(sync_data["synced_memory_ids"])
+                    synced_ids.remove(memory_id)
+                    sync_doc.reference.update({"synced_memory_ids": list(synced_ids)})
+            
+            logger.info(f"Deleted memory {memory_id} for user {user_id}")
+            return True
+        except NotFoundException:
+            # Re-raise not found exception
+            raise
+        except HTTPException:
+            # Re-raise HTTP exception
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting memory {memory_id}: {str(e)}")
+            raise DatabaseError(f"Failed to delete memory: {str(e)}")
+    
+    async def cleanup_old_memories(self, user_id: str, days_threshold: int = 30) -> int:
+        """
+        Clean up old synced memories to prevent Firestore duplication.
+        
+        Args:
+            user_id: User ID owning the memories
+            days_threshold: Age threshold in days for memories to delete
+            
+        Returns:
+            int: Number of memories cleaned up
+            
+        Raises:
+            DatabaseError: If cleanup fails
+        """
+        try:
+            # Calculate cutoff date
+            cutoff_date = (
+                firestore.firestore.SERVER_TIMESTAMP - 
+                firestore.firestore.timedelta(days=days_threshold)
+            )
+            
+            # Find old memories
+            query = (self.firestore_client
+                    .collection(self.memories_collection)
+                    .where("user_id", "==", user_id)
+                    .where("created_at", "<", cutoff_date))
+            
+            # Delete old memories in batch
+            batch = self.firestore_client.batch()
+            count = 0
+            
+            for mem_doc in query.stream():
+                batch.delete(mem_doc.reference)
+                count += 1
+                
+                # Firestore batches limited to 500 operations
+                if count % 400 == 0:
+                    batch.commit()
+                    batch = self.firestore_client.batch()
+            
+            # Commit any remaining operations
+            if count % 400 != 0:
+                batch.commit()
+            
+            logger.info(f"Cleaned up {count} old memories for user {user_id}")
+            return count
+        except Exception as e:
+            logger.error(f"Error cleaning up old memories for user {user_id}: {str(e)}")
+            raise DatabaseError(f"Failed to clean up old memories: {str(e)}")
 
-def get_sync_data_for_device(db: Session, device_id: str, last_sync_time: str) -> Dict[str, List[Dict]]:
-    """Get sync data to send to a device"""
-    # Parse the last sync time
-    try:
-        sync_time = datetime.fromisoformat(last_sync_time)
-    except (ValueError, TypeError):
-        sync_time = datetime(2000, 1, 1)  # Default to old date if invalid
-    
-    # Get all sync records for other devices since last sync
-    sync_records = db.query(SyncRecord).filter(
-        SyncRecord.device_id != device_id,
-        SyncRecord.timestamp > sync_time,
-        SyncRecord.processed == False
-    ).all()
-    
-    # Organize by table name
-    result = {
-        "users": [],
-        "conversations": [],
-        "chat_messages": [],
-        "conversation_summaries": [],
-        "devices": [],
-        "messages": []
-    }
-    
-    for record in sync_records:
-        table = record.table_name
-        if table in result:
-            result[table].append(json.loads(record.record_data))
-            # Mark as processed
-            record.processed = True
-    
-    db.commit()
-    return result
 
-# Automatic sync status update on record changes
-@event.listens_for(Session, 'before_flush')
-def set_sync_status_on_change(session, context, instances):
-    """Set sync_status to 'pending_sync' when records change"""
-    for obj in session.new:
-        if hasattr(obj, 'sync_status'):
-            obj.sync_status = 'pending_sync'
-            obj.last_modified = datetime.utcnow()
-    
-    for obj in session.dirty:
-        if hasattr(obj, 'sync_status') and session.is_modified(obj):
-            obj.sync_status = 'pending_sync'
-            obj.last_modified = datetime.utcnow()
+# Initialize database manager
+_db_manager = None
 
-def check_database_health() -> bool:
-    """Checks if the database is accessible and operational"""
-    if engine is None:
-        return False
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute("SELECT 1")
-        return True
-    except Exception as e:
-        logger.error(f"Database health check failed: {e}")
-        return False
 
-# Make sure all necessary items are available for import
-__all__ = [
-    'Base', 'engine', 'SessionLocal', 
-    'User', 'Message', 'Device', 'Conversation', 'ChatMessage', 'ConversationSummary', 'SyncRecord',
-    'get_db', 'initialize_database', 'init_db', 'check_database_health',
-    'get_pending_sync_records', 'mark_records_as_synced', 'process_incoming_sync_data', 'get_sync_data_for_device'
-]
+def get_db_manager() -> DatabaseManager:
+    """
+    Get the database manager singleton.
+    
+    Returns:
+        DatabaseManager: Database manager instance
+    """
+    global _db_manager
+    if _db_manager is None:
+        _db_manager = DatabaseManager()
+    return _db_manager
+
+
+# Helper functions for database operations
+async def get_user_by_username(username: str) -> Optional[UserInDB]:
+    """
+    Get user by username.
+    
+    Args:
+        username: Username to retrieve
+        
+    Returns:
+        Optional[UserInDB]: User if found, None otherwise
+    """
+    db = get_db_manager()
+    return await db.get_user_by_username(username)
+
+
+async def verify_user_exists(user_id: str) -> bool:
+    """
+    Verify if user exists.
+    
+    Args:
+        user_id: User ID to verify
+        
+    Returns:
+        bool: True if user exists, False otherwise
+    """
+    db = get_db_manager()
+    user = await db.get_user_by_id(user_id)
+    return user is not None

@@ -4,18 +4,19 @@ API module for EVA backend.
 This module provides the main API endpoints for text-based communication
 and function calling integration with Gemini API.
 
-Last updated: 2025-04-01
-Version: v1.8.6
+Last updated: 2025-04-02
+Version: v1.8.8
 """
 
 import logging
 import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
-from auth import get_current_active_user
+from auth import get_current_active_user, validate_request_auth
 from config import get_settings
 from database import get_db_manager
 from exceptions import AuthorizationError, DatabaseError
@@ -39,14 +40,26 @@ class MessageRequest(BaseModel):
     
     Attributes:
         text: Message text content
-        user_id: ID of the user sending the message
+        user_id: Optional ID of the user sending the message
         context_id: Optional context/conversation ID
         include_memory: Whether to include user memory in context
     """
     text: str
-    user_id: str
+    user_id: Optional[str] = None
     context_id: Optional[str] = None
     include_memory: bool = True
+
+
+class SimpleMessageRequest(BaseModel):
+    """
+    Simple message request for service account access.
+    
+    Attributes:
+        message: Message text content
+        context: Optional context for the message
+    """
+    message: str
+    context: Optional[Dict[str, Any]] = None
 
 
 class MessageResponse(BaseModel):
@@ -63,6 +76,22 @@ class MessageResponse(BaseModel):
     function_calls: Optional[List[ToolCall]] = None
 
 
+class SimpleMessageResponse(BaseModel):
+    """
+    Simple message response model for service account access.
+    
+    Attributes:
+        response: Response text content
+        tokens: Token usage information
+        model: Model used for generation
+        timestamp: Response timestamp
+    """
+    response: str
+    tokens: Dict[str, int] = Field(default_factory=dict)
+    model: str = "gemini-2.0-flash"
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
 class MemoryRequest(BaseModel):
     """
     Memory creation request.
@@ -75,10 +104,11 @@ class MemoryRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 
+# Original complex message endpoint
 @router.post("/message", response_model=MessageResponse)
 async def process_message(
     message: MessageRequest,
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(validate_request_auth)
 ) -> MessageResponse:
     """
     Process a text message and generate a response.
@@ -94,9 +124,12 @@ async def process_message(
         HTTPException: If message processing fails
         AuthorizationError: If user isn't authorized
     """
-    # Authorization check
-    if current_user.id != message.user_id:
-        logger.warning(f"User {current_user.id} attempted to access messages for user {message.user_id}")
+    # Use authenticated user ID if not provided in request
+    user_id = message.user_id or current_user.username
+    
+    # For service accounts, skip user authorization check
+    if not current_user.is_service_account and current_user.username != user_id:
+        logger.warning(f"User {current_user.username} attempted to access messages for user {user_id}")
         raise AuthorizationError(detail="Not authorized to access this user's messages")
     
     try:
@@ -105,15 +138,14 @@ async def process_message(
         if message.include_memory:
             db = get_db_manager()
             # Get relevant memories that might help with this message
-            # In a real implementation, this would use semantic search or other relevance mechanism
-            memory_docs = await db.get_relevant_memories(message.user_id, message.text)
+            memory_docs = await db.get_relevant_memories(user_id, message.text)
             memories = [Memory(**doc) for doc in memory_docs]
-            logger.info(f"Retrieved {len(memories)} relevant memories for user {message.user_id}")
+            logger.info(f"Retrieved {len(memories)} relevant memories for user {user_id}")
         
         # Generate response with LLM
         response_text, context_id, function_calls = await generate_response(
             message.text,
-            message.user_id,
+            user_id,
             message.context_id,
             memories,
             tools=available_tools()
@@ -126,7 +158,7 @@ async def process_message(
                 try:
                     # Execute the function call
                     result = await execute_function_call(call, current_user)
-                    logger.info(f"Executed function call: {call.function.name} for user {message.user_id}")
+                    logger.info(f"Executed function call: {call.function.name} for user {user_id}")
                     
                     # Append result to response if needed
                     if result.get("append_to_response", False):
@@ -157,10 +189,100 @@ async def process_message(
         )
 
 
+# Simple message endpoint for service accounts
+@router.post("/simple-message", response_model=SimpleMessageResponse)
+async def process_simple_message(
+    request: SimpleMessageRequest,
+    user: User = Depends(validate_request_auth)
+) -> Dict:
+    """
+    Process a simple message without memory management.
+    
+    Args:
+        request: Simple message request
+        user: Authenticated user
+        
+    Returns:
+        Dict: Simple message response
+    """
+    logger.info(f"Processing simple message request from {user.username}")
+    
+    try:
+        # Get response from LLM service with minimal context
+        response, token_info = await gemini_service.generate_text(
+            request.message,
+            temperature=0.7,
+            max_tokens=800
+        )
+        
+        # Ensure token_info is a dictionary even if None is returned
+        if token_info is None:
+            logger.warning("Received None for token_info, using default values")
+            token_info = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        
+        return {
+            "response": response,
+            "tokens": token_info,
+            "model": "gemini-2.0-flash",
+            "timestamp": datetime.utcnow()
+        }
+    except Exception as e:
+        logger.error(f"Error processing simple message: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing message: {str(e)}"
+        )
+
+
+# Add alias endpoints for compatibility
+@router.post("/chat", response_model=SimpleMessageResponse)
+async def process_chat(
+    request: SimpleMessageRequest,
+    user: User = Depends(validate_request_auth)
+) -> Dict:
+    """
+    Process a chat message (alias for simple-message).
+    """
+    return await process_simple_message(request, user)
+
+
+@router.post("/generate", response_model=SimpleMessageResponse)
+async def generate_text(
+    request: SimpleMessageRequest,
+    user: User = Depends(validate_request_auth)
+) -> Dict:
+    """
+    Generate text (alias for simple-message).
+    """
+    return await process_simple_message(request, user)
+
+
+@router.post("/gemini/chat", response_model=SimpleMessageResponse)
+async def gemini_chat(
+    request: SimpleMessageRequest,
+    user: User = Depends(validate_request_auth)
+) -> Dict:
+    """
+    Gemini chat endpoint (alias for simple-message).
+    """
+    return await process_simple_message(request, user)
+
+
+@router.post("/llm/generate", response_model=SimpleMessageResponse)
+async def llm_generate(
+    request: SimpleMessageRequest,
+    user: User = Depends(validate_request_auth)
+) -> Dict:
+    """
+    LLM generate endpoint (alias for simple-message).
+    """
+    return await process_simple_message(request, user)
+
+
 @router.post("/memory", status_code=status.HTTP_201_CREATED)
 async def create_memory(
     memory_request: MemoryRequest,
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(validate_request_auth)
 ) -> Dict[str, str]:
     """
     Create a new memory for the user.
@@ -178,13 +300,13 @@ async def create_memory(
     try:
         db = get_db_manager()
         memory = Memory(
-            user_id=current_user.id,
+            user_id=current_user.username,
             content=memory_request.content,
             metadata=memory_request.metadata
         )
         
         memory_id = await db.create_memory(memory)
-        logger.info(f"Created memory {memory_id} for user {current_user.id}")
+        logger.info(f"Created memory {memory_id} for user {current_user.username}")
         
         return {"memory_id": memory_id}
     except Exception as e:
@@ -198,7 +320,7 @@ async def create_memory(
 @router.delete("/memory/{memory_id}")
 async def delete_memory(
     memory_id: str,
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(validate_request_auth)
 ) -> Dict[str, bool]:
     """
     Delete a user memory.
@@ -215,10 +337,10 @@ async def delete_memory(
     """
     try:
         db = get_db_manager()
-        success = await db.delete_memory(current_user.id, memory_id)
+        success = await db.delete_memory(current_user.username, memory_id)
         
         if success:
-            logger.info(f"Deleted memory {memory_id} for user {current_user.id}")
+            logger.info(f"Deleted memory {memory_id} for user {current_user.username}")
             return {"success": True}
         
         return {"success": False}
@@ -239,7 +361,7 @@ async def delete_memory(
 @router.post("/cleanup-memories")
 async def cleanup_old_memories(
     days_threshold: int = 30,
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(validate_request_auth)
 ) -> Dict[str, int]:
     """
     Clean up old memories to prevent Firestore duplication.
@@ -256,9 +378,9 @@ async def cleanup_old_memories(
     """
     try:
         db = get_db_manager()
-        count = await db.cleanup_old_memories(current_user.id, days_threshold)
+        count = await db.cleanup_old_memories(current_user.username, days_threshold)
         
-        logger.info(f"Cleaned up {count} old memories for user {current_user.id}")
+        logger.info(f"Cleaned up {count} old memories for user {current_user.username}")
         return {"deleted_count": count}
     except Exception as e:
         logger.error(f"Error cleaning up memories: {str(e)}")
@@ -266,6 +388,41 @@ async def cleanup_old_memories(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error cleaning up memories: {str(e)}"
         )
+
+
+@router.get("/debug", status_code=200)
+async def api_debug():
+    """
+    Debug endpoint to test API router and show available routes.
+    
+    Returns:
+        Dict: Debug information
+    """
+    return {
+        "status": "ok",
+        "routes": [
+            {"path": str(route.path), "methods": list(route.methods)} 
+            for route in router.routes
+        ],
+        "timestamp": datetime.utcnow().isoformat(),
+        "service": "EVA API",
+        "version": get_settings().APP_VERSION
+    }
+
+
+@router.get("/test", status_code=200)
+async def test_endpoint():
+    """
+    Simple test endpoint that doesn't require auth.
+    
+    Returns:
+        Dict: Test response
+    """
+    return {
+        "status": "ok",
+        "message": "API router is functioning correctly",
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
 
 @router.get("/health")

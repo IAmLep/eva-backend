@@ -4,8 +4,8 @@ Authentication module for EVA backend.
 This module handles user authentication, JWT token generation, and validation.
 It provides functions for securing API endpoints and managing user sessions.
 
-Last updated: 2025-04-01
-Version: v1.8.6
+Last updated: 2025-04-02
+Version: v1.8.7
 """
 
 import logging
@@ -17,6 +17,8 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
 
 from config import get_settings
 from database import get_user_by_username, verify_user_exists
@@ -134,6 +136,46 @@ def create_access_token(data: Dict, expires_delta: Optional[timedelta] = None) -
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     
     return encoded_jwt
+
+
+async def validate_google_id_token(token: str) -> dict:
+    """
+    Validate a Google ID token.
+    
+    Args:
+        token: Google-issued ID token
+        
+    Returns:
+        dict: Token payload if valid
+        
+    Raises:
+        AuthenticationError: If token is invalid
+    """
+    try:
+        # Get the expected audience (your service URL)
+        settings = get_settings()
+        audience = settings.SERVICE_URL or "https://eva-backend-533306620971.europe-west1.run.app"
+        
+        # Verify the token
+        request = google_requests.Request()
+        payload = id_token.verify_oauth2_token(
+            token,
+            request,
+            audience=audience
+        )
+        
+        # Check if token is expired
+        if datetime.fromtimestamp(payload['exp']) < datetime.utcnow():
+            logger.error("Google ID token has expired")
+            raise AuthenticationError(detail="Token expired")
+            
+        return payload
+    except Exception as e:
+        logger.error(f"Google ID token validation failed: {str(e)}")
+        raise AuthenticationError(
+            detail=f"Invalid Google ID token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
 
 
 async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> User:
@@ -264,4 +306,31 @@ async def validate_request_auth(request: Request) -> User:
         raise AuthenticationError(detail="Invalid Authorization header format")
     
     token = parts[1]
-    return await get_current_user(token)
+    
+    # First try to validate as Google ID token for service accounts
+    try:
+        payload = await validate_google_id_token(token)
+        # For service account tokens, create or get user
+        email = payload.get('email', '')
+        if email.endswith('.gserviceaccount.com'):
+            # Return a system user for service accounts
+            logger.info(f"Authenticated service account: {email}")
+            return User(
+                username=email,
+                email=email,
+                full_name="Service Account",
+                disabled=False,
+                is_service_account=True,
+                scopes=["api:all"]  # Grant full access to service accounts
+            )
+    except AuthenticationError as e:
+        # If Google token validation fails, try regular JWT token
+        logger.debug(f"Google ID token validation failed, trying JWT: {str(e)}")
+        pass
+    
+    # Fall back to regular JWT validation
+    try:
+        return await get_current_user(token)
+    except Exception as e:
+        logger.error(f"Authentication failed after trying both methods: {str(e)}")
+        raise AuthenticationError(detail="Invalid authentication token")

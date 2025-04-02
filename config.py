@@ -37,6 +37,7 @@ class Settings(BaseSettings):
         ALGORITHM: Algorithm for JWT token generation
         ACCESS_TOKEN_EXPIRE_MINUTES: Expiration time for access tokens
         CORS_ORIGINS: List of allowed CORS origins
+        SERVICE_URL: Service URL for ID token validation
         DATABASE_URL: Database connection URL
         GOOGLE_CLOUD_PROJECT: Google Cloud project ID
         FIRESTORE_EMULATOR_HOST: Optional Firestore emulator host for local development
@@ -62,12 +63,15 @@ class Settings(BaseSettings):
     ALGORITHM: str = Field(default="HS256", description="Algorithm for JWT token generation")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30, description="Token expiration time in minutes")
     
-    # CORS settings
-    # Fixed: Use a string instead of List[AnyHttpUrl] to avoid JSON parsing issues
+    # CORS and API URL settings
     CORS_ORIGINS_STR: Optional[str] = Field(
         default=None,
         description="List of allowed CORS origins as a comma-separated string",
         env="CORS_ORIGINS"  # Map to the same env variable
+    )
+    SERVICE_URL: str = Field(
+        default="https://eva-backend-533306620971.europe-west1.run.app",
+        description="Service URL for ID token audience validation"
     )
     
     # Firestore settings

@@ -4,9 +4,8 @@ Schemas module for EVA backend.
 This module defines the schema models used for API requests and responses,
 providing validation and serialization with Pydantic.
 
-Last updated: 2025-04-01 11:11:59
-Version: v1.8.6
-Created by: IAmLep
+
+Version 3 working
 """
 
 import uuid

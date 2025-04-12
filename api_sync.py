@@ -3,10 +3,9 @@ API Sync module for EVA backend.
 
 This module provides synchronization functionality for the offline-first
 approach between device databases and Firestore backup.
-
-Last updated: 2025-04-01 10:34:25
-Version: v1.8.6
-Created by: IAmLep
+"""
+"""
+Version 3 working
 """
 
 import logging

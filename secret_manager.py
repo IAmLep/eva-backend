@@ -4,9 +4,8 @@ Secret Manager module for EVA backend.
 This module provides secure storage and retrieval of sensitive information
 using Google Cloud Secret Manager with local caching.
 
-Last updated: 2025-04-01 10:50:57
-Version: v1.8.6
-Created by: IAmLep
+
+Version 3 working
 """
 
 import base64

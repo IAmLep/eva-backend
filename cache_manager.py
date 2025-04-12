@@ -4,8 +4,10 @@ Cache Manager module for EVA backend.
 This module provides in-memory caching functionalities for 
 performance optimization. Note that Redis has been removed in v1.8.1.
 
-Last updated: 2025-04-01
-Version: v1.8.1
+"""
+
+"""
+Version 3 working
 """
 
 import logging

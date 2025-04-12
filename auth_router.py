@@ -4,8 +4,9 @@ Authentication Router module for EVA backend.
 This module provides API endpoints for authentication-related operations
 including user registration, login, token management, and verification.
 
-Last updated: 2025-04-01
-Version: v1.8.6
+"""
+"""
+Version 3 working
 """
 
 import logging

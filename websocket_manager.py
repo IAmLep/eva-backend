@@ -4,8 +4,8 @@ WebSocket Manager for EVA backend.
 This module provides WebSocket functionality for real-time voice streaming
 and conversational interactions with the Gemini API.
 
-Last updated: 2025-04-01
-Version: v1.8.7
+
+Version 3 working
 """
 
 import asyncio

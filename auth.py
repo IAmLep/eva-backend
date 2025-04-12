@@ -4,8 +4,9 @@ Authentication module for EVA backend.
 This module handles user authentication, JWT token generation, and validation.
 It provides functions for securing API endpoints and managing user sessions.
 
-Last updated: 2025-04-02
-Version: v1.8.7
+"""
+"""
+Version 3 working
 """
 
 import logging

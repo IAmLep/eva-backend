@@ -4,9 +4,8 @@ Error Middleware module for EVA backend.
 This module provides global error handling middleware to ensure
 consistent error responses throughout the application.
 
-Last updated: 2025-04-01 10:28:09
-Version: v1.8.6
-Created by: IAmLep
+
+Version 3 working
 """
 
 import logging

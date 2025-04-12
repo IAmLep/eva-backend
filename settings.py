@@ -4,9 +4,8 @@ Settings module for EVA backend.
 This module provides configuration utilities beyond what's in config.py,
 including environment-specific settings management and override capabilities.
 
-Last updated: 2025-04-01 11:06:46
-Version: v1.8.6
-Created by: IAmLep
+
+Version 3 working
 """
 
 import json

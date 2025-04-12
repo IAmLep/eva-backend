@@ -4,9 +4,8 @@ LLM Service module for EVA backend.
 This module provides integration with Gemini API for text generation,
 transcription, and function calling capabilities.
 
-Last updated: 2025-04-01 12:34:32
-Version: v1.8.8
-Created by: IAmLep
+
+Version 3 working
 """
 
 import asyncio

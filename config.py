@@ -4,8 +4,10 @@ Configuration module for EVA backend.
 This module provides settings and configuration management
 using environment variables with Pydantic settings validation.
 
-Last updated: 2025-04-01
-Version: v1.6.1 (firestore integrations)
+"""
+
+"""
+Version 3 working
 """
 
 import json

@@ -4,9 +4,8 @@ Main application module for EVA backend.
 This module sets up the FastAPI application with middleware, routes,
 and configuration.
 
-Last updated: 2025-04-01 19:50:00
-Version: v1.8.8 (Fixed API Router)
-Created by: IAmLep
+
+Version 3 working
 """
 
 import logging

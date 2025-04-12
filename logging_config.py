@@ -4,9 +4,8 @@ Logging Configuration module for EVA backend.
 This module configures the application's logging system with appropriate
 formatters, handlers, and filters for different environments.
 
-Last updated: 2025-04-01 10:44:46
-Version: v1.8.6
-Created by: IAmLep
+
+Version 3 working
 """
 
 import json

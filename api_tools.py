@@ -3,9 +3,10 @@ API Tools module for EVA backend.
 
 This module provides tools and utilities for function calling
 integration with Gemini API, allowing LLM to execute actions.
+"""
 
-Last updated: 2025-04-01
-Version: v1.7 (redis removal)
+"""
+Version 3 working
 """
 
 import inspect

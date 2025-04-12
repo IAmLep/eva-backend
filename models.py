@@ -4,9 +4,8 @@ Models module for EVA backend.
 This module defines all data models used throughout the application,
 providing type safety and validation with Pydantic.
 
-Last updated: 2025-04-01 10:47:17
-Version: v1.8.6
-Created by: IAmLep
+
+Version 3 working
 """
 
 import uuid

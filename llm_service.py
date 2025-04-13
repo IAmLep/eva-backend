@@ -1,11 +1,13 @@
 """
 LLM Service module for EVA backend.
 
-This module provides integration with Gemini API for text generation,
-transcription, and function calling capabilities.
+This module provides enhanced integration with Gemini API for text generation,
+streaming responses, and function calling capabilities with memory integration.
 
+Update your existing llm_service.py file with this version.
 
-Version 3 working
+Current Date: 2025-04-13
+Current User: IAmLep
 """
 
 import asyncio
@@ -62,13 +64,6 @@ logger = logging.getLogger(__name__)
 class ToolParameter(BaseModel):
     """
     Tool parameter model for function calling.
-    
-    Attributes:
-        name: Parameter name
-        type: Parameter type
-        description: Parameter description
-        required: Whether parameter is required
-        enum: Optional list of allowed values
     """
     name: str
     type: str
@@ -80,12 +75,6 @@ class ToolParameter(BaseModel):
 class ToolFunction(BaseModel):
     """
     Tool function model for Gemini API function calling.
-    
-    Attributes:
-        name: Function name
-        description: Function description
-        parameters: List of function parameters
-        response_description: Description of function response
     """
     name: str
     description: str
@@ -96,22 +85,27 @@ class ToolFunction(BaseModel):
 class ToolCall(BaseModel):
     """
     Tool call model representing a function called by the LLM.
-    
-    Attributes:
-        function: Function that was called
-        args: Arguments passed to the function
     """
     function: ToolFunction
     args: Dict[str, Any]
 
 
+class StreamProgress(BaseModel):
+    """
+    Streaming progress model for tracking streaming responses.
+    """
+    content: str = ""
+    is_complete: bool = False
+    tool_calls: List[ToolCall] = Field(default_factory=list)
+    token_count: int = 0
+
+
 class GeminiService:
     """
-    Service for interacting with Google's Gemini API.
+    Enhanced service for interacting with Google's Gemini API.
     
     This class provides methods for generating text responses,
-    processing conversations with function calling, and handling
-    voice transcription and generation.
+    streaming conversations, and handling function calls.
     """
     
     def __init__(self):
@@ -134,7 +128,7 @@ class GeminiService:
         temperature: float = 0.7,
         max_tokens: int = 1024,
         tools: Optional[List[ToolFunction]] = None
-    ) -> Tuple[str, Optional[List[ToolCall]]]:
+    ) -> Tuple[str, Dict[str, int], Optional[List[ToolCall]]]:
         """
         Generate text using Gemini API.
         
@@ -145,12 +139,8 @@ class GeminiService:
             tools: Optional list of tools for function calling
             
         Returns:
-            Tuple[str, Optional[List[ToolCall]]]: 
-                Generated text and optional tool calls
-                
-        Raises:
-            LLMServiceError: If generation fails
-            RateLimitError: If rate limit is exceeded
+            Tuple[str, Dict[str, int], Optional[List[ToolCall]]]: 
+                Generated text, token info, and optional tool calls
         """
         if self.use_mock:
             return self._mock_generate_text(prompt, tools)
@@ -204,52 +194,49 @@ class GeminiService:
                 
                 # Set tools for the model
                 model.tools = gemini_tools
-                
-                # Generate response with tools
-                response = await asyncio.to_thread(
-                    model.generate_content,
-                    prompt
-                )
-                
-                # Extract tool calls
-                tool_calls = []
-                if hasattr(response, 'candidates') and response.candidates:
-                    for candidate in response.candidates:
-                        if hasattr(candidate, 'content') and candidate.content.parts:
-                            for part in candidate.content.parts:
-                                if hasattr(part, 'function_call'):
-                                    function_call = part.function_call
-                                    
-                                    # Find matching tool
-                                    matched_tool = next(
-                                        (t for t in tools if t.name == function_call.name),
-                                        None
+            
+            # Generate response
+            response = await asyncio.to_thread(
+                model.generate_content,
+                prompt
+            )
+            
+            # Extract token counts
+            token_info = {
+                "input_tokens": getattr(response, "prompt_token_count", 0),
+                "output_tokens": getattr(response, "candidates_token_count", 0),
+                "total_tokens": getattr(response, "total_token_count", 0)
+            }
+            
+            # Extract tool calls
+            tool_calls = []
+            if tools and hasattr(response, 'candidates') and response.candidates:
+                for candidate in response.candidates:
+                    if hasattr(candidate, 'content') and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            if hasattr(part, 'function_call'):
+                                function_call = part.function_call
+                                
+                                # Find matching tool
+                                matched_tool = next(
+                                    (t for t in tools if t.name == function_call.name),
+                                    None
+                                )
+                                
+                                if matched_tool:
+                                    # Parse arguments
+                                    args = json.loads(
+                                        function_call.args 
+                                        if isinstance(function_call.args, str) 
+                                        else json.dumps(function_call.args)
                                     )
                                     
-                                    if matched_tool:
-                                        # Parse arguments
-                                        args = json.loads(
-                                            function_call.args 
-                                            if isinstance(function_call.args, str) 
-                                            else json.dumps(function_call.args)
-                                        )
-                                        
-                                        tool_calls.append(ToolCall(
-                                            function=matched_tool,
-                                            args=args
-                                        ))
-                
-                # Get text response
-                text_response = response.text
-                return text_response, tool_calls if tool_calls else None
-            else:
-                # Generate response without tools
-                response = await asyncio.to_thread(
-                    model.generate_content,
-                    prompt
-                )
-                
-                return response.text, None
+                                    tool_calls.append(ToolCall(
+                                        function=matched_tool,
+                                        args=args
+                                    ))
+            
+            return response.text, token_info, tool_calls if tool_calls else None
         
         except Exception as e:
             error_message = str(e).lower()
@@ -261,83 +248,193 @@ class GeminiService:
             logger.error(f"Gemini API error: {str(e)}")
             raise LLMServiceError(f"Failed to generate text: {str(e)}")
     
-    async def process_conversation(
-        self, 
-        message: str, 
-        user_id: str, 
-        conversation_id: Optional[str] = None,
-        memories: Optional[List[Memory]] = None,
-        tools: Optional[List[ToolFunction]] = None
-    ) -> Tuple[str, str, Optional[List[ToolCall]]]:
+    async def stream_conversation(
+        self,
+        context: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        tools: Optional[List[ToolFunction]] = None,
+        callback: Optional[Callable[[str, bool], None]] = None
+    ) -> AsyncGenerator[str, None]:
         """
-        Process a conversation message with context.
+        Stream conversation response from Gemini.
         
         Args:
-            message: User message
-            user_id: User ID
-            conversation_id: Optional conversation ID
-            memories: Optional list of memories for context
+            context: Full context including system prompt, memories, and conversation
+            temperature: Generation temperature (0.0 to 1.0)
+            max_tokens: Maximum tokens to generate
             tools: Optional list of tools for function calling
+            callback: Optional callback function for each chunk
+            
+        Yields:
+            str: Response chunks as they are generated
+        """
+        if self.use_mock:
+            async for chunk in self._mock_stream_conversation(context):
+                if callback:
+                    callback(chunk, False)
+                yield chunk
+            return
+            
+        try:
+            # Configure generation parameters
+            generation_config = GenerationConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+                top_p=0.95,
+                top_k=40,
+            )
+            
+            # Configure model
+            model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash",
+                generation_config=generation_config
+            )
+            
+            # Handle function calling if tools are provided
+            if tools:
+                gemini_tools = []
+                
+                for tool in tools:
+                    # Convert Pydantic model to Gemini API format
+                    parameters = {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                    
+                    for param in tool.parameters:
+                        parameters["properties"][param.name] = {
+                            "type": param.type,
+                            "description": param.description
+                        }
+                        
+                        if param.enum:
+                            parameters["properties"][param.name]["enum"] = param.enum
+                        
+                        if param.required:
+                            parameters["required"].append(param.name)
+                    
+                    function = FunctionDeclaration(
+                        name=tool.name,
+                        description=tool.description,
+                        parameters=parameters
+                    )
+                    
+                    gemini_tools.append(Tool(function=function))
+                
+                # Set tools for the model
+                model.tools = gemini_tools
+            
+            # Generate streaming response
+            stream_response = await asyncio.to_thread(
+                model.generate_content,
+                context,
+                stream=True
+            )
+            
+            # Process streaming chunks
+            full_response = ""
+            
+            for chunk in stream_response:
+                if hasattr(chunk, 'text') and chunk.text:
+                    chunk_text = chunk.text
+                    full_response += chunk_text
+                    
+                    if callback:
+                        callback(chunk_text, False)
+                    
+                    yield chunk_text
+            
+            # Final callback with complete flag
+            if callback:
+                callback(full_response, True)
+            
+        except Exception as e:
+            error_message = str(e).lower()
+            
+            if "rate limit" in error_message or "quota" in error_message:
+                logger.warning(f"Gemini API rate limit exceeded: {str(e)}")
+                raise RateLimitError("Gemini API rate limit exceeded")
+            
+            logger.error(f"Gemini API streaming error: {str(e)}")
+            raise LLMServiceError(f"Failed to stream conversation: {str(e)}")
+    
+    async def process_conversation_with_context(
+        self, 
+        context_text: str,
+        is_streaming: bool = True,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        tools: Optional[List[ToolFunction]] = None,
+        callback: Optional[Callable[[str, bool], None]] = None
+    ) -> Union[str, AsyncGenerator[str, None]]:
+        """
+        Process a conversation with full context.
+        
+        Args:
+            context_text: Full context text to send to Gemini
+            is_streaming: Whether to use streaming response
+            temperature: Generation temperature (0.0 to 1.0)
+            max_tokens: Maximum tokens to generate
+            tools: Optional list of tools for function calling
+            callback: Optional callback function for streaming chunks
             
         Returns:
-            Tuple[str, str, Optional[List[ToolCall]]]:
-                Generated response, conversation ID, and optional tool calls
+            Union[str, AsyncGenerator[str, None]]: Generated response or stream
         """
-        # Generate or use existing conversation ID
-        if not conversation_id:
-            conversation_id = str(uuid.uuid4())
-        
-        # Build context with memories
-        context = ""
-        if memories:
-            # Only use a limited amount of memory content to avoid token limits
-            memory_text = "\n".join(
-                f"Memory: {m.content[:500]}..." if len(m.content) > 500 else f"Memory: {m.content}"
-                for m in memories[:5]
+        if is_streaming:
+            return self.stream_conversation(
+                context_text,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                callback=callback
             )
-            context = f"User memories:\n{memory_text}\n\n"
+        else:
+            response, _, _ = await self.generate_text(
+                context_text,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools
+            )
+            return response
+    
+    async def _mock_stream_conversation(self, context: str) -> AsyncGenerator[str, None]:
+        """
+        Generate mock streaming responses for testing.
         
-        # Format system prompt with context
-        system_prompt = f"""
-You are EVA, a helpful AI assistant. 
-Current date and time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC.
-
-{context}
-
-Respond to the user's message conversationally and helpfully. 
-If the user asks you to perform a specific function, use the provided function calling tools.
-Always provide accurate and useful information.
-"""
+        Args:
+            context: Context text (ignored in mock)
+            
+        Yields:
+            str: Mock response chunks
+        """
+        logger.warning("Using mock conversation streaming")
         
-        # Combine prompts
-        full_prompt = f"{system_prompt}\n\nUser: {message}\nEVA:"
+        # Create a mock response that streams in chunks
+        response = "Hello! I'm your AI assistant called EVA. I'm here to help you with whatever you need. How can I assist you today?"
+        chunks = [response[i:i+10] for i in range(0, len(response), 10)]
         
-        # Generate response
-        response, tool_calls = await self.generate_text(
-            full_prompt,
-            temperature=0.85,
-            max_tokens=1024,
-            tools=tools
-        )
-        
-        logger.info(f"Generated response for conversation {conversation_id[:8]}")
-        return response, conversation_id, tool_calls
+        for chunk in chunks:
+            await asyncio.sleep(0.1)  # Simulate network delay
+            yield chunk
     
     def _mock_generate_text(
         self, 
         prompt: str,
         tools: Optional[List[ToolFunction]] = None
-    ) -> Tuple[str, Optional[List[ToolCall]]]:
+    ) -> Tuple[str, Dict[str, int], Optional[List[ToolCall]]]:
         """
-        Generate mock text responses for testing without API key.
+        Generate mock text responses for testing.
         
         Args:
             prompt: Text prompt
             tools: Optional list of tools for function calling
             
         Returns:
-            Tuple[str, Optional[List[ToolCall]]]:
-                Mock generated text and optional tool calls
+            Tuple[str, Dict[str, int], Optional[List[ToolCall]]]: 
+                Mock generated text, token counts, and optional tool calls
         """
         logger.warning("Using mock text generation")
         
@@ -354,7 +451,7 @@ Always provide accurate and useful information.
                         args={"location": "Current location", "unit": "celsius"}
                     )
                 ]
-                return response, tool_calls
+                return response, {"input_tokens": 50, "output_tokens": 20, "total_tokens": 70}, tool_calls
         
         elif "time" in prompt.lower():
             current_time = datetime.utcnow().strftime("%H:%M:%S")
@@ -366,103 +463,69 @@ Always provide accurate and useful information.
         else:
             response = "I understand you're asking about something. How can I help you with that?"
         
-        return response, None
+        # Return mock token count
+        token_info = {"input_tokens": 50, "output_tokens": 20, "total_tokens": 70}
+        
+        return response, token_info, None
 
 
 async def generate_response(
-    message: str, 
-    user_id: str, 
-    conversation_id: Optional[str] = None,
-    memories: Optional[List[Memory]] = None,
-    tools: Optional[List[ToolFunction]] = None
-) -> Tuple[str, str, Optional[List[ToolCall]]]:
+    context_text: str,
+    is_streaming: bool = False,
+    tools: Optional[List[ToolFunction]] = None,
+    callback: Optional[Callable[[str, bool], None]] = None
+) -> Union[str, AsyncGenerator[str, None]]:
     """
-    Generate a response to a user message.
+    Generate a response using the context window.
     
     Args:
-        message: User message
-        user_id: User ID
-        conversation_id: Optional conversation ID
-        memories: Optional list of memories for context
+        context_text: Full context text
+        is_streaming: Whether to use streaming response
         tools: Optional list of tools for function calling
+        callback: Optional callback for streaming chunks
         
     Returns:
-        Tuple[str, str, Optional[List[ToolCall]]]:
-            Generated response, conversation ID, and optional tool calls
+        Union[str, AsyncGenerator[str, None]]: Response or stream
     """
     service = GeminiService()
-    return await service.process_conversation(
-        message, 
-        user_id, 
-        conversation_id,
-        memories,
-        tools
+    return await service.process_conversation_with_context(
+        context_text,
+        is_streaming=is_streaming,
+        tools=tools,
+        callback=callback
     )
 
 
+# We keep the existing transcription functions for compatibility
 @cached(ttl=3600, key_prefix="audio_transcription")
 async def transcribe_audio(audio_data: bytes) -> Optional[str]:
-    """
-    Transcribe audio data to text.
-    
-    Args:
-        audio_data: Audio data as bytes
-        
-    Returns:
-        Optional[str]: Transcribed text or None if failed
-        
-    Raises:
-        LLMServiceError: If transcription fails
-    """
-    # In a real implementation, this would call a speech-to-text API
-    # For this refactoring, we'll mock it with a simple function
+    """Transcribe audio data to text."""
+    # Implementation kept from original file
     try:
         service = GeminiService()
         
         if service.use_mock:
-            # Return mock transcription
             return "This is a mock transcription of audio data."
+            
+        # Placeholder for actual implementation
+        await asyncio.sleep(0.5)
         
-        # Using Google's Speech-to-Text would be implemented here
-        # For now, we'll use a placeholder that could be replaced with actual implementation
-        logger.info(f"Transcribing {len(audio_data)} bytes of audio data")
-        
-        # This is a placeholder for the actual implementation
-        # In practice, you would use Google's Speech-to-Text API or similar
-        await asyncio.sleep(0.5)  # Simulate API call
-        
-        # Mock successful transcription with the audio length affecting the response
         audio_length = len(audio_data)
         if audio_length < 1000:
             return "Hello, this is a short audio message."
         elif audio_length < 10000:
             return "This is a medium length message about using the voice interface."
         else:
-            return "This is a longer message that demonstrates how the transcription service works with more substantial audio content. The user might be asking about specific features or giving detailed instructions."
+            return "This is a longer message that demonstrates how the transcription service works."
     
     except Exception as e:
         logger.error(f"Audio transcription error: {str(e)}")
         raise LLMServiceError(f"Failed to transcribe audio: {str(e)}")
 
 
-# Add the missing process_audio_stream function that websocket_manager imports
 async def process_audio_stream(audio_data: bytes) -> str:
-    """
-    Process audio stream data and transcribe to text.
-    
-    This function is used by the websocket manager to handle audio streams.
-    
-    Args:
-        audio_data: Raw audio data as bytes
-        
-    Returns:
-        str: Transcribed text
-        
-    Raises:
-        LLMServiceError: If processing fails
-    """
+    """Process audio stream data and transcribe to text."""
     try:
-        # Use the existing transcribe function
         transcription = await transcribe_audio(audio_data)
         if not transcription:
             raise LLMServiceError("Failed to transcribe audio: Empty result")
@@ -477,37 +540,19 @@ async def process_audio_stream(audio_data: bytes) -> str:
 
 @cached(ttl=3600, key_prefix="voice_generation")
 async def generate_voice_response(text: str) -> bytes:
-    """
-    Generate voice response from text.
-    
-    Args:
-        text: Text to convert to speech
-        
-    Returns:
-        bytes: Audio data as bytes
-        
-    Raises:
-        LLMServiceError: If generation fails
-    """
-    # In a real implementation, this would call a text-to-speech API
-    # For this refactoring, we'll mock it with a simple function
+    """Generate voice response from text."""
+    # Implementation kept from original file
     try:
         service = GeminiService()
         
         if service.use_mock:
-            # Return mock audio data
             mock_audio = b"MOCK_AUDIO_DATA" * 100
             return base64.b64encode(mock_audio)
-        
-        # Using Google's Text-to-Speech would be implemented here
-        # For now, we'll use a placeholder that could be replaced with actual implementation
+            
         logger.info(f"Generating voice for text of length {len(text)}")
         
-        # This is a placeholder for the actual implementation
-        # In practice, you would use Google's Text-to-Speech API or similar
-        await asyncio.sleep(0.5)  # Simulate API call
+        await asyncio.sleep(0.5)
         
-        # Mock successful generation
         mock_audio = b"AUDIO_DATA_FOR:" + text.encode('utf-8')
         return base64.b64encode(mock_audio)
     

@@ -1,177 +1,205 @@
 """
-Main application module for EVA backend.
+Main application entry point for EVA backend.
 
-This module sets up the FastAPI application with middleware, routes,
-and configuration.
+This file initializes the FastAPI application, configures middleware,
+and registers all API routers.
 
+Update your existing main.py file with this enhanced version.
 
-Version 3 working
+Current Date: 2025-04-13 11:20:47
+Current User: IAmLep
 """
 
+import asyncio
 import logging
+import os
 import sys
-from contextlib import asynccontextmanager
-from typing import List
+import time
+from datetime import datetime
+from typing import Dict, Any
 
-import uvicorn
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from config import get_settings
-from error_middleware import ErrorHandlerMiddleware
-from exceptions import CustomException
-from logging_config import configure_logging
+from database import get_db_manager
+from memory_manager import get_memory_manager
+from context_window import get_context_window
 
-# Import routers with error handling
-try:
-    from auth import router as auth_router
-except ImportError as e:
-    logging.warning(f"Unable to import auth router: {str(e)}")
-    auth_router = None
+# Import API routers
+import api
+import api_memory
+import websocket_manager
+from exceptions import AuthorizationError, DatabaseError, LLMServiceError, NotFoundException, RateLimitError
 
-try:
-    from auth_router import router as auth_api_router
-except ImportError as e:
-    logging.warning(f"Unable to import auth_api router: {str(e)}")
-    auth_api_router = None
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("api.log")
+    ]
+)
+logger = logging.getLogger(__name__)
 
-try:
-    from memory_extractor import router as memory_router
-except ImportError as e:
-    logging.warning(f"Unable to import memory router: {str(e)}")
-    memory_router = None
+# Initialize application
+settings = get_settings()
 
-try:
-    from secrets_router import router as secrets_router
-except ImportError as e:
-    logging.warning(f"Unable to import secrets router: {str(e)}")
-    secrets_router = None
+# Create FastAPI application
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description="Enhanced EVA AI Assistant API",
+    version=settings.VERSION,
+    docs_url="/docs" if settings.DEBUG else None,
+    redoc_url="/redoc" if settings.DEBUG else None,
+    openapi_url="/openapi.json" if settings.DEBUG else None,
+)
 
-try:
-    from websocket_manager import router as websocket_router
-except ImportError as e:
-    logging.warning(f"Unable to import websocket router: {str(e)}")
-    websocket_router = None
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Add import for the API router from api.py
-try:
-    from api import router as api_router
-except ImportError as e:
-    logging.warning(f"Unable to import API router: {str(e)}")
-    api_router = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Lifespan context manager for FastAPI.
-    Handles startup and shutdown events.
-    """
-    # Startup operations
-    configure_logging()
-    logging.info("Application startup complete")
+# Request ID middleware
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Add a unique request ID to each request."""
+    request_id = f"req_{int(time.time() * 1000)}"
+    request.state.request_id = request_id
     
-    yield
-    
-    # Shutdown operations
-    logging.info("Application shutting down")
-
-
-def create_app() -> FastAPI:
-    """
-    Create and configure the FastAPI application.
-    
-    Returns:
-        FastAPI: Configured FastAPI application
-    """
-    settings = get_settings()
-    
-    app = FastAPI(
-        title=settings.APP_NAME,
-        description="EVA Backend API",
-        version=settings.APP_VERSION,
-        lifespan=lifespan,
+    # Add to request headers
+    request.headers.__dict__["_list"].append(
+        (b"x-request-id", request_id.encode())
     )
     
-    # Configure CORS
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS or ["*"],  # Fallback to allow all if None
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+    # Process request
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    
+    # Add headers to response
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    return response
+
+# Exception handlers
+@app.exception_handler(LLMServiceError)
+async def llm_service_exception_handler(request: Request, exc: LLMServiceError):
+    """Handle LLM service errors."""
+    logger.error(f"LLM service error: {str(exc)}")
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": str(exc)}
     )
-    
-    # Add GZip compression
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
-    
-    # Add custom error handling
-    app.add_middleware(ErrorHandlerMiddleware)
-    
-    # Register exception handlers
-    @app.exception_handler(CustomException)
-    async def custom_exception_handler(request: Request, exc: CustomException):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"detail": exc.detail, "code": exc.code},
-        )
-    
-    # Register routers with error handling
-    if auth_router:
-        app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
-    else:
-        logging.warning("Auth router not loaded")
-    
-    if auth_api_router:
-        app.include_router(auth_api_router, prefix="/api/auth", tags=["Auth API"])
-    else:
-        logging.warning("Auth API router not loaded")
-    
-    if secrets_router:
-        app.include_router(secrets_router, prefix="/api/secrets", tags=["Secrets"])
-    else:
-        logging.warning("Secrets router not loaded")
-    
-    if memory_router:
-        app.include_router(memory_router, prefix="/api/memory", tags=["Memory"])
-    else:
-        logging.warning("Memory router not loaded")
-    
-    if websocket_router:
-        app.include_router(websocket_router, prefix="/ws", tags=["WebSocket"])
-    else:
-        logging.warning("WebSocket router not loaded")
-    
-    # Add the API router from api.py
-    if api_router:
-        app.include_router(api_router, prefix="/api", tags=["API"])
-        logging.info("API router loaded successfully")
-    else:
-        logging.warning("API router not loaded")
-    
-    @app.get("/health")
-    async def health_check():
-        """Health check endpoint for Google Cloud Run."""
-        return {"status": "healthy"}
-    
-    return app
 
+@app.exception_handler(RateLimitError)
+async def rate_limit_exception_handler(request: Request, exc: RateLimitError):
+    """Handle rate limit errors."""
+    logger.warning(f"Rate limit exceeded: {str(exc)}")
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": str(exc)}
+    )
 
-# Use a try-except block for the app creation to provide a clear error message
-try:
-    app = create_app()
-except Exception as e:
-    logging.error(f"Error creating app: {str(e)}")
-    # Exit with an error code if app creation fails
-    sys.exit(1)
+@app.exception_handler(AuthorizationError)
+async def authorization_exception_handler(request: Request, exc: AuthorizationError):
+    """Handle authorization errors."""
+    logger.warning(f"Authorization error: {str(exc)}")
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"detail": str(exc)}
+    )
+
+@app.exception_handler(DatabaseError)
+async def database_exception_handler(request: Request, exc: DatabaseError):
+    """Handle database errors."""
+    logger.error(f"Database error: {str(exc)}")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": f"Database error: {str(exc)}"}
+    )
+
+@app.exception_handler(NotFoundException)
+async def not_found_exception_handler(request: Request, exc: NotFoundException):
+    """Handle not found errors."""
+    logger.info(f"Resource not found: {str(exc)}")
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={"detail": str(exc)}
+    )
+
+# Initialize components
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application components on startup."""
+    logger.info(f"Starting {settings.PROJECT_NAME} v{settings.VERSION}")
+    logger.info(f"Environment: {settings.ENVIRONMENT}")
+    
+    # Initialize database connection
+    db_manager = get_db_manager()
+    logger.info("Database manager initialized")
+    
+    # Initialize memory manager
+    memory_manager = get_memory_manager()
+    logger.info("Memory manager initialized")
+    
+    # Initialize context window
+    context_window = get_context_window()
+    logger.info("Context window initialized")
+    
+    # Log feature flags
+    for feature, enabled in settings.FEATURES.items():
+        status_str = "enabled" if enabled else "disabled"
+        logger.info(f"Feature '{feature}' is {status_str}")
+
+# Register API routers
+app.include_router(api.router)
+app.include_router(api_memory.router)
+app.include_router(websocket_manager.router)
+
+# Root endpoint
+@app.get("/", tags=["status"])
+async def root():
+    """
+    Root endpoint providing API information.
+    """
+    return {
+        "name": settings.PROJECT_NAME,
+        "version": settings.VERSION,
+        "status": "online",
+        "timestamp": datetime.utcnow().isoformat(),
+        "environment": settings.ENVIRONMENT
+    }
+
+# Health check endpoint
+@app.get("/health", tags=["status"])
+async def health_check():
+    """
+    Health check endpoint for monitoring systems.
+    """
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "components": {
+            "api": "up",
+            "database": "up",
+            "memory": "up"
+        }
+    }
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8080,
-        reload=get_settings().DEBUG,
-        log_level="info",
-    )
+    import uvicorn
+    
+    # Use environment variables or defaults
+    host = os.getenv("HOST", settings.HOST)
+    port = int(os.getenv("PORT", settings.PORT))
+    
+    logger.info(f"Starting server at http://{host}:{port}")
+    uvicorn.run("main:app", host=host, port=port, reload=settings.DEBUG)

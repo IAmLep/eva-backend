@@ -2,10 +2,12 @@
 Models module for EVA backend.
 
 This module defines all data models used throughout the application,
-providing type safety and validation with Pydantic.
+including enhanced memory models for the multi-tiered memory system.
 
+Update your existing models.py file with this version.
 
-Version 3 working
+Current Date: 2025-04-13
+Current User: IAmLep
 """
 
 import uuid
@@ -79,9 +81,45 @@ class UserInDB(User):
     hashed_password: str
 
 
+class MemorySource(str, Enum):
+    """
+    Memory source enumeration.
+    
+    Defines the source/type of a memory.
+    
+    Attributes:
+        CORE: Long-term important memories
+        CONVERSATION: Conversational memories
+        EVENT: Time-based memories like appointments
+        SYSTEM: System-generated memories
+    """
+    CORE = "core"
+    CONVERSATION = "conversational"
+    EVENT = "event"
+    SYSTEM = "system"
+
+
+class MemoryCategory(str, Enum):
+    """
+    Memory category enumeration for core memories.
+    
+    Attributes:
+        PERSON: Information about people
+        PLACE: Information about places
+        PREFERENCE: User preferences and likes/dislikes
+        FACT: General factual information
+        OTHER: Miscellaneous information
+    """
+    PERSON = "person"
+    PLACE = "place"
+    PREFERENCE = "preference"
+    FACT = "fact"
+    OTHER = "other"
+
+
 class Memory(BaseModel):
     """
-    Memory model.
+    Enhanced memory model with tiered memory support.
     
     Represents a memory entry that is stored for a user and can
     be synchronized between devices.
@@ -90,26 +128,97 @@ class Memory(BaseModel):
         memory_id: Unique identifier
         user_id: ID of the user who owns this memory
         content: Memory content
-        source: Source of the memory
+        source: Source/type of the memory
         metadata: Additional metadata
         tags: Tags for categorization
         created_at: Creation timestamp
         updated_at: Last update timestamp
         is_synced: Whether memory is synced to cloud
+        importance: Importance score (1-10)
+        expiration: Optional expiration timestamp
     """
     memory_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
     content: str
-    source: str = "user"
+    source: str = MemorySource.CORE.value
     metadata: Dict[str, Any] = Field(default_factory=dict)
     tags: List[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     is_synced: bool = False
+    importance: int = 5
+    expiration: Optional[datetime] = None
     
     class Config:
         """Pydantic model configuration."""
         from_attributes = True
+
+
+class CoreMemory(BaseModel):
+    """
+    Core memory model for long-term storage.
+    
+    Specialized model for core (long-term) memories that are particularly
+    important for the user.
+    
+    Attributes:
+        memory_id: Base memory identifier
+        category: Memory category
+        entity: Primary entity this memory relates to
+        content: Memory content
+        importance: Importance score (1-10)
+        last_accessed: When this memory was last accessed
+        created_at: Creation timestamp
+    """
+    memory_id: str
+    category: MemoryCategory
+    entity: Optional[str] = None
+    content: str
+    importance: int = 5
+    last_accessed: Optional[datetime] = None
+    created_at: datetime
+
+
+class EventMemory(BaseModel):
+    """
+    Event memory model for time-based memories.
+    
+    Specialized model for event memories like reminders and appointments.
+    
+    Attributes:
+        memory_id: Base memory identifier
+        content: Event description
+        event_time: When the event occurs
+        expiration: When this memory expires
+        completed: Whether the event is completed
+        created_at: Creation timestamp
+    """
+    memory_id: str
+    content: str
+    event_time: datetime
+    expiration: datetime
+    completed: bool = False
+    created_at: datetime
+
+
+class ConversationMemory(BaseModel):
+    """
+    Conversation memory model for dialog context.
+    
+    Specialized model for conversation memories and summaries.
+    
+    Attributes:
+        memory_id: Base memory identifier
+        conversation_id: ID of the conversation
+        content: Conversation content or summary
+        entities: Key entities mentioned
+        created_at: Creation timestamp
+    """
+    memory_id: str
+    conversation_id: str
+    content: str
+    entities: List[str] = Field(default_factory=list)
+    created_at: datetime
 
 
 class SyncState(BaseModel):
@@ -148,6 +257,7 @@ class Conversation(BaseModel):
         created_at: Creation timestamp
         updated_at: Last update timestamp
         metadata: Additional metadata
+        summary: Optional conversation summary
     """
     conversation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
@@ -156,6 +266,7 @@ class Conversation(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    summary: Optional[str] = None
     
     class Config:
         """Pydantic model configuration."""
@@ -193,6 +304,7 @@ class Message(BaseModel):
         type: Message type
         timestamp: Message timestamp
         metadata: Additional metadata
+        token_count: Approximate token count of the message
     """
     message_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     conversation_id: str
@@ -200,60 +312,31 @@ class Message(BaseModel):
     type: MessageType
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    token_count: Optional[int] = None
     
     class Config:
         """Pydantic model configuration."""
         from_attributes = True
 
 
-class DeviceInfo(BaseModel):
+class ContextItem(BaseModel):
     """
-    Device information model.
+    Context item model.
     
-    Tracks information about a user's device.
+    Represents an item in the context window.
     
     Attributes:
-        device_id: Unique device identifier
-        user_id: User ID
-        device_type: Type of device
-        os_version: Operating system version
-        app_version: Application version
-        last_active: Last active timestamp
-        push_token: Optional push notification token
+        content: Item content
+        source: Source of the item
+        importance: Importance score
+        token_count: Token count
+        created_at: Creation timestamp
     """
-    device_id: str
-    user_id: str
-    device_type: str
-    os_version: str
-    app_version: str
-    last_active: datetime = Field(default_factory=datetime.utcnow)
-    push_token: Optional[str] = None
-    
-    class Config:
-        """Pydantic model configuration."""
-        from_attributes = True
-
-
-class FunctionCall(BaseModel):
-    """
-    Function call model.
-    
-    Represents a function call made by the AI assistant.
-    
-    Attributes:
-        function_name: Name of the function
-        arguments: Function arguments
-        result: Function result
-        timestamp: Call timestamp
-    """
-    function_name: str
-    arguments: Dict[str, Any]
-    result: Optional[Dict[str, Any]] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-    
-    class Config:
-        """Pydantic model configuration."""
-        from_attributes = True
+    content: str
+    source: str  # "message", "memory", "system", etc.
+    importance: float = 1.0
+    token_count: int
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class ApiKeyScope(str, Enum):
@@ -376,81 +459,4 @@ class UserRateLimit(BaseModel):
         from_attributes = True
 
 
-class WebhookEvent(str, Enum):
-    """
-    Webhook event enumeration.
-    
-    Defines possible events that can trigger webhooks.
-    
-    Attributes:
-        MESSAGE_CREATED: New message created
-        MEMORY_CREATED: New memory created
-        USER_CREATED: New user created
-        RATE_LIMIT_EXCEEDED: Rate limit exceeded
-    """
-    MESSAGE_CREATED = "message.created"
-    MEMORY_CREATED = "memory.created"
-    USER_CREATED = "user.created"
-    RATE_LIMIT_EXCEEDED = "rate_limit.exceeded"
-
-
-class Webhook(BaseModel):
-    """
-    Webhook model.
-    
-    Represents a webhook configuration.
-    
-    Attributes:
-        webhook_id: Unique identifier
-        user_id: ID of the user who owns this webhook
-        url: Webhook URL
-        events: List of events to trigger this webhook
-        is_active: Whether the webhook is active
-        secret: Secret for webhook signature
-        created_at: Creation timestamp
-        metadata: Additional metadata
-    """
-    webhook_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    url: str
-    events: List[WebhookEvent]
-    is_active: bool = True
-    secret: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    
-    class Config:
-        """Pydantic model configuration."""
-        from_attributes = True
-
-
-class WebhookDelivery(BaseModel):
-    """
-    Webhook delivery model.
-    
-    Tracks webhook delivery attempts.
-    
-    Attributes:
-        delivery_id: Unique identifier
-        webhook_id: ID of the webhook
-        event: Event type
-        payload: Event payload
-        status: Delivery status
-        status_code: HTTP status code
-        response: Response body
-        delivered_at: Delivery timestamp
-        retry_count: Number of retry attempts
-    """
-    delivery_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    webhook_id: str
-    event: WebhookEvent
-    payload: Dict[str, Any]
-    status: str
-    status_code: Optional[int] = None
-    response: Optional[str] = None
-    delivered_at: datetime = Field(default_factory=datetime.utcnow)
-    retry_count: int = 0
-    
-    class Config:
-        """Pydantic model configuration."""
-        from_attributes = True
+# Additional models for mental health support can be added in stage 3

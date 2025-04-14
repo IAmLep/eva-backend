@@ -1,142 +1,77 @@
 """
-Configuration module for EVA backend.
+Configuration handling for EVA backend.
 
-This module provides application configuration settings, including
-enhanced support for the memory system and context management.
-
-Update your existing config.py file with this version.
-
-Current Date: 2025-04-13 11:03:01
-Current User: IAmLepin
+This module configures all system settings and environment variables.
 """
 
 import os
-from functools import lru_cache
-from typing import Dict, Any, Optional
+from typing import Optional, Dict, Any, List
 
-from pydantic import BaseSettings, Field, validator
+# Updated imports for Pydantic v2.x
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings
 
+# Import for environment file loading
+from dotenv import load_dotenv
+
+# Load environment variables from .env file if it exists
+load_dotenv()
 
 class Settings(BaseSettings):
-    """
-    Application settings.
+    """System settings loaded from environment variables."""
     
-    This class provides configuration settings from environment variables
-    with reasonable defaults for development.
-    
-    Attributes:
-        PROJECT_NAME: Name of the application
-        VERSION: Application version
-        ENVIRONMENT: Current environment (development, staging, production)
-        DEBUG: Debug mode flag
-        
-        # Server settings
-        PORT: Port to run the server on
-        HOST: Host to bind the server to
-        WORKERS: Number of worker processes
-        
-        # Authentication settings
-        SECRET_KEY: Secret key for JWT tokens
-        ACCESS_TOKEN_EXPIRE_MINUTES: JWT token expiration time
-        REFRESH_TOKEN_EXPIRE_DAYS: Refresh token expiration time
-        
-        # Database settings
-        FIREBASE_CREDENTIALS_PATH: Path to Firebase service account credentials
-        
-        # Gemini API settings
-        GEMINI_API_KEY: API key for Gemini API
-        GEMINI_URL: Gemini API URL
-        
-        # Memory system settings
-        MEMORY_DEFAULT_LIMIT: Default number of memories to retrieve
-        CONTEXT_MAX_TOKENS: Maximum tokens in context window
-        SUMMARIZE_AFTER_TURNS: Number of turns before conversation summarization
-        
-        # Rate limiting
-        RATE_LIMIT_ENABLED: Whether rate limiting is enabled
-        FREE_TIER_REQUESTS_PER_MINUTE: Rate limit for free tier
-        FREE_TIER_TOKENS_PER_DAY: Token limit for free tier
-    """
-    # General settings
-    PROJECT_NAME: str = "EVA AI Assistant"
-    VERSION: str = "2.0.0"
-    ENVIRONMENT: str = "development"
-    DEBUG: bool = True
-    
-    # Server settings
-    PORT: int = 8000
-    HOST: str = "0.0.0.0"
-    WORKERS: int = 4
+    # API configuration
+    API_VERSION: str = "2.0.0"
+    API_TITLE: str = "EVA Backend API"
+    API_DESCRIPTION: str = "Enhanced Virtual Assistant Backend API"
+    DEBUG: bool = False
     
     # Authentication settings
-    SECRET_KEY: str = Field(..., env="SECRET_KEY")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
-    SECURE_COOKIES: bool = False  # Set to True in production
+    SECRET_KEY: str = Field(..., min_length=32)
+    TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
     
-    # Database settings
-    FIREBASE_CREDENTIALS_PATH: str = "./firebase-credentials.json"
-    
-    # Gemini API settings
-    GEMINI_API_KEY: Optional[str] = Field(None, env="GEMINI_API_KEY")
-    GEMINI_URL: str = "https://generativelanguage.googleapis.com/v1beta"
+    # Database configuration
+    DB_PROVIDER: str = "firebase"
     
     # Memory system settings
-    MEMORY_DEFAULT_LIMIT: int = 50
-    CONTEXT_MAX_TOKENS: int = 8000  # Gemini's context window size
-    SUMMARIZE_AFTER_TURNS: int = 10
-    CORE_MEMORY_IMPORTANCE_THRESHOLD: int = 7  # Min importance for core memories
+    MEMORY_REFRESH_BATCH_SIZE: int = 5  # Number of memories to refresh per batch
+    MEMORY_MAX_CORE_MEMORIES: int = 50  # Maximum number of core memories to load
+    MEMORY_MAX_EVENT_MEMORIES: int = 10  # Maximum number of event memories to load
+    MEMORY_IMPORTANCE_THRESHOLD: int = 5  # Minimum importance for memories to be loaded
     
-    # Rate limiting
-    RATE_LIMIT_ENABLED: bool = True
-    FREE_TIER_REQUESTS_PER_MINUTE: int = 20
-    FREE_TIER_TOKENS_PER_DAY: int = 100000
+    # LLM Service settings
+    LLM_PROVIDER: str = "gemini"
+    LLM_API_KEY: Optional[str] = None
+    LLM_MAX_TOKENS: int = 8192
+    LLM_TEMPERATURE: float = 0.7
     
-    # Memory optimization
-    ENTITY_TRACKING_ENABLED: bool = True
-    MEMORY_IMPORTANCE_SCORING_ENABLED: bool = True
-    AUTO_SUMMARIZATION_ENABLED: bool = True
+    # Context window settings
+    CONTEXT_MAX_TOKENS: int = 16000
+    CONTEXT_MAX_MESSAGES: int = 20
+    CONTEXT_SUMMARY_TRIGGER: int = 15  # Number of messages before summarization
     
-    # Mental health settings (for Stage 3)
-    MENTAL_HEALTH_SUPPORT_ENABLED: bool = False
-    
-    # Feature flags
-    FEATURES: Dict[str, bool] = {
-        "memory_system": True,
-        "context_window": True,
-        "streaming_responses": True,
-        "function_calling": False,  # Will be enabled in Stage 2
-        "mental_health": False,     # Will be enabled in Stage 3
-        "habit_tracking": False,    # Will be enabled in Stage 3
-    }
-    
-    class Config:
-        """Pydantic model configuration."""
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = True
-    
-    @validator("SECRET_KEY", pre=True)
-    def validate_secret_key(cls, v: Optional[str]) -> str:
-        """
-        Validate SECRET_KEY.
-        
-        Generates a random key for development if not provided.
-        """
-        if not v:
-            import secrets
-            return secrets.token_urlsafe(32)
+    # Replace validator decorator with field_validator for Pydantic v2.x
+    @field_validator("SECRET_KEY")
+    def validate_secret_key(cls, v):
+        if len(v) < 32:
+            raise ValueError("SECRET_KEY must be at least 32 characters")
         return v
 
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+        
+# Singleton instance for settings
+_settings = None
 
-@lru_cache()
 def get_settings() -> Settings:
     """
-    Get application settings.
-    
-    Uses LRU cache to avoid re-creating settings object for every request.
+    Return a singleton Settings instance.
     
     Returns:
-        Settings: Application settings
+        Settings: The application settings
     """
-    return Settings()
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings

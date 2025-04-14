@@ -15,7 +15,7 @@ from typing import Dict, Any, Optional
 
 from context_window import get_context_window
 from memory_manager import get_memory_manager
-from llm_service import GeminiAPI
+from llm_service import GeminiService
 from models import User
 
 # Logger configuration
@@ -35,7 +35,7 @@ class ConversationHandler:
         self.user = user
         self.context_window = get_context_window()
         self.memory_manager = get_memory_manager()
-        self.gemini_api = GeminiAPI()
+        self.gemini_service = GeminiService()
     
     async def process_message(self, message: str) -> str:
         """
@@ -61,7 +61,7 @@ class ConversationHandler:
             context = self.context_window.assemble_context()
             
             # Call Gemini API for a response
-            response = await self.gemini_api.stream_conversation(context)
+            response = await self.gemini_service.stream_conversation(context)
             
             # Add assistant message to context
             self.context_window.add_message("assistant", response)

@@ -15,7 +15,7 @@ from typing import Annotated, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from auth import Token, create_access_token, get_current_active_user, get_password_hash
 from config import get_settings
@@ -45,7 +45,7 @@ class UserCreate(BaseModel):
     password: str
     full_name: Optional[str] = None
     
-    @validator('password')
+    @field_validator('password')
     def password_strength(cls, v):
         """Validate password strength."""
         if len(v) < 8:
@@ -53,7 +53,7 @@ class UserCreate(BaseModel):
         # Could add more validation rules here (uppercase, lowercase, numbers, etc.)
         return v
     
-    @validator('username')
+    @field_validator('username')
     def username_valid(cls, v):
         """Validate username format."""
         if not v.isalnum():

@@ -49,12 +49,11 @@ settings = get_settings()
 
 # Create FastAPI application
 app = FastAPI(
-    title=settings.PROJECT_NAME,
-    description="Enhanced EVA AI Assistant API",
-    version=settings.VERSION,
-    docs_url="/docs" if settings.DEBUG else None,
-    redoc_url="/redoc" if settings.DEBUG else None,
-    openapi_url="/openapi.json" if settings.DEBUG else None,
+    title=settings.API_TITLE,
+    description=settings.API_DESCRIPTION,
+    version=settings.API_VERSION,
+    openapi_url="/api/openapi.json",
+    docs_url="/api/docs",
 )
 
 # CORS configuration
@@ -139,7 +138,7 @@ async def not_found_exception_handler(request: Request, exc: NotFoundException):
 @app.on_event("startup")
 async def startup_event():
     """Initialize application components on startup."""
-    logger.info(f"Starting {settings.PROJECT_NAME} v{settings.VERSION}")
+    logger.info(f"Starting {settings.API_TITLE} v{settings.API_VERSION}")
     logger.info(f"Environment: {settings.ENVIRONMENT}")
     
     # Initialize database connection
@@ -171,8 +170,8 @@ async def root():
     Root endpoint providing API information.
     """
     return {
-        "name": settings.PROJECT_NAME,
-        "version": settings.VERSION,
+        "name": settings.API_TITLE,
+        "version": settings.API_VERSION,
         "status": "online",
         "timestamp": datetime.utcnow().isoformat(),
         "environment": settings.ENVIRONMENT

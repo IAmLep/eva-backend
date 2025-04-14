@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union, TypeVar, Generic
 
-from pydantic import AnyHttpUrl, BaseModel, EmailStr, Field, validator
+from pydantic import AnyHttpUrl, BaseModel, EmailStr, Field, field_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, SettingsConfigDict
 

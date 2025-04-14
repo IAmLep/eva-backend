@@ -6,7 +6,7 @@ data, with enhanced support for the multi-tiered memory system.
 
 Update your existing database.py file with this version.
 
-Current Date: 2025-04-13 11:03:01
+Current Date: 2025-04-14 10:22:39
 Current User: IAmLepin
 """
 
@@ -169,6 +169,64 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error retrieving user by email {email}: {str(e)}")
             return None
+    
+    async def get_user_by_username(self, username: str) -> Optional[User]:
+        """
+        Get a user by username.
+        
+        Args:
+            username: Username to look up
+            
+        Returns:
+            Optional[User]: User if found, None otherwise
+        """
+        try:
+            if self.db:
+                # Query Firestore
+                query = self.db.collection("users").where("username", "==", username).limit(1)
+                results = query.get()
+                
+                for doc in results:
+                    user_data = doc.to_dict()
+                    # Add ID from document
+                    user_data["id"] = doc.id
+                    return User(**user_data)
+                
+                return None
+            else:
+                # Query in-memory storage
+                for user_id, user_data in self.in_memory_db["users"].items():
+                    if user_data.get("username") == username:
+                        return User(**user_data)
+                
+                return None
+            
+        except Exception as e:
+            logger.error(f"Error retrieving user by username {username}: {str(e)}")
+            return None
+    
+    async def verify_user_exists(self, user_id: str) -> bool:
+        """
+        Verify that a user exists.
+        
+        Args:
+            user_id: User ID to check
+            
+        Returns:
+            bool: True if user exists, False otherwise
+        """
+        try:
+            if self.db:
+                # Check in Firestore
+                doc = self.db.collection("users").document(user_id).get()
+                return doc.exists
+            else:
+                # Check in-memory storage
+                return user_id in self.in_memory_db["users"]
+            
+        except Exception as e:
+            logger.error(f"Error verifying user existence {user_id}: {str(e)}")
+            return False
     
     async def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
         """
@@ -891,3 +949,67 @@ def get_db_manager() -> DatabaseManager:
     if _db_manager is None:
         _db_manager = DatabaseManager()
     return _db_manager
+
+
+async def get_user_by_username(username: str) -> Optional[User]:
+    """
+    Get a user by username.
+    
+    Args:
+        username: Username to look up
+        
+    Returns:
+        Optional[User]: User if found, None otherwise
+    """
+    try:
+        db_manager = get_db_manager()
+        
+        if db_manager.db:
+            # Query Firestore
+            query = db_manager.db.collection("users").where("username", "==", username).limit(1)
+            results = query.get()
+            
+            for doc in results:
+                user_data = doc.to_dict()
+                # Add ID from document
+                user_data["id"] = doc.id
+                return User(**user_data)
+            
+            return None
+        else:
+            # Query in-memory storage
+            for user_id, user_data in db_manager.in_memory_db["users"].items():
+                if user_data.get("username") == username:
+                    return User(**user_data)
+            
+            return None
+        
+    except Exception as e:
+        logger.error(f"Error retrieving user by username {username}: {str(e)}")
+        return None
+
+
+async def verify_user_exists(user_id: str) -> bool:
+    """
+    Verify that a user exists.
+    
+    Args:
+        user_id: User ID to check
+        
+    Returns:
+        bool: True if user exists, False otherwise
+    """
+    try:
+        db_manager = get_db_manager()
+        
+        if db_manager.db:
+            # Check in Firestore
+            doc = db_manager.db.collection("users").document(user_id).get()
+            return doc.exists
+        else:
+            # Check in-memory storage
+            return user_id in db_manager.in_memory_db["users"]
+        
+    except Exception as e:
+        logger.error(f"Error verifying user existence {user_id}: {str(e)}")
+        return False

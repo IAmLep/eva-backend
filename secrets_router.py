@@ -74,14 +74,14 @@ class SecretCreateRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     tags: List[str] = Field(default_factory=list)
     
-    @validator('name')
+    @field_validator('name')
     def name_not_empty(cls, v):
         """Validate that name is not empty."""
         if not v or not v.strip():
             raise ValueError('Name cannot be empty')
         return v
     
-    @validator('value')
+    @field_validator('value')
     def value_not_empty(cls, v):
         """Validate that value is not empty."""
         if not v:
@@ -108,14 +108,14 @@ class SecretUpdateRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     tags: Optional[List[str]] = None
     
-    @validator('name')
+    @field_validator('name')
     def name_not_empty(cls, v):
         """Validate that name is not empty if provided."""
         if v is not None and not v.strip():
             raise ValueError('Name cannot be empty')
         return v
     
-    @validator('value')
+    @field_validator('value')
     def value_not_empty(cls, v):
         """Validate that value is not empty if provided."""
         if v is not None and not v:
@@ -174,7 +174,7 @@ class CategoryCreateRequest(BaseModel):
     description: Optional[str] = None
     icon: Optional[str] = None
     
-    @validator('name')
+    @field_validator('name')
     def name_not_empty(cls, v):
         """Validate that name is not empty."""
         if not v or not v.strip():

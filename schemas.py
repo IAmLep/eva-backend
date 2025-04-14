@@ -13,7 +13,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Union
 
-from pydantic import BaseModel, EmailStr, Field, validator, root_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, root_validator
 
 
 class TokenRequest(BaseModel):
@@ -55,7 +55,7 @@ class UserBase(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
     
-    @validator('username')
+    @field_validator('username')
     def username_alphanumeric(cls, v):
         """Validate username contains only alphanumeric characters."""
         if not v.isalnum():
@@ -72,7 +72,7 @@ class UserCreate(UserBase):
     """
     password: str
     
-    @validator('password')
+    @field_validator('password')
     def password_strong(cls, v):
         """Validate password strength."""
         if len(v) < 8:
@@ -101,7 +101,7 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
     preferences: Optional[Dict[str, Any]] = None
     
-    @validator('password')
+    @field_validator('password')
     def password_strong(cls, v):
         """Validate password strength if provided."""
         if v is not None:
@@ -149,7 +149,7 @@ class MemoryBase(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     tags: List[str] = Field(default_factory=list)
     
-    @validator('content')
+    @field_validator('content')
     def content_not_empty(cls, v):
         """Validate content is not empty."""
         if not v.strip():
@@ -177,7 +177,7 @@ class MemoryUpdate(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     tags: Optional[List[str]] = None
     
-    @validator('content')
+    @field_validator('content')
     def content_not_empty(cls, v):
         """Validate content is not empty if provided."""
         if v is not None and not v.strip():
@@ -298,7 +298,7 @@ class MessageCreate(BaseModel):
     role: MessageRole
     metadata: Dict[str, Any] = Field(default_factory=dict)
     
-    @validator('content')
+    @field_validator('content')
     def content_not_empty(cls, v):
         """Validate content is not empty."""
         if not v.strip():
@@ -369,14 +369,14 @@ class ApiKeyCreate(BaseModel):
     scopes: List[str]
     expires_in_days: Optional[int] = None
     
-    @validator('name')
+    @field_validator('name')
     def name_not_empty(cls, v):
         """Validate name is not empty."""
         if not v.strip():
             raise ValueError('Name cannot be empty')
         return v.strip()
     
-    @validator('scopes')
+    @field_validator('scopes')
     def scopes_valid(cls, v):
         """Validate scopes are valid."""
         valid_scopes = {"read", "write", "admin"}
@@ -385,7 +385,7 @@ class ApiKeyCreate(BaseModel):
                 raise ValueError(f"Invalid scope: {scope}")
         return v
     
-    @validator('expires_in_days')
+    @field_validator('expires_in_days')
     def expires_in_days_positive(cls, v):
         """Validate expires_in_days is positive if provided."""
         if v is not None and v <= 0:
@@ -432,14 +432,14 @@ class WebhookCreate(BaseModel):
     events: List[str]
     description: Optional[str] = None
     
-    @validator('url')
+    @field_validator('url')
     def url_valid(cls, v):
         """Validate URL format."""
         if not v.startswith(('http://', 'https://')):
             raise ValueError('URL must start with http:// or https://')
         return v
     
-    @validator('events')
+    @field_validator('events')
     def events_valid(cls, v):
         """Validate events are valid."""
         valid_events = {
@@ -536,21 +536,21 @@ class TextGenerationRequest(BaseModel):
     temperature: float = 0.7
     include_memory: bool = True
     
-    @validator('prompt')
+    @field_validator('prompt')
     def prompt_not_empty(cls, v):
         """Validate prompt is not empty."""
         if not v.strip():
             raise ValueError('Prompt cannot be empty')
         return v.strip()
     
-    @validator('max_tokens')
+    @field_validator('max_tokens')
     def max_tokens_range(cls, v):
         """Validate max_tokens is in valid range."""
         if v < 1 or v > 4096:
             raise ValueError('max_tokens must be between 1 and 4096')
         return v
     
-    @validator('temperature')
+    @field_validator('temperature')
     def temperature_range(cls, v):
         """Validate temperature is in valid range."""
         if v < 0.0 or v > 1.0:

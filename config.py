@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     API_TITLE: str = "EVA Backend API"
     API_DESCRIPTION: str = "Enhanced Virtual Assistant Backend API"
     DEBUG: bool = False
+
+    ENVIRONMENT: str = "development"
     
     # Authentication settings
     SECRET_KEY: str = Field(..., min_length=32)

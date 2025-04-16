@@ -20,26 +20,38 @@ load_dotenv()
 class Settings(BaseSettings):
     """System settings loaded from environment variables."""
     
+    # Environment settings
+    ENVIRONMENT: str = "development"  # Options: development, staging, production
+    DEBUG: bool = False
+    HOST: str = "0.0.0.0"
+    PORT: int = 8080
+    LOG_LEVEL: str = "INFO"
+    APP_NAME: str = "EVA Backend"
+    APP_VERSION: str = "2.0.0"
+    
     # API configuration
     API_VERSION: str = "2.0.0"
     API_TITLE: str = "EVA Backend API"
     API_DESCRIPTION: str = "Enhanced Virtual Assistant Backend API"
-    DEBUG: bool = False
-
-    ENVIRONMENT: str = "development"
     
     # Authentication settings
     SECRET_KEY: str = Field(..., min_length=32)
     TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
+    ALGORITHM: str = "HS256"  # Add this for JWT token generation
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # Add this for token expiration
     
     # Database configuration
     DB_PROVIDER: str = "firebase"
+    FIREBASE_CREDENTIALS_PATH: str = "firebase-credentials.json"
+    
+    # Service URL for authentication
+    SERVICE_URL: Optional[str] = None
     
     # Memory system settings
-    MEMORY_REFRESH_BATCH_SIZE: int = 5  # Number of memories to refresh per batch
-    MEMORY_MAX_CORE_MEMORIES: int = 50  # Maximum number of core memories to load
-    MEMORY_MAX_EVENT_MEMORIES: int = 10  # Maximum number of event memories to load
-    MEMORY_IMPORTANCE_THRESHOLD: int = 5  # Minimum importance for memories to be loaded
+    MEMORY_REFRESH_BATCH_SIZE: int = 5
+    MEMORY_MAX_CORE_MEMORIES: int = 50
+    MEMORY_MAX_EVENT_MEMORIES: int = 10
+    MEMORY_IMPORTANCE_THRESHOLD: int = 5
     
     # LLM Service settings
     LLM_PROVIDER: str = "gemini"
@@ -50,9 +62,26 @@ class Settings(BaseSettings):
     # Context window settings
     CONTEXT_MAX_TOKENS: int = 16000
     CONTEXT_MAX_MESSAGES: int = 20
-    CONTEXT_SUMMARY_TRIGGER: int = 15  # Number of messages before summarization
+    CONTEXT_SUMMARY_TRIGGER: int = 15
     
-    # Replace validator decorator with field_validator for Pydantic v2.x
+    # Feature flags
+    FEATURES: Dict[str, bool] = {
+        "memory_system": True,
+        "conversation_analysis": True,
+        "knowledge_integration": True,
+        "real_time_responses": True
+    }
+    
+    @property
+    def is_production(self) -> bool:
+        """
+        Check if environment is production
+        
+        Returns:
+            bool: True if environment is production, False otherwise
+        """
+        return self.ENVIRONMENT.lower() == "production"
+    
     @field_validator("SECRET_KEY")
     def validate_secret_key(cls, v):
         if len(v) < 32:

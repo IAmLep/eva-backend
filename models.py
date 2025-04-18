@@ -3,6 +3,7 @@ Core Pydantic models representing data structures used throughout the applicatio
 including database representations.
 """
 
+import uuid # Import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
@@ -12,44 +13,39 @@ from pydantic import BaseModel, Field, EmailStr, HttpUrl, field_validator
 # --- Enums ---
 
 class UserRole(str, Enum):
-    """Enumeration for user roles."""
     USER = "user"
     ADMIN = "admin"
-    AGENT = "agent" # If EVA acts as an agent
+    AGENT = "agent"
 
 class MemorySource(str, Enum):
-    """Where the memory originated from."""
-    CORE = "core" # Long-term, factual memory
-    CONVERSATIONAL = "conversational" # Extracted from specific conversation turns
-    EVENT = "event" # Time-based, like reminders or appointments
-    SYSTEM = "system" # Internal system-generated memories (e.g., user onboarding)
-    EXTERNAL = "external" # Imported from external sources
+    CORE = "core"
+    CONVERSATIONAL = "conversational"
+    EVENT = "event"
+    SYSTEM = "system"
+    EXTERNAL = "external"
 
 class MemoryCategory(str, Enum):
-    """Categories primarily for Core memories."""
-    PERSONAL_INFO = "personal_info" # Name, address, DOB, etc.
-    PREFERENCE = "preference" # Likes, dislikes, settings
-    FACT = "fact" # General knowledge about the user or world relevant to them
-    GOAL = "goal" # User's stated goals or objectives
-    RELATIONSHIP = "relationship" # Information about user's connections
-    SKILL = "skill" # User's skills or abilities
-    PROJECT = "project" # Details about projects user is working on
-    OTHER = "other" # Catch-all category
+    PERSONAL_INFO = "personal_info"
+    PREFERENCE = "preference"
+    FACT = "fact"
+    GOAL = "goal"
+    RELATIONSHIP = "relationship"
+    SKILL = "skill"
+    PROJECT = "project"
+    OTHER = "other"
 
 class ApiKeyScope(str, Enum):
-    """Defines permission scopes for API keys."""
     READ_MEMORY = "memory:read"
     WRITE_MEMORY = "memory:write"
     READ_CONVERSATION = "conversation:read"
     WRITE_CONVERSATION = "conversation:write"
     READ_USER = "user:read"
-    ADMIN = "admin" # Full access
+    ADMIN = "admin"
 
 # --- Core Models ---
 
 class User(BaseModel):
-    """Base User model for general use and API responses (excluding sensitive data)."""
-    id: str = Field(..., description="Unique user identifier")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique user identifier") # Use default factory
     username: str = Field(..., description="Unique username")
     email: EmailStr = Field(..., description="User's email address")
     full_name: Optional[str] = Field(None, description="User's full name")
@@ -61,53 +57,64 @@ class User(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     class Config:
-        from_attributes = True # Allows creating from ORM objects or dicts with extra fields
+        from_attributes = True
 
 class UserInDB(User):
-    """User model including sensitive data stored in the database."""
     hashed_password: str = Field(..., description="Hashed password for the user")
-    # Add other DB-specific fields if needed, like email_verified, last_login etc.
-    # email_verified: bool = False
-    # last_login: Optional[datetime] = None
+    # Salt for deriving encryption keys from password (if that method is chosen later)
+    encryption_salt: Optional[str] = Field(None, description="Salt for user-specific encryption key derivation")
 
 
 class Memory(BaseModel):
-    """Represents a single memory unit stored in the database."""
-    memory_id: str = Field(..., description="Unique identifier for the memory")
+    memory_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique identifier for the memory") # Use default factory
     user_id: str = Field(..., description="ID of the user this memory belongs to")
     content: str = Field(..., description="The textual content of the memory")
     source: MemorySource = Field(..., description="Origin of the memory (core, event, etc.)")
     importance: int = Field(default=5, ge=1, le=10, description="Importance score (1-10)")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata (e.g., category, entity, event_time)")
     tags: List[str] = Field(default_factory=list, description="Tags for filtering and retrieval")
-    embedding: Optional[List[float]] = Field(None, description="Optional vector embedding for semantic search") # Placeholder
+    embedding: Optional[List[float]] = Field(None, description="Optional vector embedding for semantic search")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    # Fields relevant for sync and event handling
     expiration: Optional[datetime] = Field(None, description="Optional expiration time (especially for events)")
     is_synced: bool = Field(default=True, description="Whether this memory state is synced with clients")
 
-    # Ensure metadata has expected fields based on source at validation time?
     @field_validator('metadata')
-    def check_metadata_fields(cls, v, values):
-        data = values.data # Get the underlying data being validated
+    def check_metadata_fields(cls, v, info): # Use 'info' for Pydantic v2
+        data = info.data # Get the underlying data being validated
         source = data.get('source')
         if source == MemorySource.CORE:
             if 'category' not in v:
-                v['category'] = MemoryCategory.OTHER.value # Default category if missing
-            # Ensure category is valid enum value if present
+                v['category'] = MemoryCategory.OTHER.value
             if 'category' in v and v['category'] not in [cat.value for cat in MemoryCategory]:
                  v['category'] = MemoryCategory.OTHER.value
-            if 'importance' not in v and 'importance' in data: # Copy top-level importance if not in meta
+            if 'importance' not in v and 'importance' in data:
                  v['importance'] = data.get('importance')
 
         elif source == MemorySource.EVENT:
-            if 'event_time' not in v:
-                raise ValueError("Event memory metadata must include 'event_time'")
-            if 'expiration' not in v and 'expiration' in data: # Copy top-level expiration
-                 v['expiration'] = data.get('expiration').isoformat() if data.get('expiration') else None
+            # Ensure event_time is present and valid ISO format string
+            event_time_str = v.get("event_time")
+            if not event_time_str:
+                 raise ValueError("Event memory metadata must include 'event_time'")
+            try:
+                 datetime.fromisoformat(str(event_time_str).replace('Z', '+00:00'))
+            except (TypeError, ValueError):
+                 raise ValueError("Event memory metadata 'event_time' must be a valid ISO 8601 string")
+
+            # Ensure expiration is valid ISO format string if present
+            exp_time_str = v.get("expiration")
+            if exp_time_str:
+                 try:
+                      datetime.fromisoformat(str(exp_time_str).replace('Z', '+00:00'))
+                 except (TypeError, ValueError):
+                      raise ValueError("Event memory metadata 'expiration' must be a valid ISO 8601 string if provided")
+
+            # Copy top-level expiration to metadata if not present
+            if 'expiration' not in v and data.get('expiration'):
+                 v['expiration'] = data['expiration'].isoformat()
+
             if 'completed' not in v:
-                 v['completed'] = False # Default to not completed
+                 v['completed'] = False
 
         return v
 
@@ -116,28 +123,22 @@ class Memory(BaseModel):
 
 
 class Conversation(BaseModel):
-    """Represents a conversation session."""
     conversation_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique conversation identifier")
     user_id: str = Field(..., description="ID of the user involved")
     start_time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     summary: Optional[str] = Field(None, description="Optional summary of the conversation")
-    # Messages could be stored separately or embedded (embedding can hit Firestore limits)
-    # messages: List[Dict[str, Any]] = Field(default_factory=list) # Example if embedding messages
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SyncState(BaseModel):
-    """Represents the synchronization state for a user/device."""
     user_id: str
     device_id: str
     last_sync_time: datetime
-    # Add other sync-related info if needed
 
 
 class ApiKey(BaseModel):
-    """Represents an API key stored in the database."""
-    key_id: str = Field(..., description="Unique identifier for the API key")
+    key_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique identifier for the API key") # Use default factory
     user_id: str = Field(..., description="ID of the user this key belongs to")
     prefix: str = Field(..., description="Non-secret prefix of the key (e.g., for identification)")
     hashed_key: str = Field(..., description="Secure hash of the full API key")
@@ -153,9 +154,7 @@ class ApiKey(BaseModel):
 
 
 class UserRateLimit(BaseModel):
-    """Tracks API usage rate limiting for a user."""
     user_id: str
     last_request_time: datetime
     minute_count: int
     day_count: int
-    # Add other tracking periods if needed

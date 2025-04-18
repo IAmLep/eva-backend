@@ -3,10 +3,7 @@ API Tools module for EVA backend.
 
 This module provides tools and utilities for function calling
 integration with Gemini API, allowing LLM to execute actions.
-"""
-
-"""
-Version 3 working
+Includes implementation for basic tools.
 """
 
 import inspect
@@ -14,667 +11,328 @@ import json
 import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Type, Union, get_type_hints
+from datetime import datetime, timezone, timedelta # Import datetime objects
 
+import httpx # For making HTTP requests (e.g., Weather API)
 from pydantic import BaseModel, Field, create_model
 
-from auth import get_current_user
+# --- Local Imports ---
+from auth import get_current_user # Needed for context in execute
 from config import get_settings
-from database import get_db_manager
-from exceptions import FunctionCallError
-from models import User
+from database import get_db_manager # Needed for Memory/Cleanup tools
+from exceptions import FunctionCallError, DatabaseError, NotFoundException # Use custom exceptions
+from models import User, Memory, MemorySource, MemoryCategory # Import necessary models
+# Import MemoryManager for memory operations
+from memory_manager import get_memory_manager
 
 # Logger configuration
 logger = logging.getLogger(__name__)
 
-
+# --- Tool Definitions ---
+# (ToolParameter, ToolDefinition remain the same)
 class ToolParameter(BaseModel):
-    """
-    Tool parameter definition for function calling.
-    
-    Attributes:
-        name: Parameter name
-        type: Parameter type
-        description: Parameter description
-        required: Whether parameter is required
-        enum: Optional list of allowed values
-    """
     name: str
-    type: str
+    type: str # Should align with OpenAPI types (string, integer, boolean, number, array, object)
     description: str
     required: bool = False
     enum: Optional[List[str]] = None
 
-
 class ToolDefinition(BaseModel):
-    """
-    Tool definition for function calling.
-    
-    Attributes:
-        name: Function name
-        description: Function description
-        parameters: List of parameters
-    """
     name: str
     description: str
     parameters: List[ToolParameter]
 
-
-class ToolCall(BaseModel):
-    """
-    Tool call from LLM.
-    
-    Attributes:
-        function: Tool definition
-        args: Arguments for the function
-    """
-    function: ToolDefinition
-    args: Dict[str, Any]
-
+# Renamed to avoid Pydantic conflict if ToolCall is imported elsewhere
+class ApiToolCall(BaseModel):
+    """Represents the structure of a function call request from the LLM."""
+    name: str # Function name
+    args: Dict[str, Any] # Arguments provided by LLM
 
 class Tool:
     """Base class for all tools that can be called by the LLM."""
-    
     @staticmethod
     def get_definition() -> ToolDefinition:
-        """
-        Get tool definition.
-        
-        Returns:
-            ToolDefinition: Tool definition for LLM
-        """
         raise NotImplementedError("Tools must implement get_definition")
-    
+
     @staticmethod
     async def execute(args: Dict[str, Any], user: User) -> Dict[str, Any]:
         """
-        Execute the tool.
-        
-        Args:
-            args: Tool arguments
-            user: Current user
-            
-        Returns:
-            Dict[str, Any]: Execution result
-            
-        Raises:
-            FunctionCallError: If execution fails
+        Executes the tool logic.
+        Returns a JSON-serializable dictionary representing the result.
+        This result will be sent back to the LLM.
         """
         raise NotImplementedError("Tools must implement execute")
 
+# --- Implemented Tools ---
 
 class TimeTool(Tool):
-    """Tool for getting current time and date information."""
-    
     @staticmethod
     def get_definition() -> ToolDefinition:
-        """
-        Get tool definition.
-        
-        Returns:
-            ToolDefinition: Tool definition for LLM
-        """
         return ToolDefinition(
-            name="get_time",
-            description="Get the current time and date information",
+            name="get_current_time", # Renamed for clarity
+            description="Get the current time and date information.",
             parameters=[
-                ToolParameter(
-                    name="format",
-                    type="string",
-                    description="Format of the time/date (iso, human, unix)",
-                    required=False,
-                    enum=["iso", "human", "unix"]
-                ),
-                ToolParameter(
-                    name="timezone",
-                    type="string",
-                    description="Timezone for the time (utc, local)",
-                    required=False,
-                    enum=["utc", "local"]
-                )
+                ToolParameter(name="timezone", type="string", description="Optional timezone (e.g., 'UTC', 'America/New_York'). Defaults to UTC.", required=False),
+                ToolParameter(name="format", type="string", description="Optional format ('iso', 'human', 'unix'). Defaults to 'iso'.", required=False, enum=["iso", "human", "unix"])
             ]
         )
-    
+
     @staticmethod
     async def execute(args: Dict[str, Any], user: User) -> Dict[str, Any]:
-        """
-        Execute the tool.
-        
-        Args:
-            args: Tool arguments
-            user: Current user
-            
-        Returns:
-            Dict[str, Any]: Current time information
-        """
-        from datetime import datetime
-        import time
-        
-        time_format = args.get("format", "iso")
-        timezone = args.get("timezone", "utc")
-        
+        """Returns the current time, defaulting to UTC ISO format."""
         try:
-            if timezone == "utc":
-                now = datetime.utcnow()
+            tz_str = args.get("timezone", "UTC")
+            time_format = args.get("format", "iso")
+
+            # Basic timezone handling (consider pytz for full support if needed)
+            if tz_str.upper() == "UTC":
+                now = datetime.now(timezone.utc)
             else:
-                now = datetime.now()
-            
+                # Attempting local time - NOTE: Server's local time, not user's unless specified
+                # For robust timezone handling, use pytz or user preferences
+                logger.warning(f"TimeTool using server's local time for timezone '{tz_str}' unless it's UTC.")
+                now = datetime.now() # Server's local time
+
             if time_format == "iso":
                 time_str = now.isoformat()
             elif time_format == "human":
-                time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+                time_str = now.strftime("%Y-%m-%d %H:%M:%S %Z%z") # Include timezone info
             elif time_format == "unix":
-                time_str = str(int(time.time()))
+                time_str = str(int(now.timestamp()))
             else:
-                time_str = now.isoformat()
-            
-            return {
-                "success": True,
-                "time": time_str,
-                "format": time_format,
-                "timezone": timezone,
-                "append_to_response": False
-            }
-        except Exception as e:
-            logger.error(f"Error executing time tool: {str(e)}")
-            raise FunctionCallError(f"Failed to get time information: {str(e)}")
+                time_str = now.isoformat() # Default to ISO
 
+            return {"current_time": time_str, "timezone": tz_str, "format": time_format}
+        except Exception as e:
+            logger.error(f"Error executing TimeTool: {e}", exc_info=True)
+            # Return error structure for LLM
+            return {"error": f"Failed to get time: {e}"}
 
 class WeatherTool(Tool):
-    """Tool for getting weather information for a location."""
-    
     @staticmethod
     def get_definition() -> ToolDefinition:
-        """
-        Get tool definition.
-        
-        Returns:
-            ToolDefinition: Tool definition for LLM
-        """
         return ToolDefinition(
             name="get_weather",
-            description="Get the current weather information for a location",
+            description="Get the current weather information for a specific location.",
             parameters=[
-                ToolParameter(
-                    name="location",
-                    type="string",
-                    description="Location to get weather for (city name or coordinates)",
-                    required=True
-                ),
-                ToolParameter(
-                    name="units",
-                    type="string",
-                    description="Units for temperature (celsius, fahrenheit)",
-                    required=False,
-                    enum=["celsius", "fahrenheit"]
-                )
+                ToolParameter(name="location", type="string", description="The city and state/country (e.g., 'London, UK', 'Tokyo', 'New York, US').", required=True),
+                ToolParameter(name="units", type="string", description="Temperature units ('metric' for Celsius, 'imperial' for Fahrenheit). Defaults to 'metric'.", required=False, enum=["metric", "imperial"])
             ]
         )
-    
+
     @staticmethod
     async def execute(args: Dict[str, Any], user: User) -> Dict[str, Any]:
-        """
-        Execute the tool.
-        
-        Args:
-            args: Tool arguments
-            user: Current user
-            
-        Returns:
-            Dict[str, Any]: Weather information
-            
-        Raises:
-            FunctionCallError: If execution fails
-        """
-        try:
-            # This is a mock implementation
-            # In a real implementation, you would call a weather API
-            location = args.get("location", "")
-            units = args.get("units", "celsius")
-            
-            if not location:
-                raise FunctionCallError("Location is required")
-            
-            # Mock weather data
-            weather_data = {
-                "location": location,
-                "temperature": 22 if units == "celsius" else 72,
-                "units": units,
-                "condition": "Sunny",
-                "humidity": 65,
-                "wind_speed": 10,
-                "precipitation": 0
-            }
-            
-            return {
-                "success": True,
-                "weather": weather_data,
-                "append_to_response": True,
-                "message": f"The current weather in {location} is {weather_data['condition']} with a temperature of {weather_data['temperature']}°{'C' if units == 'celsius' else 'F'}."
-            }
-        except FunctionCallError:
-            # Re-raise function call errors
-            raise
-        except Exception as e:
-            logger.error(f"Error executing weather tool: {str(e)}")
-            raise FunctionCallError(f"Failed to get weather information: {str(e)}")
+        """Fetches weather using an external API (mocked for now)."""
+        settings = get_settings()
+        location = args.get("location")
+        units = args.get("units", "metric") # Default to Celsius
 
+        if not location:
+            return {"error": "Location parameter is required."}
+
+        # --- Replace with actual API call ---
+        # Example using OpenWeatherMap (requires API key)
+        api_key = settings.WEATHER_API_KEY
+        base_url = settings.WEATHER_API_URL or "https://api.openweathermap.org/data/2.5/weather"
+
+        if not api_key or not base_url:
+             logger.warning("Weather API key or URL not configured. Returning mock weather.")
+             # Mock Response
+             temp = 22 if units == "metric" else 72
+             unit_symbol = "°C" if units == "metric" else "°F"
+             return {
+                 "location": location,
+                 "temperature": f"{temp}{unit_symbol}",
+                 "condition": "Sunny (Mock Data)",
+                 "humidity_percent": 65,
+                 "details": "Mock weather data. Configure WEATHER_API_KEY and WEATHER_API_URL for real data."
+             }
+
+        params = {
+            "q": location,
+            "appid": api_key,
+            "units": units
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(base_url, params=params)
+                response.raise_for_status() # Raise exception for bad status codes
+                data = response.json()
+
+            # Extract relevant information
+            main = data.get("main", {})
+            weather = data.get("weather", [{}])[0]
+            temp = main.get("temp")
+            feels_like = main.get("feels_like")
+            humidity = main.get("humidity")
+            description = weather.get("description")
+            city = data.get("name")
+            unit_symbol = "°C" if units == "metric" else "°F"
+
+            return {
+                "location": city or location,
+                "temperature": f"{temp}{unit_symbol}" if temp is not None else "N/A",
+                "feels_like": f"{feels_like}{unit_symbol}" if feels_like is not None else "N/A",
+                "condition": description.capitalize() if description else "N/A",
+                "humidity_percent": humidity if humidity is not None else "N/A",
+            }
+        except httpx.HTTPStatusError as e:
+             error_detail = f"HTTP error fetching weather: {e.response.status_code}"
+             if e.response.status_code == 404: error_detail = f"Could not find weather for location: {location}"
+             if e.response.status_code == 401: error_detail = "Invalid weather API key."
+             logger.error(f"{error_detail} - Response: {e.response.text}")
+             return {"error": error_detail}
+        except httpx.RequestError as e:
+            logger.error(f"Network error fetching weather: {e}")
+            return {"error": "Could not connect to weather service."}
+        except Exception as e:
+            logger.error(f"Error executing WeatherTool: {e}", exc_info=True)
+            return {"error": f"Failed to get weather: {e}"}
 
 class MemoryTool(Tool):
-    """Tool for managing user memories."""
-    
     @staticmethod
     def get_definition() -> ToolDefinition:
-        """
-        Get tool definition.
-        
-        Returns:
-            ToolDefinition: Tool definition for LLM
-        """
         return ToolDefinition(
             name="manage_memory",
-            description="Save or retrieve memories for the user",
+            description="Save, retrieve, or delete user memories. Use 'retrieve' to find relevant information based on a query.",
             parameters=[
-                ToolParameter(
-                    name="action",
-                    type="string",
-                    description="Action to perform (save, retrieve, delete)",
-                    required=True,
-                    enum=["save", "retrieve", "delete"]
-                ),
-                ToolParameter(
-                    name="content",
-                    type="string",
-                    description="Memory content to save (required for 'save' action)",
-                    required=False
-                ),
-                ToolParameter(
-                    name="query",
-                    type="string",
-                    description="Query to search for memories (for 'retrieve' action)",
-                    required=False
-                ),
-                ToolParameter(
-                    name="memory_id",
-                    type="string",
-                    description="Memory ID to delete (required for 'delete' action)",
-                    required=False
-                )
+                ToolParameter(name="action", type="string", description="Action: 'save', 'retrieve', or 'delete'.", required=True, enum=["save", "retrieve", "delete"]),
+                ToolParameter(name="content", type="string", description="Memory content to save (required for 'save').", required=False),
+                ToolParameter(name="category", type="string", description="Category for 'save' (e.g., 'personal_info', 'preference', 'fact'). Defaults to 'fact'.", required=False, enum=[cat.value for cat in MemoryCategory]),
+                ToolParameter(name="query", type="string", description="Search query for 'retrieve'.", required=False),
+                ToolParameter(name="memory_id", type="string", description="ID of the memory to delete (required for 'delete').", required=False)
             ]
         )
-    
+
     @staticmethod
     async def execute(args: Dict[str, Any], user: User) -> Dict[str, Any]:
-        """
-        Execute the tool.
-        
-        Args:
-            args: Tool arguments
-            user: Current user
-            
-        Returns:
-            Dict[str, Any]: Execution result
-            
-        Raises:
-            FunctionCallError: If execution fails
-        """
+        """Manages user memories via MemoryManager."""
+        action = args.get("action")
+        memory_manager = get_memory_manager()
+
         try:
-            action = args.get("action", "")
-            
-            if not action:
-                raise FunctionCallError("Action is required")
-            
-            db = get_db_manager()
-            
             if action == "save":
-                content = args.get("content", "")
-                if not content:
-                    raise FunctionCallError("Content is required for 'save' action")
-                
-                # Create memory
-                from models import Memory
-                memory = Memory(
+                content = args.get("content")
+                if not content: return {"error": "Content is required for 'save' action."}
+                category_str = args.get("category", MemoryCategory.FACT.value)
+                try:
+                    category = MemoryCategory(category_str)
+                except ValueError:
+                    return {"error": f"Invalid category '{category_str}'. Valid categories are: {[c.value for c in MemoryCategory]}"}
+
+                # Using create_core_memory for simplicity, could add logic for event/conv types
+                memory = await memory_manager.create_core_memory(
                     user_id=user.id,
-                    content=content
+                    content=content,
+                    category=category
                 )
-                
-                memory_id = await db.create_memory(memory)
-                
-                return {
-                    "success": True,
-                    "memory_id": memory_id,
-                    "action": "save",
-                    "append_to_response": True,
-                    "message": "Memory saved successfully."
-                }
-            
+                return {"status": "success", "action": "save", "memory_id": memory.memory_id, "message": "Memory saved."}
+
             elif action == "retrieve":
-                query = args.get("query", "")
-                if not query:
-                    raise FunctionCallError("Query is required for 'retrieve' action")
-                
-                # Search memories
-                memories = await db.get_memories_by_query(user.id, query)
-                
-                if not memories:
-                    return {
-                        "success": True,
-                        "memories": [],
-                        "action": "retrieve",
-                        "append_to_response": True,
-                        "message": "No memories found matching your query."
-                    }
-                
-                # Format memories for response
-                memory_list = [
-                    {"id": mem.memory_id, "content": mem.content, "created_at": mem.created_at.isoformat()}
-                    for mem in memories[:5]  # Limit to 5 memories
+                query = args.get("query")
+                if not query: return {"error": "Query is required for 'retrieve' action."}
+
+                # Use get_relevant_memories
+                relevant_memories = await memory_manager.get_relevant_memories(user_id=user.id, query=query, limit=3) # Limit results for LLM
+                if not relevant_memories:
+                    return {"status": "success", "action": "retrieve", "found_memories": 0, "message": "No relevant memories found."}
+
+                results = [
+                    {"memory_id": mem.memory_id, "content": mem.content, "relevance": score}
+                    for mem, score in relevant_memories
                 ]
-                
-                return {
-                    "success": True,
-                    "memories": memory_list,
-                    "count": len(memories),
-                    "action": "retrieve",
-                    "append_to_response": True,
-                    "message": f"Found {len(memories)} memories. Here are the most relevant ones:\n" + 
-                              "\n".join([f"- {m['content']}" for m in memory_list])
-                }
-            
+                return {"status": "success", "action": "retrieve", "found_memories": len(results), "results": results}
+
             elif action == "delete":
-                memory_id = args.get("memory_id", "")
-                if not memory_id:
-                    raise FunctionCallError("Memory ID is required for 'delete' action")
-                
-                # Delete memory
-                success = await db.delete_memory(user.id, memory_id)
-                
+                memory_id = args.get("memory_id")
+                if not memory_id: return {"error": "Memory ID is required for 'delete' action."}
+
+                success = await memory_manager.delete_memory(memory_id=memory_id, user_id=user.id)
                 if success:
-                    return {
-                        "success": True,
-                        "memory_id": memory_id,
-                        "action": "delete",
-                        "append_to_response": True,
-                        "message": "Memory deleted successfully."
-                    }
+                    return {"status": "success", "action": "delete", "memory_id": memory_id, "message": "Memory deleted."}
                 else:
-                    return {
-                        "success": False,
-                        "memory_id": memory_id,
-                        "action": "delete",
-                        "append_to_response": True,
-                        "message": "Failed to delete memory. It may not exist or you don't have permission."
-                    }
-            
+                    # delete_memory raises NotFoundException if not found/authorized
+                    # This path might not be reached if exceptions are handled globally
+                    return {"status": "error", "action": "delete", "memory_id": memory_id, "message": "Memory not found or delete failed."}
+
             else:
-                raise FunctionCallError(f"Unknown action: {action}")
-        
-        except FunctionCallError:
-            # Re-raise function call errors
-            raise
+                return {"error": f"Invalid action '{action}'. Must be 'save', 'retrieve', or 'delete'."}
+
+        except (NotFoundException, AuthorizationError) as e:
+            logger.warning(f"MemoryTool error ({action}): {e}")
+            return {"error": str(e)} # Return specific error to LLM
         except Exception as e:
-            logger.error(f"Error executing memory tool: {str(e)}")
-            raise FunctionCallError(f"Failed to manage memory: {str(e)}")
+            logger.error(f"Error executing MemoryTool ({action}): {e}", exc_info=True)
+            return {"error": f"Failed to {action} memory: {e}"}
 
+# --- Tool Registration & Execution ---
 
-class SyncTool(Tool):
-    """Tool for triggering database synchronization."""
-    
-    @staticmethod
-    def get_definition() -> ToolDefinition:
-        """
-        Get tool definition.
-        
-        Returns:
-            ToolDefinition: Tool definition for LLM
-        """
-        return ToolDefinition(
-            name="sync_database",
-            description="Trigger database synchronization with cloud",
-            parameters=[
-                ToolParameter(
-                    name="full_sync",
-                    type="boolean",
-                    description="Whether to perform a full sync (true) or incremental sync (false)",
-                    required=False
-                ),
-                ToolParameter(
-                    name="cleanup",
-                    type="boolean",
-                    description="Whether to clean up old entries after sync",
-                    required=False
-                )
-            ]
-        )
-    
-    @staticmethod
-    async def execute(args: Dict[str, Any], user: User) -> Dict[str, Any]:
-        """
-        Execute the tool.
-        
-        Args:
-            args: Tool arguments
-            user: Current user
-            
-        Returns:
-            Dict[str, Any]: Execution result
-            
-        Raises:
-            FunctionCallError: If execution fails
-        """
-        try:
-            full_sync = args.get("full_sync", False)
-            cleanup = args.get("cleanup", False)
-            
-            # Import here to avoid circular imports
-            from api_sync import trigger_sync
-            
-            # Call the sync function
-            result = await trigger_sync(user.id, full_sync=full_sync, cleanup=cleanup)
-            
-            if result.get("success", False):
-                return {
-                    "success": True,
-                    "synced_items": result.get("synced_items", 0),
-                    "deleted_items": result.get("deleted_items", 0),
-                    "full_sync": full_sync,
-                    "cleanup": cleanup,
-                    "append_to_response": True,
-                    "message": f"Database sync completed successfully. Synced {result.get('synced_items', 0)} items." +
-                              (f" Cleaned up {result.get('deleted_items', 0)} old items." if cleanup else "")
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": result.get("error", "Unknown error"),
-                    "append_to_response": True,
-                    "message": f"Database sync failed: {result.get('error', 'Unknown error')}"
-                }
-        
-        except Exception as e:
-            logger.error(f"Error executing sync tool: {str(e)}")
-            raise FunctionCallError(f"Failed to sync database: {str(e)}")
-
-
-class CleanupTool(Tool):
-    """Tool for cleaning up old or duplicate memories."""
-    
-    @staticmethod
-    def get_definition() -> ToolDefinition:
-        """
-        Get tool definition.
-        
-        Returns:
-            ToolDefinition: Tool definition for LLM
-        """
-        return ToolDefinition(
-            name="cleanup_database",
-            description="Clean up old or duplicate entries in the database",
-            parameters=[
-                ToolParameter(
-                    name="cleanup_type",
-                    type="string",
-                    description="Type of cleanup to perform",
-                    required=True,
-                    enum=["old", "duplicates", "both"]
-                ),
-                ToolParameter(
-                    name="days_threshold",
-                    type="integer",
-                    description="Age threshold in days for old entries (for 'old' or 'both' types)",
-                    required=False
-                )
-            ]
-        )
-    
-    @staticmethod
-    async def execute(args: Dict[str, Any], user: User) -> Dict[str, Any]:
-        """
-        Execute the tool.
-        
-        Args:
-            args: Tool arguments
-            user: Current user
-            
-        Returns:
-            Dict[str, Any]: Execution result
-            
-        Raises:
-            FunctionCallError: If execution fails
-        """
-        try:
-            cleanup_type = args.get("cleanup_type", "")
-            days_threshold = args.get("days_threshold", 30)
-            
-            if not cleanup_type:
-                raise FunctionCallError("Cleanup type is required")
-            
-            db = get_db_manager()
-            old_count = 0
-            duplicates_count = 0
-            
-            if cleanup_type in ["old", "both"]:
-                # Clean up old memories
-                old_count = await db.cleanup_old_memories(user.id, days_threshold)
-            
-            if cleanup_type in ["duplicates", "both"]:
-                # Clean up duplicate memories
-                from firestore_manager import get_firestore_client
-                firestore_manager = get_firestore_client().parent
-                duplicates_count = await firestore_manager.cleanup_duplicate_memories(user.id)
-            
-            total_count = old_count + duplicates_count
-            
-            return {
-                "success": True,
-                "cleanup_type": cleanup_type,
-                "old_count": old_count,
-                "duplicates_count": duplicates_count,
-                "total_count": total_count,
-                "days_threshold": days_threshold,
-                "append_to_response": True,
-                "message": f"Database cleanup completed. " +
-                          (f"Removed {old_count} old entries. " if old_count > 0 else "") +
-                          (f"Removed {duplicates_count} duplicate entries." if duplicates_count > 0 else "") +
-                          (f" No entries were removed." if total_count == 0 else "")
-            }
-        
-        except FunctionCallError:
-            # Re-raise function call errors
-            raise
-        except Exception as e:
-            logger.error(f"Error executing cleanup tool: {str(e)}")
-            raise FunctionCallError(f"Failed to clean up database: {str(e)}")
-
-
-# Register available tools
-_available_tools = [
-    TimeTool,
-    WeatherTool,
-    MemoryTool,
-    SyncTool,
-    CleanupTool
-]
-
+# Register available tools explicitly
+_available_tools_registry: Dict[str, Type[Tool]] = {
+    tool.get_definition().name: tool for tool in [
+        TimeTool,
+        WeatherTool,
+        MemoryTool,
+        # Add SyncTool, CleanupTool implementations here if needed
+    ]
+}
 
 def available_tools() -> List[ToolDefinition]:
-    """
-    Get list of available tools.
-    
-    Returns:
-        List[ToolDefinition]: List of tool definitions
-    """
-    return [tool.get_definition() for tool in _available_tools]
-
+    """Returns definitions of all registered tools."""
+    return [tool.get_definition() for tool in _available_tools_registry.values()]
 
 def get_tool_by_name(name: str) -> Optional[Type[Tool]]:
-    """
-    Get tool class by name.
-    
-    Args:
-        name: Tool name
-        
-    Returns:
-        Optional[Type[Tool]]: Tool class if found
-    """
-    for tool in _available_tools:
-        if tool.get_definition().name == name:
-            return tool
-    return None
+    """Gets a tool class by its registered name."""
+    return _available_tools_registry.get(name)
 
-
-async def execute_function_call(call: ToolCall, user: User) -> Dict[str, Any]:
+async def execute_function_call(
+    tool_call_request: Dict, # Expects {'name': str, 'args': dict}
+    user: User
+) -> Dict[str, Any]:
     """
-    Execute a function call from LLM.
-    
+    Finds and executes the requested tool based on the LLM request.
+
     Args:
-        call: Tool call information
-        user: Current user
-        
+        tool_call_request: Dictionary containing 'name' and 'args'.
+        user: The current authenticated user.
+
     Returns:
-        Dict[str, Any]: Execution result
-        
+        A dictionary containing the result of the tool execution, suitable
+        for serialization and sending back to the LLM. Includes 'error' key on failure.
+
     Raises:
-        FunctionCallError: If execution fails
+        FunctionCallError: If the tool is not found. (Specific tool errors are returned in the result dict)
     """
+    function_name = tool_call_request.get("name")
+    args = tool_call_request.get("args", {})
+
+    if not function_name:
+        logger.error("execute_function_call received request without 'name'.")
+        # Don't raise, return error dict for LLM
+        return {"error": "Function call request missing function name."}
+
+    tool_class = get_tool_by_name(function_name)
+    if not tool_class:
+        logger.error(f"Unknown function requested by LLM: {function_name}")
+        # Raise FunctionCallError here as it's a fundamental issue
+        raise FunctionCallError(f"Unknown function name: {function_name}")
+
+    logger.info(f"Executing tool '{function_name}' for user {user.id} with args: {args}")
     try:
-        # Get function name
-        function_name = call.function.name
-        
-        # Get tool
-        tool = get_tool_by_name(function_name)
-        if not tool:
-            logger.error(f"Unknown function: {function_name}")
-            raise FunctionCallError(f"Unknown function: {function_name}")
-        
-        # Execute tool
-        result = await tool.execute(call.args, user)
-        
-        logger.info(f"Executed function {function_name} for user {user.username}")
-        return result
-    
-    except FunctionCallError:
-        # Re-raise function call errors
-        raise
+        # Execute the tool's static method
+        result = await tool_class.execute(args, user)
+        # Ensure result is a dictionary
+        return result if isinstance(result, dict) else {"result": str(result)}
     except Exception as e:
-        logger.error(f"Error executing function call: {str(e)}")
-        raise FunctionCallError(f"Function execution error: {str(e)}")
+        # Catch unexpected errors during tool execution itself
+        logger.exception(f"Unexpected error executing tool '{function_name}': {e}", exc_info=True)
+        # Return error structure for LLM
+        return {"error": f"Error during execution of {function_name}: {e}"}
 
-
-def register_tool(tool_class: Type[Tool]):
-    """
-    Register a new tool.
-    
-    Args:
-        tool_class: Tool class to register
-    """
-    global _available_tools
-    
-    # Check if tool already registered
-    for existing_tool in _available_tools:
-        if existing_tool.get_definition().name == tool_class.get_definition().name:
-            logger.warning(f"Tool {tool_class.get_definition().name} already registered")
-            return
-    
-    # Add tool
-    _available_tools.append(tool_class)
-    logger.info(f"Registered tool: {tool_class.get_definition().name}")
+# --- Deprecated/Placeholder Definitions (If needed for compatibility) ---
+# Kept for reference if llm_service still imports them directly
+class ToolFunction(BaseModel):
+    """Alias for ToolDefinition, if needed."""
+    name: str
+    description: str
+    parameters: List[ToolParameter]

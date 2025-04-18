@@ -1,165 +1,173 @@
 """
-Configuration handling for EVA backend using Pydantic-Settings.
+Configuration Management for EVA Backend.
 
-This module configures all system settings, loading from environment
-variables and Google Cloud Secrets where appropriate.
+Loads settings from environment variables and .env files using pydantic-settings.
+Provides a centralized way to access configuration values throughout the application.
 """
 
+import logging
 import os
-from typing import Optional, Dict, Any, List, Set
+from functools import lru_cache
+from typing import List, Optional, Union # Added Union
 
-from pydantic import Field, field_validator, AnyHttpUrl, EmailStr
+from pydantic import Field, field_validator # Added field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from dotenv import load_dotenv
 
-# Load environment variables from .env file if it exists (useful for local dev)
-load_dotenv()
+# --- Logger Setup ---
+# Basic logging setup if not configured elsewhere (e.g., in main.py)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+# --- Environment Variable Handling ---
+# Determine the environment (development, production, testing)
+# Default to 'development' if not set
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+logger.info(f"Application environment detected: {APP_ENV}")
+
+# Load appropriate .env file based on environment
+env_file = f".env.{APP_ENV}" if APP_ENV != "production" else ".env"
+if not os.path.exists(env_file) and APP_ENV != "production":
+    logger.warning(f"Environment file '{env_file}' not found. Trying default '.env'.")
+    env_file = ".env" # Fallback to default .env if specific one not found
+
+if os.path.exists(env_file):
+    logger.info(f"Loading settings from environment file: {env_file}")
+else:
+    logger.warning(f"Environment file '{env_file}' not found. Relying solely on environment variables.")
+    env_file = None # Set to None if no env file exists
+
+
+# --- Settings Model ---
 class Settings(BaseSettings):
-    """System settings loaded from environment variables and secrets."""
+    """
+    Defines application settings, loaded from environment variables and .env files.
+    """
+    # --- Core Application Settings ---
+    APP_NAME: str = "EVA Backend"
+    APP_VERSION: str = "0.1.0"
+    APP_ENV: str = Field(default=APP_ENV) # Use the detected environment
+    DEBUG: bool = Field(default=False, description="Enable debug mode (more verbose logging, etc.)")
+    LOG_LEVEL: str = Field(default="INFO", description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
 
-    # --- Environment & Application Info ---
-    ENVIRONMENT: str = Field(default="development", description="Application environment (development, staging, production)")
-    DEBUG: bool = Field(default=False, description="Enable debug mode")
-    HOST: str = Field(default="0.0.0.0", description="Host address to bind the server")
-    PORT: int = Field(default=8080, description="Port to bind the server")
-    LOG_LEVEL: str = Field(default="INFO", description="Logging level")
-    APP_NAME: str = Field(default="EVA Backend", description="Application name")
-    APP_VERSION: str = Field(default="2.0.0", description="Application version")
-    GOOGLE_CLOUD_PROJECT: Optional[str] = Field(default=None, description="Google Cloud Project ID")
-    SERVICE_URL: Optional[AnyHttpUrl] = Field(default=None, description="Public URL of the Cloud Run service")
-    CORS_ORIGINS: List[str] = Field(default=["*"], description="Allowed CORS origins")
+    # --- API / Server Settings ---
+    API_V1_STR: str = "/api/v1"
+    PROJECT_NAME: str = Field(default="EVA", description="Name of the project")
+    # PORT environment variable is automatically used by Cloud Run, but good to define default
+    PORT: int = Field(default=8080, description="Port the application listens on")
+    HOST: str = Field(default="0.0.0.0", description="Host the application binds to")
 
-    # --- API Configuration ---
-    API_VERSION: str = Field(default="2.0.0", description="API version string")
-    API_TITLE: str = Field(default="EVA Backend API", description="API title for documentation")
-    API_DESCRIPTION: str = Field(default="Enhanced Virtual Assistant Backend API", description="API description for documentation")
+    # --- Security Settings ---
+    SECRET_KEY: str = Field(..., description="Secret key for JWT token generation (MUST be set)")
+    ALGORITHM: str = Field(default="HS256", description="Algorithm for JWT token encoding")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60 * 24 * 7, description="Access token expiry time in minutes (default: 7 days)") # e.g., 7 days
 
-    # --- Authentication & Security ---
-    # SECRET_KEY: Loaded from Secret Manager secret 'SECRET_KEY'
-    SECRET_KEY: str = Field(..., description="Secret key for JWT signing (min 32 chars)")
-    # MASTER_ENCRYPTION_KEY: Loaded from Secret Manager secret 'MASTER_ENCRYPTION_KEY'
-    MASTER_ENCRYPTION_KEY: str = Field(..., description="Master key for encrypting secrets (Fernet key, base64 encoded)")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60 * 24, description="Access token validity duration in minutes") # 1 day
-    ALGORITHM: str = Field(default="HS256", description="JWT signing algorithm")
-    EVA_INITIAL_DEVICE_SECRET: Optional[str] = Field(default=None, description="Secret for initial device pairing")
-    DEVICE_TOKEN_SECRET: Optional[str] = Field(default=None, description="Secret related to device tokens")
+    # --- CORS Settings ---
+    # Default allows all origins for development, should be restricted in production
+    CORS_ORIGINS: List[str] = Field(default=["*"], description="List of allowed origins for CORS")
+    CORS_ALLOW_CREDENTIALS: bool = Field(default=True)
+    CORS_ALLOW_METHODS: List[str] = Field(default=["*"])
+    CORS_ALLOW_HEADERS: List[str] = Field(default=["*"])
 
-    # --- Database Configuration ---
-    DB_PROVIDER: str = Field(default="firebase", description="Database provider ('firebase')")
-    FIREBASE_CREDENTIALS_PATH: str = Field(default="/app/secrets/firebase-credentials.json", description="Path to Firebase service account key file")
+    # --- Database Settings ---
+    # Firestore specific (if using Firestore)
+    FIREBASE_PROJECT_ID: Optional[str] = Field(default=None, description="Google Cloud Project ID for Firebase")
+    # Path to service account key file (mounted as secret in Cloud Run)
+    FIREBASE_CREDENTIALS_PATH: Optional[str] = Field(default="/app/secrets/firebase-credentials.json", description="Path to Firebase service account JSON file")
+    # Or use default credentials if running in GCP environment with appropriate service account
+    USE_GCP_DEFAULT_CREDENTIALS: bool = Field(default=False, description="Use default GCP credentials instead of a key file")
 
-    # --- LLM Service (Gemini) ---
-    LLM_PROVIDER: str = Field(default="gemini", description="LLM provider ('gemini')")
-    GEMINI_API_KEY: Optional[str] = Field(default=None, description="API Key for Gemini")
-    GEMINI_MODEL: str = Field(default="gemini-1.5-flash", description="Gemini model name to use")
-    LLM_MAX_TOKENS: int = Field(default=8192, description="Default max tokens for LLM generation")
-    LLM_TEMPERATURE: float = Field(default=0.7, description="Default temperature for LLM generation")
+    # --- LLM Service Settings ---
+    LLM_PROVIDER: str = Field(default="gemini", description="LLM provider to use (e.g., 'gemini', 'openai')")
+    # Gemini Specific
+    GEMINI_API_KEY: Optional[str] = Field(default=None, description="API Key for Google Gemini")
+    GEMINI_MODEL: str = Field(default="gemini-1.5-flash-latest", description="Specific Gemini model to use") # Or gemini-pro, etc.
+    # OpenAI Specific (Example)
+    # OPENAI_API_KEY: Optional[str] = Field(default=None, description="API Key for OpenAI")
+    # OPENAI_MODEL: str = Field(default="gpt-4o", description="Specific OpenAI model to use")
 
-    # --- Memory System ---
-    MEMORY_REFRESH_BATCH_SIZE: int = Field(default=5, description="Batch size for memory refresh")
-    MEMORY_MAX_CORE_MEMORIES: int = Field(default=50, description="Max core memories to retrieve")
-    MEMORY_MAX_EVENT_MEMORIES: int = Field(default=10, description="Max event memories to retrieve")
-    MEMORY_IMPORTANCE_THRESHOLD: int = Field(default=5, description="Min importance for auto-extracted memories")
-    CORE_MEMORY_IMPORTANCE_THRESHOLD: int = Field(default=5, description="Alias for memory importance threshold") # Added for memory_extractor.py compatibility
-
-    # --- Context Window ---
-    CONTEXT_MAX_TOKENS: int = Field(default=16000, description="Max tokens in LLM context window")
-    CONTEXT_MAX_MESSAGES: int = Field(default=20, description="Max recent messages to keep before summarization attempt")
-    SUMMARIZE_AFTER_TURNS: int = Field(default=10, description="Number of turns before attempting summarization")
+    # --- LLM Generation Parameters ---
+    LLM_TEMPERATURE: float = Field(default=0.7, description="LLM generation temperature (creativity)")
+    LLM_MAX_TOKENS: int = Field(default=2048, description="Maximum tokens for LLM response") # Adjust based on model limits
 
     # --- Rate Limiting ---
-    RATE_LIMIT_PER_MINUTE: int = Field(default=60, description="Default requests per minute for free tier")
-    RATE_LIMIT_PER_DAY: int = Field(default=1000, description="Default requests per day for free tier")
+    RATE_LIMIT_USER_REQUESTS: int = Field(default=100, description="Max requests per user per time window")
+    RATE_LIMIT_USER_WINDOW_SECONDS: int = Field(default=60, description="Time window for user rate limiting (in seconds)")
+    RATE_LIMIT_GLOBAL_REQUESTS: int = Field(default=1000, description="Max requests globally per time window")
+    RATE_LIMIT_GLOBAL_WINDOW_SECONDS: int = Field(default=60, description="Time window for global rate limiting (in seconds)")
+    RATE_LIMIT_ENABLED: bool = Field(default=True, description="Enable or disable rate limiting")
 
-    # --- External Service URLs (Example for Weather Tool) ---
-    WEATHER_API_URL: Optional[str] = Field(default=None, description="Base URL for weather API (e.g., OpenWeatherMap)")
-    WEATHER_API_KEY: Optional[str] = Field(default=None, description="API Key for weather service (Loaded from Secret Manager)") # Load from secrets
+    # --- WebSocket Settings ---
+    WEBSOCKET_MAX_QUEUE_SIZE: int = Field(default=10, description="Maximum number of messages to queue for a WebSocket client")
+    WEBSOCKET_TIMEOUT_SECONDS: int = Field(default=60 * 10, description="Timeout for WebSocket connections (in seconds)") # 10 minutes
 
-    # --- Feature Flags (Defaults, can be overridden by env/files) ---
-    FEATURES: Dict[str, bool] = Field(default_factory=lambda: {
-        "memory_system": True,
-        "conversation_analysis": True, # Needed for memory extraction/summarization
-        "knowledge_integration": False, # Placeholder
-        "real_time_responses": True, # WebSocket streaming
-        "function_calling": True, # For api_tools.py
-        "sentiment_analysis": False, # Stage 4
-        "adaptive_response": False, # Stage 4
-        "wellness_tools": False, # Stage 5
-        "offline_sync": True, # For api_sync.py
-    }, description="Feature flags")
+    # --- Memory Management ---
+    MEMORY_DEFAULT_RETENTION_DAYS: Optional[int] = Field(default=None, description="Default retention period for memories (in days, None for indefinite)")
+    MEMORY_SUMMARY_THRESHOLD: int = Field(default=10, description="Number of conversation turns before attempting summarization")
+    MEMORY_SEARCH_LIMIT: int = Field(default=10, description="Default number of memories to retrieve in searches")
+
+    # --- Caching ---
+    CACHE_ENABLED: bool = Field(default=True, description="Enable or disable caching")
+    CACHE_DEFAULT_TTL_SECONDS: int = Field(default=300, description="Default cache Time-To-Live (in seconds)") # 5 minutes
+
+    # --- Validator for CORS_ORIGINS ---
+    @field_validator("CORS_ORIGINS", mode='before')
+    @classmethod
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        """Parses comma-separated string from env var into a list."""
+        if isinstance(v, str):
+            # Split comma-separated string and strip whitespace
+            # Filter out empty strings that might result from trailing commas
+            origins = [origin.strip() for origin in v.split(",") if origin.strip()]
+            logger.debug(f"Parsing CORS_ORIGINS string '{v}' into list: {origins}")
+            return origins
+        elif isinstance(v, list):
+            # It's already a list (like the default value), return as is
+            logger.debug(f"CORS_ORIGINS is already a list: {v}")
+            return v
+        # Handle unexpected types if necessary, or raise error
+        logger.error(f"Invalid type for CORS_ORIGINS: {type(v)}. Expected str or List[str].")
+        raise ValueError("Invalid type for CORS_ORIGINS. Expected str or List[str].")
+
 
     # --- Pydantic Settings Configuration ---
     model_config = SettingsConfigDict(
-        env_file=".env",          # Load .env file if present
-        env_nested_delimiter='__', # Use __ for nested env vars (e.g., GEMINI_CONFIG__MODEL)
-        case_sensitive=False,     # Environment variables are usually case-insensitive
-        extra='ignore'            # Ignore extra fields from environment/files
+        env_file=env_file,          # Specify the .env file to load
+        env_file_encoding='utf-8',  # Encoding for the .env file
+        extra='ignore',             # Ignore extra environment variables not defined in the model
+        case_sensitive=False        # Environment variables are typically case-insensitive
     )
 
-    # --- Derived Properties ---
-    @property
-    def is_production(self) -> bool:
-        return self.ENVIRONMENT.lower() == "production"
-
-    @property
-    def is_development(self) -> bool:
-        return self.ENVIRONMENT.lower() == "development"
-
-    # --- Validators ---
-    @field_validator("SECRET_KEY")
-    def validate_secret_key(cls, v):
-        if len(v) < 32:
-            raise ValueError("SECRET_KEY must be at least 32 characters long")
-        return v
-
-    @field_validator("MASTER_ENCRYPTION_KEY")
-    def validate_master_key(cls, v):
-        import base64
-        try:
-            # Must be a valid Fernet key (URL-safe base64 encoded 32 bytes)
-            key_bytes = base64.urlsafe_b64decode(v)
-            if len(key_bytes) != 32:
-                raise ValueError("MASTER_ENCRYPTION_KEY must be a URL-safe base64 encoded 32-byte key")
-        except (TypeError, ValueError, Exception) as e:
-            raise ValueError(f"Invalid MASTER_ENCRYPTION_KEY format: {e}")
-        return v
-
-    @field_validator("LOG_LEVEL")
-    def validate_log_level(cls, v):
-        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-        if v.upper() not in valid_levels:
-            raise ValueError(f"LOG_LEVEL must be one of {valid_levels}")
-        return v.upper()
-
-    @field_validator("CORS_ORIGINS", mode='before')
-    def assemble_cors_origins(cls, v: Any) -> List[str]:
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        elif isinstance(v, list):
-            return v
-        return ["*"]
-
 # --- Singleton Instance ---
-_settings: Optional[Settings] = None
-
+# Use lru_cache to create a singleton instance of the Settings object
+# This ensures settings are loaded only once.
+@lru_cache()
 def get_settings() -> Settings:
-    global _settings
-    if _settings is None:
+    """Returns the cached Settings instance."""
+    logger.info("Initializing application settings...")
+    try:
         _settings = Settings()
-        if 'DEBUG' not in os.environ:
-             _settings.DEBUG = not _settings.is_production
-        print(f"Settings loaded for environment: {_settings.ENVIRONMENT}")
-        print(f"Debug mode: {_settings.DEBUG}")
-        print(f"Firebase Credentials Path: {_settings.FIREBASE_CREDENTIALS_PATH}")
-        if not _settings.SERVICE_URL and _settings.CORS_ORIGINS and _settings.CORS_ORIGINS[0] != "*":
-             _settings.SERVICE_URL = _settings.CORS_ORIGINS[0]
-    return _settings
+        # Optionally log some settings on startup (avoid logging secrets!)
+        logger.info(f"APP_ENV: {_settings.APP_ENV}")
+        logger.info(f"LLM_PROVIDER: {_settings.LLM_PROVIDER}")
+        logger.info(f"GEMINI_MODEL: {_settings.GEMINI_MODEL}")
+        # Be careful logging list values that might be sensitive if misinterpreted
+        # logger.info(f"CORS_ORIGINS: {_settings.CORS_ORIGINS}")
+        return _settings
+    except Exception as e:
+        logger.exception("CRITICAL: Failed to load application settings.", exc_info=e)
+        # In a real application, you might want to exit if settings fail to load
+        raise RuntimeError(f"Failed to load application settings: {e}")
 
-# Example usage (optional, for testing)
+
+# --- Example Usage (for testing if run directly) ---
 if __name__ == "__main__":
     settings = get_settings()
-    print("--- Loaded Settings ---")
-    # ... (rest of print statements) ...
-    print(f"Master Key Loaded: {'Yes' if settings.MASTER_ENCRYPTION_KEY else 'No'}")
-    print("-----------------------")
+    print("Settings loaded successfully:")
+    print(f"  APP_NAME: {settings.APP_NAME}")
+    print(f"  APP_ENV: {settings.APP_ENV}")
+    print(f"  DEBUG: {settings.DEBUG}")
+    print(f"  SECRET_KEY: {'*' * len(settings.SECRET_KEY) if settings.SECRET_KEY else 'Not Set'}") # Mask secret key
+    print(f"  CORS_ORIGINS: {settings.CORS_ORIGINS}")
+    print(f"  FIREBASE_PROJECT_ID: {settings.FIREBASE_PROJECT_ID}")
+    print(f"  GEMINI_API_KEY: {'Set' if settings.GEMINI_API_KEY else 'Not Set'}")
+    print(f"  GEMINI_MODEL: {settings.GEMINI_MODEL}")

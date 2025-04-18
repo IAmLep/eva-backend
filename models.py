@@ -121,6 +121,9 @@ class Memory(BaseModel):
     class Config:
         from_attributes = True
 
+class TokenData(BaseModel):
+    """Data model for the content of a JWT token."""
+    username: Optional[str] = None
 
 class Conversation(BaseModel):
     conversation_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique conversation identifier")

@@ -1,13 +1,8 @@
 """
 Main application entry point for EVA backend.
 
-This file initializes the FastAPI application, configures middleware,
-and registers all API routers.
-
-Update your existing main.py file with this enhanced version.
-
-Current Date: 2025-04-13 11:20:47
-Current User: IAmLep
+Initializes the FastAPI application, configures middleware, logging,
+exception handlers, and registers all API routers.
 """
 
 import asyncio
@@ -15,190 +10,231 @@ import logging
 import os
 import sys
 import time
+import uuid # Import uuid
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Callable
 
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
+# --- Configuration and Core Components ---
 from config import get_settings
 from database import get_db_manager
 from memory_manager import get_memory_manager
 from context_window import get_context_window
+from logging_config import configure_logging, get_logger # Use our logging config
+from error_middleware import ErrorHandlerMiddleware # Use our error middleware
+from security import SecurityMiddleware, setup_security # Import security setup
 
-# Import API routers
+# --- API Routers ---
 import api
 import api_memory
+import api_sync
+import api_tools # Assuming this exists and has a router
+import auth_router # Renamed from auth to avoid conflict
+import secrets_router
 import websocket_manager
-from exceptions import AuthorizationError, DatabaseError, LLMServiceError, NotFoundException, RateLimitError
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("api.log")
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Initialize application
+# --- Initialize Settings ---
+# This should be one of the first things to run
 settings = get_settings()
 
-# Create FastAPI application
+# --- Configure Logging ---
+# Do this *after* getting settings, as log level depends on settings
+configure_logging()
+logger = get_logger(__name__) # Get root logger configured by logging_config
+
+# --- Create FastAPI Application ---
 app = FastAPI(
     title=settings.API_TITLE,
     description=settings.API_DESCRIPTION,
     version=settings.API_VERSION,
-    openapi_url="/api/openapi.json",
+    openapi_url="/api/openapi.json", # Standard prefix for API docs
     docs_url="/api/docs",
+    redoc_url="/api/redoc",
 )
 
-# CORS configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from security import setup_security
+setup_security(app)
 
-# Request ID middleware
+# --- Middleware Configuration ---
+
+# 1. Error Handling Middleware (should be early)
+app.add_middleware(ErrorHandlerMiddleware)
+
+# 2. Request ID and Logging Middleware
 @app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    """Add a unique request ID to each request."""
-    request_id = f"req_{int(time.time() * 1000)}"
+async def request_context_middleware(request: Request, call_next: Callable):
+    """Adds request ID, logs request/response, measures process time."""
+    request_id = str(uuid.uuid4()) # Use UUID for request ID
     request.state.request_id = request_id
-    
-    # Add to request headers
-    request.headers.__dict__["_list"].append(
-        (b"x-request-id", request_id.encode())
-    )
-    
-    # Process request
+
+    # Add request_id to context for logging
+    from contextvars import ContextVar
+    request_id_var: ContextVar[str] = ContextVar('request_id', default='no-request-id')
+    request_id_token = request_id_var.set(request_id)
+
+    logger.info(f"Request started: {request.method} {request.url.path} (ID: {request_id})")
     start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    
-    # Add headers to response
-    response.headers["X-Request-ID"] = request_id
-    response.headers["X-Process-Time"] = str(process_time)
-    
+
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time"] = f"{process_time:.4f}" # Format time
+        logger.info(f"Request finished: {request.method} {request.url.path} "
+                    f"Status: {response.status_code} Process Time: {process_time:.4f}s (ID: {request_id})")
+    except Exception as e:
+        process_time = time.time() - start_time
+        logger.exception(f"Request failed: {request.method} {request.url.path} "
+                         f"Process Time: {process_time:.4f}s (ID: {request_id})",
+                         exc_info=e)
+        # Let the ErrorHandlerMiddleware handle the response generation
+        raise e # Re-raise the exception
+    finally:
+        # Reset context var
+        request_id_var.reset(request_id_token)
+
     return response
 
-# Exception handlers
-@app.exception_handler(LLMServiceError)
-async def llm_service_exception_handler(request: Request, exc: LLMServiceError):
-    """Handle LLM service errors."""
-    logger.error(f"LLM service error: {str(exc)}")
-    return JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"detail": str(exc)}
+# 3. Security Middleware (CSRF, etc. - if needed beyond API routes)
+# app.add_middleware(SecurityMiddleware) # Add if you have non-API web routes
+
+# 4. CORS Middleware (applied based on settings)
+# Ensure settings.CORS_ORIGINS is correctly populated
+if settings.CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"], # Allow all standard methods
+        allow_headers=["*"], # Allow all headers
+        expose_headers=["X-Request-ID", "X-Process-Time", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"] # Expose custom headers
+    )
+    logger.info(f"CORS enabled for origins: {settings.CORS_ORIGINS}")
+else:
+    logger.warning("CORS is not configured. Allowing all origins by default.")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Request-ID", "X-Process-Time", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"]
     )
 
-@app.exception_handler(RateLimitError)
-async def rate_limit_exception_handler(request: Request, exc: RateLimitError):
-    """Handle rate limit errors."""
-    logger.warning(f"Rate limit exceeded: {str(exc)}")
-    return JSONResponse(
-        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        content={"detail": str(exc)}
-    )
+# --- Event Handlers ---
 
-@app.exception_handler(AuthorizationError)
-async def authorization_exception_handler(request: Request, exc: AuthorizationError):
-    """Handle authorization errors."""
-    logger.warning(f"Authorization error: {str(exc)}")
-    return JSONResponse(
-        status_code=status.HTTP_403_FORBIDDEN,
-        content={"detail": str(exc)}
-    )
-
-@app.exception_handler(DatabaseError)
-async def database_exception_handler(request: Request, exc: DatabaseError):
-    """Handle database errors."""
-    logger.error(f"Database error: {str(exc)}")
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": f"Database error: {str(exc)}"}
-    )
-
-@app.exception_handler(NotFoundException)
-async def not_found_exception_handler(request: Request, exc: NotFoundException):
-    """Handle not found errors."""
-    logger.info(f"Resource not found: {str(exc)}")
-    return JSONResponse(
-        status_code=status.HTTP_404_NOT_FOUND,
-        content={"detail": str(exc)}
-    )
-
-# Initialize components
 @app.on_event("startup")
 async def startup_event():
     """Initialize application components on startup."""
-    logger.info(f"Starting {settings.API_TITLE} v{settings.API_VERSION}")
-    logger.info(f"Environment: {settings.ENVIRONMENT}")
-    
-    # Initialize database connection
-    db_manager = get_db_manager()
-    logger.info("Database manager initialized")
-    
-    # Initialize memory manager
-    memory_manager = get_memory_manager()
-    logger.info("Memory manager initialized")
-    
-    # Initialize context window
-    context_window = get_context_window()
-    logger.info("Context window initialized")
-    
+    logger.info(f"--- Starting {settings.API_TITLE} v{settings.API_VERSION} ---")
+    logger.info(f"Environment: {settings.ENVIRONMENT} | Debug Mode: {settings.DEBUG}")
+
+    # Initialize database connection (already handled by singleton pattern)
+    try:
+        get_db_manager()
+        logger.info("Database manager initialized successfully.")
+    except Exception as e:
+        logger.exception("Failed to initialize Database Manager during startup.", exc_info=e)
+        # Depending on severity, you might want to prevent startup
+        # sys.exit("Critical component (Database) failed to initialize.")
+
+    # Initialize other components (handled by singletons)
+    get_memory_manager()
+    get_context_window()
+    logger.info("Memory Manager and Context Window initialized.")
+
     # Log feature flags
-    for feature, enabled in settings.FEATURES.items():
-        status_str = "enabled" if enabled else "disabled"
-        logger.info(f"Feature '{feature}' is {status_str}")
+    enabled_features = [name for name, enabled in settings.FEATURES.items() if enabled]
+    logger.info(f"Enabled features: {enabled_features if enabled_features else 'None'}")
+    logger.info("--- Application Startup Complete ---")
 
-# Register API routers
-app.include_router(api.router)
-app.include_router(api_memory.router)
-app.include_router(websocket_manager.router)
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources on shutdown."""
+    logger.info("--- Application Shutting Down ---")
+    # Add any cleanup logic here (e.g., close database connections if not managed automatically)
+    logger.info("--- Application Shutdown Complete ---")
 
-# Root endpoint
-@app.get("/", tags=["status"])
+# --- API Routers ---
+# Prefixing API routes for better organization
+
+# Authentication
+app.include_router(auth_router.router, prefix="/api/v1/auth", tags=["Authentication"])
+
+# Core Conversation API (REST and WebSocket)
+app.include_router(api.router, prefix="/api/v1/conversation", tags=["Conversation"]) # REST part
+app.include_router(websocket_manager.router, prefix="/ws", tags=["WebSocket"]) # WebSocket part
+
+# Memory Management
+app.include_router(api_memory.router, prefix="/api/v1/memory", tags=["Memory"])
+
+# Synchronization
+app.include_router(api_sync.router, prefix="/api/v1/sync", tags=["Synchronization"])
+
+# Tools (Function Calling)
+# Assuming api_tools.py has a router defined
+# app.include_router(api_tools.router, prefix="/api/v1/tools", tags=["Tools"])
+
+# Secrets Management
+app.include_router(secrets_router.router, prefix="/api/v1/secrets", tags=["Secrets"])
+
+# --- Root and Health Check Endpoints ---
+
+@app.get("/", tags=["Status"], include_in_schema=False) # Exclude from OpenAPI docs if desired
 async def root():
-    """
-    Root endpoint providing API information.
-    """
+    """Root endpoint providing basic API information."""
     return {
         "name": settings.API_TITLE,
         "version": settings.API_VERSION,
         "status": "online",
-        "timestamp": datetime.utcnow().isoformat(),
-        "environment": settings.ENVIRONMENT
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "environment": settings.ENVIRONMENT,
+        "documentation": "/api/docs"
     }
 
-# Health check endpoint
-@app.get("/health", tags=["status"])
-async def health_check():
-    """
-    Health check endpoint for monitoring systems.
-    """
+@app.get("/health", tags=["Status"])
+async def health_check(request: Request):
+    """Health check endpoint for monitoring systems."""
+    # Basic health check, can be expanded to check DB, LLM connectivity etc.
+    db_status = "up"
+    try:
+        # Simple check, e.g., try getting a non-existent user
+        db = get_db_manager()
+        await db.get_user("healthcheck_dummy_id")
+    except Exception:
+        # Don't log error here, just report status
+        db_status = "down" # Or "degraded"
+
     return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "status": "healthy" if db_status == "up" else "degraded",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "request_id": request.state.request_id, # Include request ID
         "components": {
             "api": "up",
-            "database": "up",
-            "memory": "up"
+            "database": db_status,
+            # Add checks for other critical components like LLM if needed
         }
     }
 
+# --- Main Execution ---
+# The Dockerfile CMD will run this using Uvicorn
 if __name__ == "__main__":
+    # This block is mainly for local development
+    # Use the port from settings (which respects $PORT env var)
+    port = settings.PORT
+    host = settings.HOST
+
+    logger.info(f"Starting development server at http://{host}:{port}")
     import uvicorn
-    
-    # Use environment variables or defaults
-    host = os.getenv("HOST", settings.HOST)
-    port = int(os.getenv("PORT", settings.PORT))
-    
-    logger.info(f"Starting server at http://{host}:{port}")
-    uvicorn.run("main:app", host=host, port=port, reload=settings.DEBUG)
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        log_level=settings.LOG_LEVEL.lower(), # Use log level from settings
+        reload=settings.DEBUG, # Enable reload only if DEBUG is True
+        # Consider adding --workers 1 for local dev simplicity if needed
+    )

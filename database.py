@@ -1,1015 +1,352 @@
 """
-Database Manager for EVA backend.
+WebSocket Manager for EVA backend.
 
-This module provides database operations for storing and retrieving
-data, with enhanced support for the multi-tiered memory system.
-
-Update your existing database.py file with this version.
-
-Current Date: 2025-04-14 10:22:39
-Current User: IAmLepin
+Handles real-time WebSocket connections for chat and audio streaming,
+integrating with ConversationHandler for processing and response generation.
 """
 
 import asyncio
+import base64
 import json
 import logging
-import os
 import time
 import uuid
-from datetime import datetime, timedelta
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Set, Union
 
-from google.cloud import firestore
-import firebase_admin
-from firebase_admin import credentials, firestore as firebase_firestore
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from pydantic import BaseModel, Field
 
+# --- Local Imports ---
+from auth import get_current_user, validate_request_auth # Use generalized auth validation
 from config import get_settings
-from models import Memory, User, Conversation, SyncState, ApiKey, UserRateLimit
+# Import the handler
+from conversation_handler import ConversationHandler
+# Import LLM service functions used directly (audio)
+from llm_service import transcribe_audio, generate_voice_response # Keep direct audio functions for now
+from models import User
+from exceptions import AuthenticationError # Import specific exception
+
+# Setup router
+router = APIRouter()
 
 # Logger configuration
 logger = logging.getLogger(__name__)
 
+# --- Connection Management ---
+# Use dictionaries keyed by session_id for better tracking
+active_connections: Dict[str, WebSocket] = {}
+# Store handler instances associated with sessions
+active_sessions: Dict[str, ConversationHandler] = {}
 
-class DatabaseManager:
-    """
-    Database manager for Firestore.
-    
-    This class provides methods for database operations with
-    enhanced support for the multi-tiered memory system.
-    """
-    
-    def __init__(self):
-        """Initialize database manager with Firestore client."""
-        settings = get_settings()
-        self.is_production = settings.ENVIRONMENT == "production"
-        
-        try:
-            # Initialize Firestore client
-            if not firebase_admin._apps:
-                # Use service account credentials if available
-                credentials_path = settings.FIREBASE_CREDENTIALS_PATH
-                if os.path.exists(credentials_path):
-                    cred = credentials.Certificate(credentials_path)
-                    firebase_admin.initialize_app(cred)
-                else:
-                    # Use application default credentials
-                    firebase_admin.initialize_app()
-            
-            # Get Firestore client
-            self.db = firebase_firestore.client()
-            logger.info("Firestore database initialized")
-        
-        except Exception as e:
-            logger.error(f"Error initializing database: {str(e)}")
-            # Set up a dummy db for development if needed
-            self.db = None
-            self.in_memory_db = {
-                "users": {},
-                "memories": {},
-                "conversations": {},
-                "sync_states": {},
-                "api_keys": {},
-                "rate_limits": {}
-            }
-            logger.warning("Using in-memory database (for development only)")
-    
-    async def create_user(self, user: User) -> bool:
-        """
-        Create a new user.
-        
-        Args:
-            user: User object to create
-            
-        Returns:
-            bool: Success status
-            
-        Raises:
-            DatabaseError: If creation fails
-        """
-        try:
-            if self.db:
-                # Convert to dict and save
-                user_data = user.model_dump(exclude={"id"})
-                self.db.collection("users").document(user.id).set(user_data)
-            else:
-                # In-memory storage
-                self.in_memory_db["users"][user.id] = user.model_dump()
-            
-            logger.info(f"Created user {user.id}: {user.username}")
-            return True
-        
-        except Exception as e:
-            logger.error(f"Error creating user: {str(e)}")
-            from exceptions import DatabaseError
-            raise DatabaseError(f"Failed to create user: {str(e)}")
-    
-    async def get_user(self, user_id: str) -> Optional[User]:
-        """
-        Get a user by ID.
-        
-        Args:
-            user_id: User ID to retrieve
-            
-        Returns:
-            Optional[User]: User if found, None otherwise
-        """
-        try:
-            if self.db:
-                # Get from Firestore
-                doc = self.db.collection("users").document(user_id).get()
-                if doc.exists:
-                    user_data = doc.to_dict()
-                    # Add ID from document
-                    user_data["id"] = doc.id
-                    return User(**user_data)
-                else:
-                    return None
-            else:
-                # Get from in-memory storage
-                user_data = self.in_memory_db["users"].get(user_id)
-                return User(**user_data) if user_data else None
-            
-        except Exception as e:
-            logger.error(f"Error retrieving user {user_id}: {str(e)}")
-            return None
-    
-    async def get_user_by_email(self, email: str) -> Optional[User]:
-        """
-        Get a user by email.
-        
-        Args:
-            email: User email to look up
-            
-        Returns:
-            Optional[User]: User if found, None otherwise
-        """
-        try:
-            if self.db:
-                # Query Firestore
-                query = self.db.collection("users").where("email", "==", email).limit(1)
-                results = query.get()
-                
-                for doc in results:
-                    user_data = doc.to_dict()
-                    # Add ID from document
-                    user_data["id"] = doc.id
-                    return User(**user_data)
-                
-                return None
-            else:
-                # Query in-memory storage
-                for user_id, user_data in self.in_memory_db["users"].items():
-                    if user_data.get("email") == email:
-                        return User(**user_data)
-                
-                return None
-            
-        except Exception as e:
-            logger.error(f"Error retrieving user by email {email}: {str(e)}")
-            return None
-    
-    async def get_user_by_username(self, username: str) -> Optional[User]:
-        """
-        Get a user by username.
-        
-        Args:
-            username: Username to look up
-            
-        Returns:
-            Optional[User]: User if found, None otherwise
-        """
-        try:
-            if self.db:
-                # Query Firestore
-                query = self.db.collection("users").where("username", "==", username).limit(1)
-                results = query.get()
-                
-                for doc in results:
-                    user_data = doc.to_dict()
-                    # Add ID from document
-                    user_data["id"] = doc.id
-                    return User(**user_data)
-                
-                return None
-            else:
-                # Query in-memory storage
-                for user_id, user_data in self.in_memory_db["users"].items():
-                    if user_data.get("username") == username:
-                        return User(**user_data)
-                
-                return None
-            
-        except Exception as e:
-            logger.error(f"Error retrieving user by username {username}: {str(e)}")
-            return None
-    
-    async def verify_user_exists(self, user_id: str) -> bool:
-        """
-        Verify that a user exists.
-        
-        Args:
-            user_id: User ID to check
-            
-        Returns:
-            bool: True if user exists, False otherwise
-        """
-        try:
-            if self.db:
-                # Check in Firestore
-                doc = self.db.collection("users").document(user_id).get()
-                return doc.exists
-            else:
-                # Check in-memory storage
-                return user_id in self.in_memory_db["users"]
-            
-        except Exception as e:
-            logger.error(f"Error verifying user existence {user_id}: {str(e)}")
-            return False
-    
-    async def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
-        """
-        Update a user.
-        
-        Args:
-            user_id: User ID to update
-            updates: Fields to update
-            
-        Returns:
-            bool: Success status
-        """
-        try:
-            # Always update timestamp
-            updates["updated_at"] = datetime.utcnow()
-            
-            if self.db:
-                # Update in Firestore
-                self.db.collection("users").document(user_id).update(updates)
-            else:
-                # Update in-memory storage
-                if user_id in self.in_memory_db["users"]:
-                    self.in_memory_db["users"][user_id].update(updates)
-                else:
-                    return False
-            
-            logger.info(f"Updated user {user_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating user {user_id}: {str(e)}")
-            return False
-    
-    async def delete_user(self, user_id: str) -> bool:
-        """
-        Delete a user.
-        
-        Args:
-            user_id: User ID to delete
-            
-        Returns:
-            bool: Success status
-        """
-        try:
-            if self.db:
-                # Delete from Firestore
-                self.db.collection("users").document(user_id).delete()
-            else:
-                # Delete from in-memory storage
-                if user_id in self.in_memory_db["users"]:
-                    del self.in_memory_db["users"][user_id]
-                else:
-                    return False
-            
-            logger.info(f"Deleted user {user_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error deleting user {user_id}: {str(e)}")
-            return False
-    
-    # Memory Operations
-    
-    async def create_memory(self, memory: Memory) -> bool:
-        """
-        Create a new memory.
-        
-        Args:
-            memory: Memory object to create
-            
-        Returns:
-            bool: Success status
-            
-        Raises:
-            DatabaseError: If creation fails
-        """
-        try:
-            # Convert to dict for storage
-            memory_data = memory.model_dump()
-            
-            if self.db:
-                # Store in Firestore
-                self.db.collection("memories").document(memory.memory_id).set(memory_data)
-            else:
-                # Store in-memory
-                self.in_memory_db["memories"][memory.memory_id] = memory_data
-            
-            logger.info(f"Created memory {memory.memory_id} for user {memory.user_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error creating memory: {str(e)}")
-            from exceptions import DatabaseError
-            raise DatabaseError(f"Failed to create memory: {str(e)}")
-    
-    async def get_memory(self, memory_id: str) -> Optional[Memory]:
-        """
-        Get a memory by ID.
-        
-        Args:
-            memory_id: Memory ID to retrieve
-            
-        Returns:
-            Optional[Memory]: Memory if found, None otherwise
-        """
-        try:
-            if self.db:
-                # Get from Firestore
-                doc = self.db.collection("memories").document(memory_id).get()
-                if doc.exists:
-                    memory_data = doc.to_dict()
-                    return Memory(**memory_data)
-                else:
-                    return None
-            else:
-                # Get from in-memory storage
-                memory_data = self.in_memory_db["memories"].get(memory_id)
-                return Memory(**memory_data) if memory_data else None
-            
-        except Exception as e:
-            logger.error(f"Error retrieving memory {memory_id}: {str(e)}")
-            return None
-    
-    async def get_user_memories(
-        self,
-        user_id: str,
-        limit: int = 50,
-        offset: int = 0,
-        memory_type: Optional[str] = None,
-        tags: Optional[List[str]] = None
-    ) -> List[Memory]:
-        """
-        Get memories for a user.
-        
-        Args:
-            user_id: User ID to get memories for
-            limit: Maximum number of memories to return
-            offset: Offset for pagination
-            memory_type: Optional memory type filter
-            tags: Optional tags to filter by
-            
-        Returns:
-            List[Memory]: List of memories
-        """
-        try:
-            memories = []
-            
-            if self.db:
-                # Start with base query
-                query = self.db.collection("memories").where("user_id", "==", user_id)
-                
-                # Add type filter if provided
-                if memory_type:
-                    query = query.where("source", "==", memory_type)
-                
-                # TODO: For proper pagination, we'd need to use a cursor
-                # This is a simplified approach
-                results = query.limit(limit + offset).get()
-                
-                # Apply offset and limit
-                for i, doc in enumerate(results):
-                    if i >= offset:  # Skip items before offset
-                        memory_data = doc.to_dict()
-                        memory = Memory(**memory_data)
-                        
-                        # Apply tag filtering
-                        if tags:
-                            # Memory must have all requested tags
-                            if all(tag in memory.tags for tag in tags):
-                                memories.append(memory)
-                        else:
-                            memories.append(memory)
-                        
-                        # Apply limit
-                        if len(memories) >= limit:
-                            break
-            else:
-                # Filter in-memory storage
-                filtered_memories = []
-                
-                for memory_data in self.in_memory_db["memories"].values():
-                    if memory_data.get("user_id") == user_id:
-                        # Apply type filter
-                        if memory_type and memory_data.get("source") != memory_type:
-                            continue
-                            
-                        # Apply tag filter
-                        if tags:
-                            memory_tags = memory_data.get("tags", [])
-                            if not all(tag in memory_tags for tag in tags):
-                                continue
-                        
-                        filtered_memories.append(Memory(**memory_data))
-                
-                # Apply pagination
-                memories = filtered_memories[offset:offset + limit]
-            
-            logger.info(f"Retrieved {len(memories)} memories for user {user_id}")
-            return memories
-            
-        except Exception as e:
-            logger.error(f"Error retrieving memories for user {user_id}: {str(e)}")
-            return []
-    
-    async def update_memory(
-        self,
-        memory_id: str,
-        updates: Dict[str, Any]
-    ) -> bool:
-        """
-        Update a memory.
-        
-        Args:
-            memory_id: Memory ID to update
-            updates: Fields to update
-            
-        Returns:
-            bool: Success status
-        """
-        try:
-            if self.db:
-                # Update in Firestore
-                self.db.collection("memories").document(memory_id).update(updates)
-            else:
-                # Update in-memory storage
-                if memory_id in self.in_memory_db["memories"]:
-                    self.in_memory_db["memories"][memory_id].update(updates)
-                else:
-                    return False
-            
-            logger.info(f"Updated memory {memory_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating memory {memory_id}: {str(e)}")
-            return False
-    
-    async def delete_memory(self, user_id: str, memory_id: str) -> bool:
-        """
-        Delete a memory.
-        
-        Args:
-            user_id: User ID for authorization
-            memory_id: Memory ID to delete
-            
-        Returns:
-            bool: Success status
-            
-        Raises:
-            AuthorizationError: If user doesn't own the memory
-        """
-        try:
-            # First verify ownership
-            memory = await self.get_memory(memory_id)
-            
-            if not memory:
-                logger.warning(f"Memory {memory_id} not found for deletion")
-                return False
-                
-            if memory.user_id != user_id:
-                logger.warning(f"User {user_id} attempted to delete memory {memory_id} owned by {memory.user_id}")
-                from exceptions import AuthorizationError
-                raise AuthorizationError("Not authorized to delete this memory")
-            
-            if self.db:
-                # Delete from Firestore
-                self.db.collection("memories").document(memory_id).delete()
-            else:
-                # Delete from in-memory storage
-                if memory_id in self.in_memory_db["memories"]:
-                    del self.in_memory_db["memories"][memory_id]
-                else:
-                    return False
-            
-            logger.info(f"Deleted memory {memory_id} for user {user_id}")
-            return True
-            
-        except Exception as e:
-            if "AuthorizationError" in str(type(e)):
-                raise
-                
-            logger.error(f"Error deleting memory {memory_id}: {str(e)}")
-            return False
-    
-    async def get_memories_since(
-        self, 
-        user_id: str, 
-        since: datetime
-    ) -> List[Memory]:
-        """
-        Get memories updated since a specific time.
-        
-        Args:
-            user_id: User ID to get memories for
-            since: Datetime to get memories since
-            
-        Returns:
-            List[Memory]: List of memories
-        """
-        try:
-            memories = []
-            
-            if self.db:
-                # Query Firestore
-                query = (self.db.collection("memories")
-                         .where("user_id", "==", user_id)
-                         .where("updated_at", ">=", since))
-                
-                results = query.get()
-                
-                for doc in results:
-                    memory_data = doc.to_dict()
-                    memories.append(Memory(**memory_data))
-            else:
-                # Query in-memory storage
-                for memory_data in self.in_memory_db["memories"].values():
-                    if memory_data.get("user_id") == user_id:
-                        updated_at = memory_data.get("updated_at")
-                        if isinstance(updated_at, str):
-                            updated_at = datetime.fromisoformat(updated_at)
-                            
-                        if updated_at >= since:
-                            memories.append(Memory(**memory_data))
-            
-            logger.info(f"Retrieved {len(memories)} memories for user {user_id} since {since}")
-            return memories
-            
-        except Exception as e:
-            logger.error(f"Error retrieving memories since {since}: {str(e)}")
-            return []
-    
-    async def get_events_by_timerange(
-        self,
-        user_id: str,
-        start_time: datetime,
-        end_time: datetime
-    ) -> List[Memory]:
-        """
-        Get event memories within a time range.
-        
-        Args:
-            user_id: User ID to get events for
-            start_time: Start of time range
-            end_time: End of time range
-            
-        Returns:
-            List[Memory]: List of event memories
-        """
-        try:
-            events = []
-            
-            if self.db:
-                # Query Firestore
-                query = (self.db.collection("memories")
-                         .where("user_id", "==", user_id)
-                         .where("source", "==", "event"))
-                
-                results = query.get()
-                
-                for doc in results:
-                    memory_data = doc.to_dict()
-                    
-                    # Check if event is within time range
-                    event_time_str = memory_data.get("metadata", {}).get("event_time")
-                    if event_time_str:
-                        try:
-                            event_time = datetime.fromisoformat(event_time_str)
-                            if start_time <= event_time <= end_time:
-                                events.append(Memory(**memory_data))
-                        except (ValueError, TypeError):
-                            pass
-            else:
-                # Query in-memory storage
-                for memory_data in self.in_memory_db["memories"].values():
-                    if (memory_data.get("user_id") == user_id and 
-                        memory_data.get("source") == "event"):
-                        
-                        # Check if event is within time range
-                        event_time_str = memory_data.get("metadata", {}).get("event_time")
-                        if event_time_str:
-                            try:
-                                event_time = datetime.fromisoformat(event_time_str)
-                                if start_time <= event_time <= end_time:
-                                    events.append(Memory(**memory_data))
-                            except (ValueError, TypeError):
-                                pass
-            
-            logger.info(f"Retrieved {len(events)} events for user {user_id} between {start_time} and {end_time}")
-            return events
-            
-        except Exception as e:
-            logger.error(f"Error retrieving events in time range: {str(e)}")
-            return []
-    
-    # Conversation Operations
-    
-    async def create_conversation(self, conversation: Conversation) -> bool:
-        """
-        Create a new conversation.
-        
-        Args:
-            conversation: Conversation object to create
-            
-        Returns:
-            bool: Success status
-            
-        Raises:
-            DatabaseError: If creation fails
-        """
-        try:
-            # Convert to dict for storage
-            conversation_data = conversation.model_dump()
-            
-            if self.db:
-                # Store in Firestore
-                self.db.collection("conversations").document(conversation.conversation_id).set(conversation_data)
-            else:
-                # Store in-memory
-                self.in_memory_db["conversations"][conversation.conversation_id] = conversation_data
-            
-            logger.info(f"Created conversation {conversation.conversation_id} for user {conversation.user_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error creating conversation: {str(e)}")
-            from exceptions import DatabaseError
-            raise DatabaseError(f"Failed to create conversation: {str(e)}")
-    
-    async def get_conversation(
-        self, 
-        conversation_id: str
-    ) -> Optional[Conversation]:
-        """
-        Get a conversation by ID.
-        
-        Args:
-            conversation_id: Conversation ID to retrieve
-            
-        Returns:
-            Optional[Conversation]: Conversation if found, None otherwise
-        """
-        try:
-            if self.db:
-                # Get from Firestore
-                doc = self.db.collection("conversations").document(conversation_id).get()
-                if doc.exists:
-                    conversation_data = doc.to_dict()
-                    return Conversation(**conversation_data)
-                else:
-                    return None
-            else:
-                # Get from in-memory storage
-                conversation_data = self.in_memory_db["conversations"].get(conversation_id)
-                return Conversation(**conversation_data) if conversation_data else None
-            
-        except Exception as e:
-            logger.error(f"Error retrieving conversation {conversation_id}: {str(e)}")
-            return None
-    
-    async def get_user_conversations(
-        self, 
-        user_id: str,
-        limit: int = 10,
-        offset: int = 0
-    ) -> List[Conversation]:
-        """
-        Get conversations for a user.
-        
-        Args:
-            user_id: User ID to get conversations for
-            limit: Maximum number of conversations to return
-            offset: Offset for pagination
-            
-        Returns:
-            List[Conversation]: List of conversations
-        """
-        try:
-            conversations = []
-            
-            if self.db:
-                # Query Firestore
-                query = (self.db.collection("conversations")
-                         .where("user_id", "==", user_id)
-                         .order_by("updated_at", direction="DESCENDING")
-                         .limit(limit)
-                         .offset(offset))
-                
-                results = query.get()
-                
-                for doc in results:
-                    conversation_data = doc.to_dict()
-                    conversations.append(Conversation(**conversation_data))
-            else:
-                # Filter and sort in-memory storage
-                filtered_conversations = []
-                
-                for conversation_data in self.in_memory_db["conversations"].values():
-                    if conversation_data.get("user_id") == user_id:
-                        filtered_conversations.append(Conversation(**conversation_data))
-                
-                # Sort by updated_at
-                filtered_conversations.sort(
-                    key=lambda c: c.updated_at,
-                    reverse=True
-                )
-                
-                # Apply pagination
-                conversations = filtered_conversations[offset:offset + limit]
-            
-            logger.info(f"Retrieved {len(conversations)} conversations for user {user_id}")
-            return conversations
-            
-        except Exception as e:
-            logger.error(f"Error retrieving conversations for user {user_id}: {str(e)}")
-            return []
-    
-    async def update_conversation(
-        self,
-        conversation_id: str,
-        updates: Dict[str, Any]
-    ) -> bool:
-        """
-        Update a conversation.
-        
-        Args:
-            conversation_id: Conversation ID to update
-            updates: Fields to update
-            
-        Returns:
-            bool: Success status
-        """
-        try:
-            if self.db:
-                # Update in Firestore
-                self.db.collection("conversations").document(conversation_id).update(updates)
-            else:
-                # Update in-memory storage
-                if conversation_id in self.in_memory_db["conversations"]:
-                    self.in_memory_db["conversations"][conversation_id].update(updates)
-                else:
-                    return False
-            
-            logger.info(f"Updated conversation {conversation_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating conversation {conversation_id}: {str(e)}")
-            return False
-    
-    async def add_message_to_conversation(
-        self,
-        conversation_id: str,
-        message: Dict[str, Any]
-    ) -> bool:
-        """
-        Add a message to a conversation.
-        
-        Args:
-            conversation_id: Conversation ID to update
-            message: Message to add
-            
-        Returns:
-            bool: Success status
-        """
-        try:
-            if self.db:
-                # Use array union to add message
-                conversation_ref = self.db.collection("conversations").document(conversation_id)
-                
-                # Update the conversation
-                conversation_ref.update({
-                    "messages": firebase_firestore.ArrayUnion([message]),
-                    "updated_at": datetime.utcnow()
-                })
-            else:
-                # Update in-memory storage
-                if conversation_id in self.in_memory_db["conversations"]:
-                    # Add message to array
-                    if "messages" not in self.in_memory_db["conversations"][conversation_id]:
-                        self.in_memory_db["conversations"][conversation_id]["messages"] = []
-                        
-                    self.in_memory_db["conversations"][conversation_id]["messages"].append(message)
-                    self.in_memory_db["conversations"][conversation_id]["updated_at"] = datetime.utcnow().isoformat()
-                else:
-                    return False
-            
-            logger.info(f"Added message to conversation {conversation_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error adding message to conversation {conversation_id}: {str(e)}")
-            return False
-    
-    async def delete_conversation(self, user_id: str, conversation_id: str) -> bool:
-        """
-        Delete a conversation.
-        
-        Args:
-            user_id: User ID for authorization
-            conversation_id: Conversation ID to delete
-            
-        Returns:
-            bool: Success status
-            
-        Raises:
-            AuthorizationError: If user doesn't own the conversation
-        """
-        try:
-            # First verify ownership
-            conversation = await self.get_conversation(conversation_id)
-            
-            if not conversation:
-                logger.warning(f"Conversation {conversation_id} not found for deletion")
-                return False
-                
-            if conversation.user_id != user_id:
-                logger.warning(f"User {user_id} attempted to delete conversation {conversation_id} owned by {conversation.user_id}")
-                from exceptions import AuthorizationError
-                raise AuthorizationError("Not authorized to delete this conversation")
-            
-            if self.db:
-                # Delete from Firestore
-                self.db.collection("conversations").document(conversation_id).delete()
-            else:
-                # Delete from in-memory storage
-                if conversation_id in self.in_memory_db["conversations"]:
-                    del self.in_memory_db["conversations"][conversation_id]
-                else:
-                    return False
-            
-            logger.info(f"Deleted conversation {conversation_id} for user {user_id}")
-            return True
-            
-        except Exception as e:
-            if "AuthorizationError" in str(type(e)):
-                raise
-                
-            logger.error(f"Error deleting conversation {conversation_id}: {str(e)}")
-            return False
-    
-    # Sync Operations
-    
-    async def get_sync_state(
-        self, 
-        user_id: str, 
-        device_id: str
-    ) -> Optional[SyncState]:
-        """
-        Get synchronization state for a device.
-        
-        Args:
-            user_id: User ID
-            device_id: Device ID
-            
-        Returns:
-            Optional[SyncState]: Sync state if found, None otherwise
-        """
-        try:
-            if self.db:
-                # Get from Firestore
-                doc_id = f"{user_id}_{device_id}"
-                doc = self.db.collection("sync_states").document(doc_id).get()
-                if doc.exists:
-                    sync_data = doc.to_dict()
-                    return SyncState(**sync_data)
-                else:
-                    return None
-            else:
-                # Get from in-memory storage
-                doc_id = f"{user_id}_{device_id}"
-                sync_data = self.in_memory_db["sync_states"].get(doc_id)
-                return SyncState(**sync_data) if sync_data else None
-            
-        except Exception as e:
-            logger.error(f"Error retrieving sync state for {user_id}/{device_id}: {str(e)}")
-            return None
-    
-    async def update_sync_state(self, sync_state: SyncState) -> bool:
-        """
-        Update synchronization state.
-        
-        Args:
-            sync_state: Sync state to update
-            
-        Returns:
-            bool: Success status
-        """
-        try:
-            # Convert to dict for storage
-            sync_data = sync_state.model_dump()
-            doc_id = f"{sync_state.user_id}_{sync_state.device_id}"
-            
-            if self.db:
-                # Update in Firestore
-                self.db.collection("sync_states").document(doc_id).set(sync_data)
-            else:
-                # Update in-memory storage
-                self.in_memory_db["sync_states"][doc_id] = sync_data
-            
-            logger.info(f"Updated sync state for {sync_state.user_id}/{sync_state.device_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating sync state: {str(e)}")
-            return False
+# --- WebSocket Message Models ---
+class WebSocketMessage(BaseModel):
+    """Incoming WebSocket message structure."""
+    message_type: str = Field(..., description="Type of message: text, audio, command")
+    content: Any
+    session_id: Optional[str] = None # Client might send existing session ID to resume
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+class StreamingResponse(BaseModel):
+    """Outgoing WebSocket message structure."""
+    response_type: str # e.g., "text_chunk", "full_text", "function_call", "error", "info", "transcription"
+    content: Any
+    session_id: str
+    is_final: bool = False # Indicates the end of a logical response sequence
+    # Add other fields as needed, e.g., for function calls
+    function_call_info: Optional[Dict[str, Any]] = None
 
 
-# Singleton instance
-_db_manager: Optional[DatabaseManager] = None
+# --- Helper Functions ---
 
+async def authenticate_websocket(websocket: WebSocket) -> Optional[User]:
+    """Authenticates WebSocket connection using token from query param or header."""
+    token: Optional[str] = None
+    # 1. Check query parameter
+    token = websocket.query_params.get("token")
 
-def get_db_manager() -> DatabaseManager:
-    """
-    Get the database manager singleton.
-    
-    Returns:
-        DatabaseManager: Database manager instance
-    """
-    global _db_manager
-    if _db_manager is None:
-        _db_manager = DatabaseManager()
-    return _db_manager
+    # 2. Check Authorization header if no query param
+    if not token:
+        auth_header = websocket.headers.get("authorization")
+        if auth_header and auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1]
 
+    # 3. Check Sec-WebSocket-Protocol (less common but possible)
+    if not token:
+         protocols = websocket.headers.get("sec-websocket-protocol", "").split(',')
+         for proto in protocols:
+              proto = proto.strip()
+              if proto.lower().startswith("bearer_"):
+                   token = proto.split('_', 1)[1]
+                   break # Found token
 
-async def get_user_by_username(username: str) -> Optional[User]:
-    """
-    Get a user by username.
-    
-    Args:
-        username: Username to look up
-        
-    Returns:
-        Optional[User]: User if found, None otherwise
-    """
-    try:
-        db_manager = get_db_manager()
-        
-        if db_manager.db:
-            # Query Firestore
-            query = db_manager.db.collection("users").where("username", "==", username).limit(1)
-            results = query.get()
-            
-            for doc in results:
-                user_data = doc.to_dict()
-                # Add ID from document
-                user_data["id"] = doc.id
-                return User(**user_data)
-            
-            return None
-        else:
-            # Query in-memory storage
-            for user_id, user_data in db_manager.in_memory_db["users"].items():
-                if user_data.get("username") == username:
-                    return User(**user_data)
-            
-            return None
-        
-    except Exception as e:
-        logger.error(f"Error retrieving user by username {username}: {str(e)}")
+    if not token:
+        logger.warning("WebSocket connection attempt without token.")
         return None
 
-
-async def verify_user_exists(user_id: str) -> bool:
-    """
-    Verify that a user exists.
-    
-    Args:
-        user_id: User ID to check
-        
-    Returns:
-        bool: True if user exists, False otherwise
-    """
     try:
-        db_manager = get_db_manager()
-        
-        if db_manager.db:
-            # Check in Firestore
-            doc = db_manager.db.collection("users").document(user_id).get()
-            return doc.exists
+        # Use the same validation as HTTP requests for consistency
+        # Need to simulate a request object or adapt validate_request_auth
+        # Simplified: directly use get_current_user which expects token string
+        user = await get_current_user(token)
+        if user and not user.disabled:
+            logger.info(f"WebSocket authenticated for user: {user.id} ({user.username})")
+            return user
+        elif user:
+            logger.warning(f"WebSocket authentication failed: User {user.id} is disabled.")
+            return None
         else:
-            # Check in-memory storage
-            return user_id in db_manager.in_memory_db["users"]
-        
+             # get_current_user raises exception on invalid token/user not found
+             return None
+    except AuthenticationError as e:
+        logger.warning(f"WebSocket authentication failed: {e.detail}")
+        return None
     except Exception as e:
-        logger.error(f"Error verifying user existence {user_id}: {str(e)}")
-        return False
+        logger.error(f"Unexpected WebSocket authentication error: {e}", exc_info=True)
+        return None
+
+async def send_websocket_response(websocket: WebSocket, response_data: StreamingResponse):
+    """Sends a structured response over the WebSocket."""
+    try:
+        await websocket.send_json(response_data.model_dump(exclude_none=True))
+    except WebSocketDisconnect:
+        # Handle disconnect during send if necessary, though usually caught in main loop
+        logger.warning(f"Attempted to send to disconnected WebSocket (Session: {response_data.session_id})")
+    except Exception as e:
+        logger.error(f"Error sending WebSocket response (Session: {response_data.session_id}): {e}", exc_info=True)
+
+async def close_websocket_session(session_id: str, code: int = status.WS_1000_NORMAL_CLOSURE, reason: str = "Session ended"):
+    """Closes a WebSocket connection and cleans up resources."""
+    websocket = active_connections.pop(session_id, None)
+    session_handler = active_sessions.pop(session_id, None) # Changed variable name
+    if websocket:
+        try:
+            await websocket.close(code=code, reason=reason)
+            logger.info(f"WebSocket connection closed for session {session_id}. Reason: {reason}")
+        except RuntimeError as e:
+             # Catch errors if socket is already closed
+             logger.warning(f"Error closing WebSocket for session {session_id} (possibly already closed): {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error closing WebSocket for session {session_id}: {e}", exc_info=True)
+    if session_handler:
+         # Perform any cleanup needed for the handler/context
+         # e.g., session_handler.context_window.save_state() if needed
+         logger.debug(f"Cleaned up handler for session {session_id}")
+
+
+# --- WebSocket Endpoints ---
+
+@router.websocket("/chat")
+async def websocket_chat_endpoint(websocket: WebSocket):
+    """Handles real-time text-based chat conversations via WebSocket."""
+    user = await authenticate_websocket(websocket)
+    if not user:
+        # Close unauthorized connection immediately
+        await websocket.accept() # Must accept before closing with code
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Unauthorized")
+        return
+
+    await websocket.accept()
+
+    # Initialize session
+    session_id = str(uuid.uuid4())
+    handler = ConversationHandler(user, session_id)
+    active_connections[session_id] = websocket
+    active_sessions[session_id] = handler # Store handler instance
+    logger.info(f"Chat WebSocket session {session_id} started for user {user.id}")
+
+    # Send session ID confirmation
+    await send_websocket_response(websocket, StreamingResponse(
+        response_type="info",
+        content={"message": "Session started.", "session_id": session_id},
+        session_id=session_id,
+        is_final=True # This specific info message is final
+    ))
+
+    try:
+        while True:
+            raw_data = await websocket.receive_text() # Use receive_text for flexibility, parse JSON manually
+            try:
+                data = json.loads(raw_data)
+                message = WebSocketMessage(**data)
+                logger.debug(f"Received message (Session: {session_id}): Type={message.message_type}")
+
+                if message.message_type == "text":
+                    if not message.content or not isinstance(message.content, str):
+                         raise ValueError("Text message content cannot be empty.")
+
+                    # Use the ConversationHandler's generator
+                    response_generator = handler.process_message(message.content)
+                    async for chunk in response_generator:
+                        response_type = "text_chunk" # Default for text
+                        is_final = chunk.get("is_final", False)
+                        content = None
+                        func_call_info = None
+
+                        if "text" in chunk:
+                            content = chunk["text"]
+                            # Could differentiate final text chunk type if desired
+                            # if is_final: response_type = "full_text"
+                        elif "function_call" in chunk:
+                            response_type = "function_call"
+                            content = f"Function call requested: {chunk['function_call']['name']}" # Info for client
+                            func_call_info = chunk['function_call']
+                            # Decide if function call implies is_final=True for this turn
+                            # is_final = True # Or based on chunk flag
+                        elif "error" in chunk:
+                            response_type = "error"
+                            content = chunk["error"]
+                            is_final = True # Errors are usually final for the turn
+
+                        if content is not None:
+                            await send_websocket_response(websocket, StreamingResponse(
+                                response_type=response_type,
+                                content=content,
+                                session_id=session_id,
+                                is_final=is_final,
+                                function_call_info=func_call_info
+                            ))
+
+                elif message.message_type == "command":
+                    # Handle client-side commands like clear context, end session
+                    command = message.content
+                    if command == "end_session":
+                         logger.info(f"Client requested end_session for session {session_id}")
+                         await close_websocket_session(session_id, reason="Client ended session")
+                         break # Exit loop
+                    # Add other commands as needed
+                    # elif command == "clear_context":
+                    #     handler.context_window.clear() ... send confirmation
+                    else:
+                         await send_websocket_response(websocket, StreamingResponse(
+                              response_type="error", content=f"Unknown command: {command}", session_id=session_id, is_final=True
+                         ))
+
+                # Add handling for other message types if needed (e.g., function_result)
+
+            except json.JSONDecodeError:
+                logger.warning(f"Received invalid JSON via WebSocket (Session: {session_id})")
+                await send_websocket_response(websocket, StreamingResponse(
+                    response_type="error", content="Invalid JSON message format.", session_id=session_id, is_final=True
+                ))
+            except Exception as e: # Catch errors during message processing
+                logger.exception(f"Error processing WebSocket message (Session: {session_id}): {e}", exc_info=True)
+                await send_websocket_response(websocket, StreamingResponse(
+                    response_type="error", content=f"An error occurred: {e}", session_id=session_id, is_final=True
+                ))
+
+    except WebSocketDisconnect:
+        logger.info(f"Chat WebSocket disconnected (Session: {session_id})")
+    except Exception as e:
+        logger.exception(f"Unexpected error in chat WebSocket loop (Session: {session_id}): {e}", exc_info=True)
+    finally:
+        # Ensure cleanup happens regardless of how the loop exits
+        await close_websocket_session(session_id, reason="Connection closed or error")
+
+
+@router.websocket("/audio")
+async def websocket_audio_endpoint(websocket: WebSocket):
+    """Handles real-time audio streaming, transcription, and voice response."""
+    user = await authenticate_websocket(websocket)
+    if not user:
+        await websocket.accept()
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Unauthorized")
+        return
+
+    await websocket.accept()
+
+    session_id = str(uuid.uuid4())
+    handler = ConversationHandler(user, session_id) # Use the same handler
+    active_connections[session_id] = websocket
+    active_sessions[session_id] = handler
+    logger.info(f"Audio WebSocket session {session_id} started for user {user.id}")
+
+    await send_websocket_response(websocket, StreamingResponse(
+        response_type="info",
+        content={"message": "Audio session started.", "session_id": session_id},
+        session_id=session_id,
+        is_final=True
+    ))
+
+    audio_buffer = bytearray()
+    # Add state for VAD (Voice Activity Detection) if implementing chunking
+
+    try:
+        while True:
+            # Receive binary audio data or control messages (JSON)
+            raw_data = await websocket.receive_bytes() # Primarily expect bytes for audio
+
+            # Basic check: If data looks like JSON, treat as control message
+            try:
+                 # Attempt to decode as UTF-8 and parse JSON
+                 control_msg_str = raw_data.decode('utf-8')
+                 control_msg_data = json.loads(control_msg_str)
+                 message = WebSocketMessage(**control_msg_data)
+
+                 if message.message_type == "command":
+                      if message.content == "end_audio_stream":
+                           logger.info(f"Client signaled end of audio stream for session {session_id}. Processing buffer...")
+                           # Process any remaining audio in the buffer
+                           if audio_buffer:
+                                # --- Process buffered audio ---
+                                try:
+                                    transcribed_text = await transcribe_audio(bytes(audio_buffer))
+                                    audio_buffer.clear() # Clear buffer after processing
+                                    if not transcribed_text: raise ValueError("Transcription failed or empty.")
+
+                                    await send_websocket_response(websocket, StreamingResponse(
+                                        response_type="transcription", content=transcribed_text, session_id=session_id, is_final=False
+                                    ))
+
+                                    # Process text with conversation handler (streaming response)
+                                    response_generator = handler.process_message(transcribed_text)
+                                    async for chunk in response_generator:
+                                        # ... (send chunks as in chat endpoint) ...
+                                        response_type = "text_chunk"
+                                        is_final = chunk.get("is_final", False)
+                                        content = chunk.get("text") or chunk.get("error") # Prioritize text/error
+                                        func_call_info = chunk.get("function_call")
+
+                                        if content:
+                                            await send_websocket_response(websocket, StreamingResponse(
+                                                response_type="error" if "error" in chunk else response_type,
+                                                content=content, session_id=session_id, is_final=is_final,
+                                                function_call_info=func_call_info
+                                            ))
+                                except Exception as audio_proc_err:
+                                     logger.error(f"Error processing buffered audio (Session: {session_id}): {audio_proc_err}", exc_info=True)
+                                     await send_websocket_response(websocket, StreamingResponse(
+                                          response_type="error", content=f"Error processing audio: {audio_proc_err}", session_id=session_id, is_final=True
+                                     ))
+                           else:
+                                logger.info(f"End of audio stream signal received, buffer empty (Session: {session_id}).")
+                           # Optionally wait for final response processing before breaking?
+                           # For now, break after processing buffer.
+
+                      elif message.content == "end_session":
+                           logger.info(f"Client requested end_session via audio socket for session {session_id}")
+                           await close_websocket_session(session_id, reason="Client ended session")
+                           break # Exit loop
+                      else:
+                           logger.warning(f"Received unknown command via audio socket: {message.content}")
+                 continue # Skip audio processing if it was a control message
+
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                 # Assume it's binary audio data if decoding/parsing fails
+                 audio_buffer.extend(raw_data)
+                 logger.debug(f"Received audio chunk: {len(raw_data)} bytes. Buffer size: {len(audio_buffer)} (Session: {session_id})")
+                 # TODO: Implement VAD or chunking logic here.
+                 # If a complete utterance is detected (e.g., silence after speech),
+                 # process the audio_buffer like in the "end_audio_stream" block above.
+                 # For now, we only process on explicit "end_audio_stream" command.
+
+    except WebSocketDisconnect:
+        logger.info(f"Audio WebSocket disconnected (Session: {session_id})")
+        # Process any remaining buffer on disconnect? Optional.
+        if audio_buffer:
+             logger.info(f"Processing remaining audio buffer ({len(audio_buffer)} bytes) on disconnect (Session: {session_id}).")
+             # Add processing logic here if desired
+    except Exception as e:
+        logger.exception(f"Unexpected error in audio WebSocket loop (Session: {session_id}): {e}", exc_info=True)
+    finally:
+        await close_websocket_session(session_id, reason="Connection closed or error")

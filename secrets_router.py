@@ -1,1015 +1,394 @@
 """
-Secrets Router module for EVA backend.
+API Router for managing user secrets and categories.
 
-This module provides API endpoints for secure management of user secrets
-and sensitive information with encryption and access controls.
-
-
-Version 3 working
+Provides endpoints for CRUD operations on secret categories and individual secrets,
+ensuring user ownership and authentication.
 """
 
-import base64
-import json
 import logging
-import os
 import uuid
-from datetime import datetime
-from typing import Dict, List, Optional, Any, Union
+from datetime import datetime, timezone
+from typing import Annotated, Any, Dict, List, Optional
 
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
-from pydantic import BaseModel, Field, validator
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator
 
-from auth import get_current_active_user
-from config import get_settings
-from database import get_db_manager
-from exceptions import AuthorizationError, DatabaseError, NotFoundException
-from logging_config import get_logger
-from models import User
-from rate_limiter import rate_limit, RateLimitType, RateLimitWindow
+# --- Local Imports ---
+from auth import get_current_active_user # Authentication dependency
+from database import get_db_manager, DatabaseManager # Use the DB manager
+from exceptions import DatabaseError, NotFoundException, AuthorizationError # Custom exceptions
+from models import User # User model
 
-# Setup router
+# --- Router Setup ---
 router = APIRouter()
 
 # Logger configuration
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
+# --- Pydantic Models for Secrets ---
+# (Could reside in schemas.py, but kept here for module focus)
 
-class SecretCategory(BaseModel):
-    """
-    Secret category model.
-    
-    Represents a category for organizing secrets.
-    
-    Attributes:
-        id: Unique identifier
-        name: Category name
-        description: Optional category description
-        icon: Optional icon identifier
-    """
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+class SecretCategoryCreate(BaseModel):
+    """Request model for creating a secret category."""
+    name: str = Field(..., min_length=1, max_length=50)
+    description: Optional[str] = Field(None, max_length=200)
+    icon: Optional[str] = Field(None, max_length=50) # e.g., FontAwesome name
+
+class SecretCategoryResponse(BaseModel):
+    """Response model for secret category."""
+    id: str
+    user_id: str
     name: str
     description: Optional[str] = None
     icon: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
 
-
-class SecretCreateRequest(BaseModel):
-    """
-    Secret creation request model.
-    
-    Attributes:
-        name: Secret name
-        value: Secret value to encrypt
-        description: Optional description
-        category_id: Optional category identifier
-        metadata: Optional additional metadata
-        tags: Optional tags for filtering
-    """
-    name: str
-    value: str
-    description: Optional[str] = None
-    category_id: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+class SecretCreate(BaseModel):
+    """Request model for creating a secret."""
+    category_id: str
+    name: str = Field(..., min_length=1, max_length=100)
+    value: str = Field(..., description="The actual secret value (will be encrypted)")
+    notes: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
-    
-    @field_validator('name')
-    def name_not_empty(cls, v):
-        """Validate that name is not empty."""
-        if not v or not v.strip():
-            raise ValueError('Name cannot be empty')
-        return v
-    
-    @field_validator('value')
-    def value_not_empty(cls, v):
-        """Validate that value is not empty."""
-        if not v:
-            raise ValueError('Value cannot be empty')
-        return v
 
-
-class SecretUpdateRequest(BaseModel):
-    """
-    Secret update request model.
-    
-    Attributes:
-        name: Optional new name
-        value: Optional new value to encrypt
-        description: Optional new description
-        category_id: Optional new category identifier
-        metadata: Optional new metadata
-        tags: Optional new tags
-    """
-    name: Optional[str] = None
-    value: Optional[str] = None
-    description: Optional[str] = None
-    category_id: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+class SecretUpdate(BaseModel):
+    """Request model for updating a secret."""
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    value: Optional[str] = None # Allow updating the secret value
+    notes: Optional[str] = None
     tags: Optional[List[str]] = None
-    
-    @field_validator('name')
-    def name_not_empty(cls, v):
-        """Validate that name is not empty if provided."""
-        if v is not None and not v.strip():
-            raise ValueError('Name cannot be empty')
-        return v
-    
-    @field_validator('value')
-    def value_not_empty(cls, v):
-        """Validate that value is not empty if provided."""
-        if v is not None and not v:
-            raise ValueError('Value cannot be empty')
-        return v
-
+    category_id: Optional[str] = None # Allow moving secret to different category
 
 class SecretResponse(BaseModel):
-    """
-    Secret response model.
-    
-    Attributes:
-        id: Secret identifier
-        name: Secret name
-        description: Optional description
-        category_id: Optional category identifier
-        metadata: Additional metadata
-        tags: Tags for filtering
-        created_at: Creation timestamp
-        updated_at: Last update timestamp
-        has_value: Whether the secret has a value
-    """
+    """Response model for a secret (value is NOT included)."""
     id: str
+    user_id: str
+    category_id: str
     name: str
-    description: Optional[str] = None
-    category_id: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    notes: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
-    has_value: bool
+    # Exclude 'value' for security
+
+# --- Encryption Placeholder ---
+# TODO: Implement actual encryption/decryption for secret values
+# Use a strong library like 'cryptography' with Fernet symmetric encryption.
+# The key should be derived securely from user password or a master key.
+# For simplicity, this is just a placeholder.
+def encrypt_value(value: str, user_key: str) -> str:
+    logger.warning("Using placeholder encryption (Base64). Replace with real encryption.")
+    # Placeholder: Base64 encode (NOT SECURE!)
+    import base64
+    return base64.b64encode(value.encode()).decode()
+
+def decrypt_value(encrypted_value: str, user_key: str) -> str:
+    logger.warning("Using placeholder decryption (Base64). Replace with real encryption.")
+    # Placeholder: Base64 decode
+    import base64
+    try:
+        return base64.b64decode(encrypted_value.encode()).decode()
+    except Exception as e:
+        logger.error(f"Placeholder decryption failed: {e}")
+        return "[DECRYPTION FAILED]"
+
+# --- Helper Function ---
+async def get_user_key_placeholder(user: User) -> str:
+    """Placeholder function to get user's encryption key."""
+    # In a real implementation, this would involve deriving the key securely.
+    # NEVER store the raw key directly.
+    logger.warning("Using placeholder user encryption key.")
+    return f"key_for_{user.id}" # Highly insecure placeholder
 
 
-class SecretWithValueResponse(SecretResponse):
+# --- Category Endpoints ---
+
+@router.post(
+    "/categories",
+    response_model=SecretCategoryResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new secret category"
+)
+async def create_secret_category(
+    category_data: SecretCategoryCreate,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: DatabaseManager = Depends(get_db_manager)
+) -> SecretCategoryResponse:
+    """Creates a new category for organizing secrets belonging to the current user."""
+    category_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    db_category_data = {
+        "id": category_id,
+        "user_id": current_user.id,
+        "name": category_data.name,
+        "description": category_data.description,
+        "icon": category_data.icon,
+        "created_at": now,
+        "updated_at": now,
+    }
+    success = await db.create_category(db_category_data)
+    if not success:
+        logger.error(f"Failed to create secret category '{category_data.name}' for user {current_user.id}")
+        raise HTTPException(status_code=500, detail="Could not create secret category.")
+
+    logger.info(f"Created secret category '{category_data.name}' (ID: {category_id}) for user {current_user.id}")
+    # Return the created data, conforming to the response model
+    return SecretCategoryResponse(**db_category_data)
+
+
+@router.get(
+    "/categories",
+    response_model=List[SecretCategoryResponse],
+    summary="List user's secret categories"
+)
+async def list_secret_categories(
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: DatabaseManager = Depends(get_db_manager)
+) -> List[SecretCategoryResponse]:
+    """Retrieves all secret categories belonging to the current user."""
+    categories_data = await db.get_user_categories(current_user.id)
+    return [SecretCategoryResponse(**cat) for cat in categories_data]
+
+
+@router.delete(
+    "/categories/{category_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a secret category"
+)
+async def delete_secret_category(
+    category_id: str,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: DatabaseManager = Depends(get_db_manager)
+):
     """
-    Secret response model with decrypted value.
-    
-    Extends SecretResponse with the decrypted value.
-    
-    Attributes:
-        value: Decrypted secret value
+    Deletes a secret category belonging to the current user.
+    Note: Does not automatically delete secrets within the category.
     """
-    value: str
+    # Verify ownership first
+    category = await db.get_category(current_user.id, category_id)
+    if not category:
+        logger.warning(f"Attempt to delete non-existent or unauthorized category {category_id} by user {current_user.id}")
+        raise NotFoundException(detail="Secret category not found or access denied.")
+
+    # TODO: Decide on behavior for secrets in the category.
+    # Option 1: Prevent deletion if category contains secrets.
+    # Option 2: Delete secrets (potentially dangerous).
+    # Option 3: Orphan secrets (remove category_id).
+    # For now, just delete the category itself.
+    secrets_in_category = await db.get_user_secrets(user_id=current_user.id, category_id=category_id)
+    if secrets_in_category:
+         logger.warning(f"Attempt to delete category {category_id} which contains secrets. Deletion prevented.")
+         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cannot delete category: contains secrets.")
 
 
-class CategoryCreateRequest(BaseModel):
-    """
-    Category creation request model.
-    
-    Attributes:
-        name: Category name
-        description: Optional description
-        icon: Optional icon identifier
-    """
-    name: str
-    description: Optional[str] = None
-    icon: Optional[str] = None
-    
-    @field_validator('name')
-    def name_not_empty(cls, v):
-        """Validate that name is not empty."""
-        if not v or not v.strip():
-            raise ValueError('Name cannot be empty')
-        return v
+    success = await db.delete_category(category_id)
+    if not success:
+        logger.error(f"Failed to delete secret category {category_id} for user {current_user.id}")
+        raise HTTPException(status_code=500, detail="Could not delete secret category.")
+
+    logger.info(f"Deleted secret category {category_id} for user {current_user.id}")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-class SecretsEncryptor:
-    """
-    Utility class for encrypting and decrypting secrets.
-    
-    Uses Fernet symmetric encryption with a key derived from the app secret.
-    """
-    
-    def __init__(self):
-        """Initialize the secrets encryptor with key derived from settings."""
-        self.settings = get_settings()
-        self._fernet = self._create_fernet()
-    
-    def _create_fernet(self) -> Fernet:
-        """
-        Create Fernet instance with key derived from app secret.
-        
-        Returns:
-            Fernet: Initialized Fernet instance
-        """
-        # Get master key from settings
-        master_key = self.settings.SECRET_KEY
-        
-        # Use a static salt for key derivation
-        # In production, this should be a securely stored value
-        salt = b'eva_secrets_salt_2025'
-        
-        # Derive a key using PBKDF2
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-        )
-        
-        # Generate the key
-        key = base64.urlsafe_b64encode(kdf.derive(master_key.encode()))
-        
-        # Create and return Fernet instance
-        return Fernet(key)
-    
-    def encrypt(self, value: str) -> str:
-        """
-        Encrypt a value.
-        
-        Args:
-            value: Value to encrypt
-            
-        Returns:
-            str: Base64-encoded encrypted value
-        """
-        # Encrypt the value
-        encrypted = self._fernet.encrypt(value.encode())
-        
-        # Return as base64 string
-        return base64.urlsafe_b64encode(encrypted).decode()
-    
-    def decrypt(self, encrypted_value: str) -> str:
-        """
-        Decrypt a value.
-        
-        Args:
-            encrypted_value: Base64-encoded encrypted value
-            
-        Returns:
-            str: Decrypted value
-            
-        Raises:
-            ValueError: If decryption fails
-        """
-        try:
-            # Decode from base64
-            encrypted_bytes = base64.urlsafe_b64decode(encrypted_value.encode())
-            
-            # Decrypt the value
-            decrypted = self._fernet.decrypt(encrypted_bytes)
-            
-            # Return as string
-            return decrypted.decode()
-        except Exception as e:
-            logger.error(f"Decryption error: {str(e)}")
-            raise ValueError(f"Failed to decrypt value: {str(e)}")
+# --- Secret Endpoints ---
 
-
-# Singleton instance of the encryptor
-_secrets_encryptor: Optional[SecretsEncryptor] = None
-
-
-def get_secrets_encryptor() -> SecretsEncryptor:
-    """
-    Get secrets encryptor singleton.
-    
-    Returns:
-        SecretsEncryptor: Secrets encryptor instance
-    """
-    global _secrets_encryptor
-    if _secrets_encryptor is None:
-        _secrets_encryptor = SecretsEncryptor()
-    return _secrets_encryptor
-
-
-@router.post("", response_model=SecretResponse, status_code=status.HTTP_201_CREATED)
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.MINUTE, increment=1)
+@router.post(
+    "/",
+    response_model=SecretResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new secret"
+)
 async def create_secret(
-    secret: SecretCreateRequest,
-    current_user: User = Depends(get_current_active_user)
-) -> Dict:
-    """
-    Create a new secret.
-    
-    Args:
-        secret: Secret creation request
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict: Created secret information
-        
-    Raises:
-        HTTPException: If secret creation fails
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Generate UUID for the secret
-        secret_id = str(uuid.uuid4())
-        now = datetime.utcnow()
-        
-        # Get encryptor
-        encryptor = get_secrets_encryptor()
-        
-        # Encrypt the secret value
-        encrypted_value = encryptor.encrypt(secret.value)
-        
-        # Create secret record
-        secret_data = {
-            "id": secret_id,
-            "user_id": current_user.id,
-            "name": secret.name,
-            "encrypted_value": encrypted_value,
-            "description": secret.description,
-            "category_id": secret.category_id,
-            "metadata": secret.metadata,
-            "tags": secret.tags,
-            "created_at": now,
-            "updated_at": now
-        }
-        
-        # Check category if provided
-        if secret.category_id:
-            category = await db.get_category(current_user.id, secret.category_id)
-            if not category:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Category with ID {secret.category_id} not found"
-                )
-        
-        # Store secret
-        await db.create_secret(secret_data)
-        
-        logger.info(f"Secret created: {secret_id} for user {current_user.id}")
-        
-        # Return response without the encrypted value
-        return {
-            "id": secret_id,
-            "name": secret.name,
-            "description": secret.description,
-            "category_id": secret.category_id,
-            "metadata": secret.metadata,
-            "tags": secret.tags,
-            "created_at": now,
-            "updated_at": now,
-            "has_value": True
-        }
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error creating secret: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create secret: {str(e)}"
-        )
+    secret_data: SecretCreate,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: DatabaseManager = Depends(get_db_manager)
+) -> SecretResponse:
+    """Creates a new encrypted secret belonging to the current user."""
+    # Verify category exists and belongs to user
+    category = await db.get_category(current_user.id, secret_data.category_id)
+    if not category:
+        logger.warning(f"Attempt to create secret in invalid category {secret_data.category_id} by user {current_user.id}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid category ID.")
+
+    secret_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    user_key = await get_user_key_placeholder(current_user) # Get user's key (placeholder)
+    encrypted_value = encrypt_value(secret_data.value, user_key)
+
+    db_secret_data = {
+        "id": secret_id,
+        "user_id": current_user.id,
+        "category_id": secret_data.category_id,
+        "name": secret_data.name,
+        "encrypted_value": encrypted_value, # Store encrypted value
+        "notes": secret_data.notes,
+        "tags": list(set(secret_data.tags)), # Ensure unique tags
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    success = await db.create_secret(db_secret_data)
+    if not success:
+        logger.error(f"Failed to create secret '{secret_data.name}' for user {current_user.id}")
+        raise HTTPException(status_code=500, detail="Could not create secret.")
+
+    logger.info(f"Created secret '{secret_data.name}' (ID: {secret_id}) for user {current_user.id}")
+
+    # Return data conforming to SecretResponse (no value)
+    response_data = db_secret_data.copy()
+    del response_data["encrypted_value"] # Remove encrypted value from response
+    return SecretResponse(**response_data)
 
 
-@router.get("", response_model=List[SecretResponse])
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.MINUTE, increment=1)
-async def get_secrets(
-    category_id: Optional[str] = None,
-    tag: Optional[str] = None,
-    current_user: User = Depends(get_current_active_user)
-) -> List[Dict]:
-    """
-    Get all secrets for the current user.
-    
-    Args:
-        category_id: Optional category ID filter
-        tag: Optional tag filter
-        current_user: Current authenticated user
-        
-    Returns:
-        List[Dict]: List of secrets
-        
-    Raises:
-        HTTPException: If retrieval fails
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Get secrets
-        secrets = await db.get_user_secrets(
-            user_id=current_user.id,
-            category_id=category_id,
-            tag=tag
-        )
-        
-        # Convert to response format
-        response_secrets = []
-        for secret in secrets:
-            response_secrets.append({
-                "id": secret["id"],
-                "name": secret["name"],
-                "description": secret["description"],
-                "category_id": secret["category_id"],
-                "metadata": secret["metadata"],
-                "tags": secret["tags"],
-                "created_at": secret["created_at"],
-                "updated_at": secret["updated_at"],
-                "has_value": "encrypted_value" in secret and bool(secret["encrypted_value"])
-            })
-        
-        logger.info(f"Retrieved {len(response_secrets)} secrets for user {current_user.id}")
-        return response_secrets
-    
-    except Exception as e:
-        logger.error(f"Error retrieving secrets: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve secrets: {str(e)}"
-        )
+@router.get(
+    "/",
+    response_model=List[SecretResponse],
+    summary="List user's secrets"
+)
+async def list_secrets(
+    category_id: Optional[str] = Query(None, description="Filter secrets by category ID"),
+    tag: Optional[str] = Query(None, description="Filter secrets by tag"),
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: DatabaseManager = Depends(get_db_manager)
+) -> List[SecretResponse]:
+    """Retrieves secrets belonging to the current user, optionally filtered."""
+    secrets_data = await db.get_user_secrets(
+        user_id=current_user.id,
+        category_id=category_id,
+        tag=tag
+    )
+    # Convert to response model (excluding encrypted value)
+    response_list = []
+    for sec in secrets_data:
+        sec_copy = sec.copy()
+        if "encrypted_value" in sec_copy:
+            del sec_copy["encrypted_value"]
+        response_list.append(SecretResponse(**sec_copy))
+    return response_list
 
 
-@router.get("/{secret_id}", response_model=SecretWithValueResponse)
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.MINUTE, increment=1)
-async def get_secret(
+@router.get(
+    "/{secret_id}/value",
+    response_model=Dict[str, str], # Return just the decrypted value
+    summary="Get the decrypted value of a specific secret"
+)
+async def get_secret_value(
     secret_id: str,
-    include_value: bool = True,
-    current_user: User = Depends(get_current_active_user)
-) -> Dict:
-    """
-    Get a specific secret by ID.
-    
-    Args:
-        secret_id: Secret ID to retrieve
-        include_value: Whether to include the decrypted value
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict: Secret information
-        
-    Raises:
-        HTTPException: If retrieval fails or secret not found
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Get secret
-        secret = await db.get_secret(secret_id)
-        
-        if not secret:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Secret with ID {secret_id} not found"
-            )
-        
-        # Check ownership
-        if secret["user_id"] != current_user.id:
-            logger.warning(f"User {current_user.id} attempted to access secret {secret_id} owned by {secret['user_id']}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to access this secret"
-            )
-        
-        # Prepare response
-        response = {
-            "id": secret["id"],
-            "name": secret["name"],
-            "description": secret["description"],
-            "category_id": secret["category_id"],
-            "metadata": secret["metadata"],
-            "tags": secret["tags"],
-            "created_at": secret["created_at"],
-            "updated_at": secret["updated_at"],
-            "has_value": "encrypted_value" in secret and bool(secret["encrypted_value"])
-        }
-        
-        # Decrypt and include value if requested
-        if include_value and "encrypted_value" in secret and secret["encrypted_value"]:
-            try:
-                encryptor = get_secrets_encryptor()
-                response["value"] = encryptor.decrypt(secret["encrypted_value"])
-            except ValueError as e:
-                logger.error(f"Error decrypting secret {secret_id}: {str(e)}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to decrypt secret value: {str(e)}"
-                )
-        elif include_value:
-            # Include empty value if requested but not available
-            response["value"] = ""
-        
-        logger.info(f"Retrieved secret {secret_id} for user {current_user.id}")
-        return response
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error retrieving secret {secret_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve secret: {str(e)}"
-        )
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: DatabaseManager = Depends(get_db_manager)
+) -> Dict[str, str]:
+    """Retrieves and decrypts the value of a specific secret belonging to the user."""
+    secret_data = await db.get_secret(secret_id)
+    if not secret_data or secret_data.get("user_id") != current_user.id:
+        logger.warning(f"Attempt to access value of non-existent or unauthorized secret {secret_id} by user {current_user.id}")
+        raise NotFoundException(detail="Secret not found or access denied.")
+
+    encrypted_value = secret_data.get("encrypted_value")
+    if not encrypted_value:
+         logger.error(f"Encrypted value missing for secret {secret_id}")
+         raise HTTPException(status_code=500, detail="Secret data corrupted (missing value).")
+
+    user_key = await get_user_key_placeholder(current_user)
+    decrypted_value = decrypt_value(encrypted_value, user_key)
+
+    logger.info(f"Decrypted value accessed for secret {secret_id} by user {current_user.id}")
+    return {"value": decrypted_value}
 
 
-@router.put("/{secret_id}", response_model=SecretResponse)
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.MINUTE, increment=1)
+@router.put(
+    "/{secret_id}",
+    response_model=SecretResponse,
+    summary="Update an existing secret"
+)
 async def update_secret(
     secret_id: str,
-    secret_update: SecretUpdateRequest,
-    current_user: User = Depends(get_current_active_user)
-) -> Dict:
-    """
-    Update a secret.
-    
-    Args:
-        secret_id: Secret ID to update
-        secret_update: Secret update request
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict: Updated secret information
-        
-    Raises:
-        HTTPException: If update fails or secret not found
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Get existing secret
-        existing_secret = await db.get_secret(secret_id)
-        
-        if not existing_secret:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Secret with ID {secret_id} not found"
-            )
-        
-        # Check ownership
-        if existing_secret["user_id"] != current_user.id:
-            logger.warning(f"User {current_user.id} attempted to update secret {secret_id} owned by {existing_secret['user_id']}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to update this secret"
-            )
-        
-        # Check category if provided
-        if secret_update.category_id:
-            category = await db.get_category(current_user.id, secret_update.category_id)
-            if not category:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Category with ID {secret_update.category_id} not found"
-                )
-        
-        # Prepare update data
-        update_data = {}
-        for field, value in secret_update.dict(exclude_unset=True).items():
-            if value is not None:
-                update_data[field] = value
-        
-        # Encrypt value if provided
-        if "value" in update_data:
-            encryptor = get_secrets_encryptor()
-            update_data["encrypted_value"] = encryptor.encrypt(update_data.pop("value"))
-        
-        # Set updated timestamp
-        update_data["updated_at"] = datetime.utcnow()
-        
-        # Update secret
-        success = await db.update_secret(secret_id, update_data)
-        
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update secret"
-            )
-        
-        # Get updated secret
-        updated_secret = await db.get_secret(secret_id)
-        
-        logger.info(f"Updated secret {secret_id} for user {current_user.id}")
-        
-        # Return response
-        return {
-            "id": updated_secret["id"],
-            "name": updated_secret["name"],
-            "description": updated_secret["description"],
-            "category_id": updated_secret["category_id"],
-            "metadata": updated_secret["metadata"],
-            "tags": updated_secret["tags"],
-            "created_at": updated_secret["created_at"],
-            "updated_at": updated_secret["updated_at"],
-            "has_value": "encrypted_value" in updated_secret and bool(updated_secret["encrypted_value"])
-        }
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error updating secret {secret_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update secret: {str(e)}"
-        )
+    update_data: SecretUpdate,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: DatabaseManager = Depends(get_db_manager)
+) -> SecretResponse:
+    """Updates details of an existing secret belonging to the user."""
+    # Verify secret exists and belongs to user
+    existing_secret = await db.get_secret(secret_id)
+    if not existing_secret or existing_secret.get("user_id") != current_user.id:
+        logger.warning(f"Attempt to update non-existent or unauthorized secret {secret_id} by user {current_user.id}")
+        raise NotFoundException(detail="Secret not found or access denied.")
+
+    # Prepare updates for the database, handling potential encryption
+    db_updates: Dict[str, Any] = {}
+    has_changes = False
+
+    if update_data.name is not None and update_data.name != existing_secret.get("name"):
+        db_updates["name"] = update_data.name
+        has_changes = True
+    if update_data.notes is not None and update_data.notes != existing_secret.get("notes"):
+        db_updates["notes"] = update_data.notes
+        has_changes = True
+    if update_data.tags is not None:
+         new_tags = list(set(update_data.tags))
+         if set(new_tags) != set(existing_secret.get("tags", [])):
+              db_updates["tags"] = new_tags
+              has_changes = True
+    if update_data.category_id is not None and update_data.category_id != existing_secret.get("category_id"):
+        # Verify the new category exists and belongs to the user
+        new_category = await db.get_category(current_user.id, update_data.category_id)
+        if not new_category:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid target category ID.")
+        db_updates["category_id"] = update_data.category_id
+        has_changes = True
+
+    # Handle value update (encrypt new value)
+    if update_data.value is not None:
+        user_key = await get_user_key_placeholder(current_user)
+        new_encrypted_value = encrypt_value(update_data.value, user_key)
+        # Only update if the encrypted value actually changes
+        if new_encrypted_value != existing_secret.get("encrypted_value"):
+            db_updates["encrypted_value"] = new_encrypted_value
+            has_changes = True
+
+    if not has_changes:
+         logger.info(f"No changes detected for secret {secret_id}. Update skipped.")
+         # Return current state without hitting DB again
+         response_data = existing_secret.copy()
+         if "encrypted_value" in response_data: del response_data["encrypted_value"]
+         return SecretResponse(**response_data)
+
+    db_updates["updated_at"] = datetime.now(timezone.utc)
+
+    success = await db.update_secret(secret_id, db_updates)
+    if not success:
+        logger.error(f"Failed to update secret {secret_id} for user {current_user.id}")
+        raise HTTPException(status_code=500, detail="Could not update secret.")
+
+    logger.info(f"Updated secret {secret_id} for user {current_user.id}")
+
+    # Get updated data to return (or construct from updates)
+    updated_secret_data = {**existing_secret, **db_updates}
+    if "encrypted_value" in updated_secret_data: del updated_secret_data["encrypted_value"]
+    return SecretResponse(**updated_secret_data)
 
 
-@router.delete("/{secret_id}")
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.MINUTE, increment=1)
+@router.delete(
+    "/{secret_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a secret"
+)
 async def delete_secret(
     secret_id: str,
-    current_user: User = Depends(get_current_active_user)
-) -> Dict:
-    """
-    Delete a secret.
-    
-    Args:
-        secret_id: Secret ID to delete
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict: Deletion confirmation
-        
-    Raises:
-        HTTPException: If deletion fails or secret not found
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Get existing secret
-        existing_secret = await db.get_secret(secret_id)
-        
-        if not existing_secret:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Secret with ID {secret_id} not found"
-            )
-        
-        # Check ownership
-        if existing_secret["user_id"] != current_user.id:
-            logger.warning(f"User {current_user.id} attempted to delete secret {secret_id} owned by {existing_secret['user_id']}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to delete this secret"
-            )
-        
-        # Delete secret
-        success = await db.delete_secret(secret_id)
-        
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to delete secret"
-            )
-        
-        logger.info(f"Deleted secret {secret_id} for user {current_user.id}")
-        
-        return {"success": True, "message": "Secret deleted successfully"}
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting secret {secret_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete secret: {str(e)}"
-        )
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: DatabaseManager = Depends(get_db_manager)
+):
+    """Deletes a specific secret belonging to the current user."""
+    # Verify ownership
+    secret = await db.get_secret(secret_id)
+    if not secret or secret.get("user_id") != current_user.id:
+        logger.warning(f"Attempt to delete non-existent or unauthorized secret {secret_id} by user {current_user.id}")
+        raise NotFoundException(detail="Secret not found or access denied.")
 
+    success = await db.delete_secret(secret_id)
+    if not success:
+        logger.error(f"Failed to delete secret {secret_id} for user {current_user.id}")
+        raise HTTPException(status_code=500, detail="Could not delete secret.")
 
-@router.post("/categories", response_model=SecretCategory, status_code=status.HTTP_201_CREATED)
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.MINUTE, increment=1)
-async def create_category(
-    category: CategoryCreateRequest,
-    current_user: User = Depends(get_current_active_user)
-) -> Dict:
-    """
-    Create a new category.
-    
-    Args:
-        category: Category creation request
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict: Created category information
-        
-    Raises:
-        HTTPException: If category creation fails
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Generate UUID for the category
-        category_id = str(uuid.uuid4())
-        
-        # Create category record
-        category_data = {
-            "id": category_id,
-            "user_id": current_user.id,
-            "name": category.name,
-            "description": category.description,
-            "icon": category.icon,
-            "created_at": datetime.utcnow()
-        }
-        
-        # Store category
-        await db.create_category(category_data)
-        
-        logger.info(f"Category created: {category_id} for user {current_user.id}")
-        
-        # Return response
-        return {
-            "id": category_id,
-            "name": category.name,
-            "description": category.description,
-            "icon": category.icon
-        }
-    
-    except Exception as e:
-        logger.error(f"Error creating category: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create category: {str(e)}"
-        )
-
-
-@router.get("/categories", response_model=List[SecretCategory])
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.MINUTE, increment=1)
-async def get_categories(
-    current_user: User = Depends(get_current_active_user)
-) -> List[Dict]:
-    """
-    Get all categories for the current user.
-    
-    Args:
-        current_user: Current authenticated user
-        
-    Returns:
-        List[Dict]: List of categories
-        
-    Raises:
-        HTTPException: If retrieval fails
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Get categories
-        categories = await db.get_user_categories(current_user.id)
-        
-        logger.info(f"Retrieved {len(categories)} categories for user {current_user.id}")
-        
-        # Convert to response format
-        return categories
-    
-    except Exception as e:
-        logger.error(f"Error retrieving categories: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve categories: {str(e)}"
-        )
-
-
-@router.delete("/categories/{category_id}")
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.MINUTE, increment=1)
-async def delete_category(
-    category_id: str,
-    current_user: User = Depends(get_current_active_user)
-) -> Dict:
-    """
-    Delete a category.
-    
-    Args:
-        category_id: Category ID to delete
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict: Deletion confirmation
-        
-    Raises:
-        HTTPException: If deletion fails or category not found
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Get existing category
-        existing_category = await db.get_category(current_user.id, category_id)
-        
-        if not existing_category:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Category with ID {category_id} not found"
-            )
-        
-        # Check ownership
-        if existing_category["user_id"] != current_user.id:
-            logger.warning(f"User {current_user.id} attempted to delete category {category_id} owned by {existing_category['user_id']}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to delete this category"
-            )
-        
-        # Check if category has secrets
-        secrets = await db.get_user_secrets(
-            user_id=current_user.id,
-            category_id=category_id
-        )
-        
-        if secrets:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot delete category with {len(secrets)} secrets. Remove or reassign secrets first."
-            )
-        
-        # Delete category
-        success = await db.delete_category(category_id)
-        
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to delete category"
-            )
-        
-        logger.info(f"Deleted category {category_id} for user {current_user.id}")
-        
-        return {"success": True, "message": "Category deleted successfully"}
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting category {category_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete category: {str(e)}"
-        )
-
-
-@router.post("/bulk-export", response_model=Dict[str, Any])
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.DAY, increment=1)
-async def export_secrets(
-    current_user: User = Depends(get_current_active_user)
-) -> Dict:
-    """
-    Export all user secrets with their decrypted values.
-    
-    This is a sensitive operation that should be used with caution.
-    
-    Args:
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict: Exported secrets and categories
-        
-    Raises:
-        HTTPException: If export fails
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Get secrets
-        secrets = await db.get_user_secrets(user_id=current_user.id)
-        
-        # Get categories
-        categories = await db.get_user_categories(current_user.id)
-        
-        # Get encryptor
-        encryptor = get_secrets_encryptor()
-        
-        # Decrypt secrets
-        decrypted_secrets = []
-        for secret in secrets:
-            secret_copy = secret.copy()
-            
-            # Decrypt value if present
-            if "encrypted_value" in secret_copy and secret_copy["encrypted_value"]:
-                try:
-                    secret_copy["value"] = encryptor.decrypt(secret_copy["encrypted_value"])
-                except ValueError:
-                    secret_copy["value"] = ""
-                
-                # Remove encrypted value
-                del secret_copy["encrypted_value"]
-            else:
-                secret_copy["value"] = ""
-            
-            decrypted_secrets.append(secret_copy)
-        
-        logger.info(f"Exported {len(decrypted_secrets)} secrets for user {current_user.id}")
-        
-        # Return exported data
-        return {
-            "secrets": decrypted_secrets,
-            "categories": categories,
-            "exported_at": datetime.utcnow(),
-            "user_id": current_user.id
-        }
-    
-    except Exception as e:
-        logger.error(f"Error exporting secrets: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to export secrets: {str(e)}"
-        )
-
-
-@router.post("/bulk-import", status_code=status.HTTP_201_CREATED)
-@rate_limit(limit_type=RateLimitType.REQUESTS, window=RateLimitWindow.DAY, increment=1)
-async def import_secrets(
-    import_data: Dict[str, Any],
-    current_user: User = Depends(get_current_active_user)
-) -> Dict:
-    """
-    Import secrets and categories.
-    
-    Args:
-        import_data: Data to import containing secrets and categories
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict: Import results
-        
-    Raises:
-        HTTPException: If import fails
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Get encryptor
-        encryptor = get_secrets_encryptor()
-        
-        # Process categories first
-        categories_imported = 0
-        if "categories" in import_data and isinstance(import_data["categories"], list):
-            for category in import_data["categories"]:
-                # Skip if missing required fields
-                if not isinstance(category, dict) or "name" not in category:
-                    continue
-                
-                # Generate new ID
-                category_id = str(uuid.uuid4())
-                
-                # Create category record
-                category_data = {
-                    "id": category_id,
-                    "user_id": current_user.id,
-                    "name": category["name"],
-                    "description": category.get("description"),
-                    "icon": category.get("icon"),
-                    "created_at": datetime.utcnow()
-                }
-                
-                # Store category
-                await db.create_category(category_data)
-                categories_imported += 1
-        
-        # Process secrets
-        secrets_imported = 0
-        if "secrets" in import_data and isinstance(import_data["secrets"], list):
-            for secret in import_data["secrets"]:
-                # Skip if missing required fields
-                if not isinstance(secret, dict) or "name" not in secret or "value" not in secret:
-                    continue
-                
-                # Generate new ID
-                secret_id = str(uuid.uuid4())
-                now = datetime.utcnow()
-                
-                # Encrypt the secret value
-                encrypted_value = encryptor.encrypt(secret["value"])
-                
-                # Create secret record
-                secret_data = {
-                    "id": secret_id,
-                    "user_id": current_user.id,
-                    "name": secret["name"],
-                    "encrypted_value": encrypted_value,
-                    "description": secret.get("description"),
-                    "category_id": None,  # Don't import category relationship directly
-                    "metadata": secret.get("metadata", {}),
-                    "tags": secret.get("tags", []),
-                    "created_at": now,
-                    "updated_at": now
-                }
-                
-                # Store secret
-                await db.create_secret(secret_data)
-                secrets_imported += 1
-        
-        logger.info(f"Imported {secrets_imported} secrets and {categories_imported} categories for user {current_user.id}")
-        
-        return {
-            "success": True,
-            "secrets_imported": secrets_imported,
-            "categories_imported": categories_imported
-        }
-    
-    except Exception as e:
-        logger.error(f"Error importing secrets: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to import secrets: {str(e)}"
-        )
+    logger.info(f"Deleted secret {secret_id} for user {current_user.id}")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

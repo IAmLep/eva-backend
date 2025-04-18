@@ -1,462 +1,69 @@
 """
-Exceptions module for EVA backend.
-
-This module provides custom exception classes for consistent
-error handling throughout the application.
-
-
-Version 3 working
+Custom Exception classes for the EVA backend application.
 """
 
-from typing import Dict, List, Optional, Union, Any
+from fastapi import HTTPException, status
 
+# --- Base Exception ---
+class AppException(HTTPException):
+    """Base exception for custom application errors."""
+    def __init__(self, status_code: int, detail: str, headers: dict = None):
+        super().__init__(status_code=status_code, detail=detail, headers=headers)
 
-class CustomException(Exception):
-    """
-    Base custom exception class.
-    
-    All custom exceptions in the application inherit from this base class
-    to ensure consistent error handling and response formatting.
-    
-    Attributes:
-        detail: Human-readable error description
-        code: Machine-readable error code
-        status_code: HTTP status code
-        headers: Optional response headers
-    """
-    def __init__(
-        self, 
-        detail: str, 
-        code: str = "internal_error",
-        status_code: int = 500,
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize custom exception.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            status_code: HTTP status code
-            headers: Optional response headers
-        """
-        self.detail = detail
-        self.code = code
-        self.status_code = status_code
-        self.headers = headers or {}
-        super().__init__(self.detail)
+# --- Authentication / Authorization Errors ---
+class AuthenticationError(AppException):
+    """Exception for authentication failures (invalid credentials, bad token)."""
+    def __init__(self, detail: str = "Authentication failed", headers: dict = None):
+        # Default headers for bearer token challenges
+        final_headers = {"WWW-Authenticate": "Bearer"}
+        if headers:
+            final_headers.update(headers)
+        super().__init__(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail, headers=final_headers)
 
+class AuthorizationError(AppException):
+    """Exception for authorization failures (insufficient permissions, inactive user)."""
+    def __init__(self, detail: str = "Permission denied"):
+        super().__init__(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
 
-class AuthenticationError(CustomException):
-    """
-    Authentication-related errors.
-    
-    Raised when authentication fails or credentials are invalid.
-    
-    Examples:
-        - Invalid JWT token
-        - Expired credentials
-        - Missing authentication headers
-    """
-    def __init__(
-        self, 
-        detail: str = "Authentication failed", 
-        code: str = "authentication_error",
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize authentication error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            headers: Optional response headers
-        """
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=401,
-            headers=headers or {"WWW-Authenticate": "Bearer"}
-        )
+# --- Data Validation / Resource Errors ---
+class NotFoundException(AppException):
+    """Exception when a requested resource is not found."""
+    def __init__(self, detail: str = "Resource not found"):
+        super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
 
+class DuplicateError(AppException):
+    """Exception for conflicts, like creating a resource that already exists."""
+    def __init__(self, detail: str = "Resource already exists"):
+        super().__init__(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
-class AuthorizationError(CustomException):
-    """
-    Authorization-related errors.
-    
-    Raised when user does not have permission to access a resource.
-    
-    Examples:
-        - Insufficient permissions
-        - Access to another user's resources
-        - Disabled account
-    """
-    def __init__(
-        self, 
-        detail: str = "Not authorized", 
-        code: str = "authorization_error",
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize authorization error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            headers: Optional response headers
-        """
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=403,
-            headers=headers
-        )
+class BadRequestError(AppException):
+    """Exception for general bad requests (invalid input format, missing data)."""
+    def __init__(self, detail: str = "Bad request"):
+        super().__init__(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
+# --- Service / Integration Errors ---
+class DatabaseError(AppException):
+    """Exception for database operation failures."""
+    def __init__(self, detail: str = "Database operation failed"):
+        # Use 500 for internal DB issues
+        super().__init__(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail)
 
-class NotFoundException(CustomException):
-    """
-    Resource not found errors.
-    
-    Raised when a requested resource does not exist.
-    
-    Examples:
-        - User not found
-        - Memory not found
-        - Configuration not found
-    """
-    def __init__(
-        self, 
-        detail: str = "Resource not found", 
-        code: str = "not_found",
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize not found error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            headers: Optional response headers
-        """
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=404,
-            headers=headers
-        )
+class LLMServiceError(AppException):
+    """Exception for failures interacting with the LLM service."""
+    def __init__(self, detail: str = "LLM service error"):
+        super().__init__(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) # 502 or 503 might fit
 
+class RateLimitError(AppException):
+    """Exception when API rate limits are exceeded."""
+    def __init__(self, detail: str = "Rate limit exceeded", headers: dict = None):
+        super().__init__(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail, headers=headers)
 
-class ValidationError(CustomException):
-    """
-    Data validation errors.
-    
-    Raised when input data fails validation.
-    
-    Examples:
-        - Invalid email format
-        - Required field missing
-        - Value out of allowed range
-    """
-    def __init__(
-        self, 
-        detail: str = "Validation error", 
-        code: str = "validation_error",
-        field_errors: Optional[Dict[str, List[str]]] = None,
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize validation error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            field_errors: Optional mapping of field names to error messages
-            headers: Optional response headers
-        """
-        self.field_errors = field_errors or {}
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=422,
-            headers=headers
-        )
+class ConfigurationError(AppException):
+     """Exception for server configuration problems."""
+     def __init__(self, detail: str = "Server configuration error"):
+          super().__init__(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail)
 
-
-class DatabaseError(CustomException):
-    """
-    Database-related errors.
-    
-    Raised when database operations fail.
-    
-    Examples:
-        - Connection failure
-        - Query execution error
-        - Constraint violation
-    """
-    def __init__(
-        self, 
-        detail: str = "Database error", 
-        code: str = "database_error",
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize database error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            headers: Optional response headers
-        """
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=500,
-            headers=headers
-        )
-
-
-class RateLimitError(CustomException):
-    """
-    Rate limit exceeded errors.
-    
-    Raised when a client exceeds allowed request rate.
-    
-    Examples:
-        - Too many requests in a time period
-        - API quota exceeded
-    """
-    def __init__(
-        self, 
-        detail: str = "Rate limit exceeded", 
-        code: str = "rate_limit_exceeded",
-        reset_at: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize rate limit error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            reset_at: Optional timestamp when rate limit resets
-            headers: Optional response headers
-        """
-        self.reset_at = reset_at
-        headers = headers or {}
-        
-        if reset_at:
-            headers["Retry-After"] = reset_at
-            
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=429,
-            headers=headers
-        )
-
-
-class LLMServiceError(CustomException):
-    """
-    LLM service-related errors.
-    
-    Raised when communication with external LLM services fails.
-    
-    Examples:
-        - Gemini API error
-        - Context length exceeded
-        - Invalid prompt
-    """
-    def __init__(
-        self, 
-        detail: str = "LLM service error", 
-        code: str = "llm_service_error",
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize LLM service error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            headers: Optional response headers
-        """
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=502,
-            headers=headers
-        )
-
-
-class ConfigurationError(CustomException):
-    """
-    Configuration-related errors.
-    
-    Raised when there are issues with application configuration.
-    
-    Examples:
-        - Missing required environment variable
-        - Invalid configuration value
-        - Incompatible settings
-    """
-    def __init__(
-        self, 
-        detail: str = "Configuration error", 
-        code: str = "configuration_error",
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize configuration error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            headers: Optional response headers
-        """
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=500,
-            headers=headers
-        )
-
-
-class WebSocketError(CustomException):
-    """
-    WebSocket-related errors.
-    
-    Raised when WebSocket operations fail.
-    
-    Examples:
-        - Connection failure
-        - Message format error
-        - Protocol violation
-    """
-    def __init__(
-        self, 
-        detail: str = "WebSocket error", 
-        code: str = "websocket_error",
-        close_code: int = 1008,
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize WebSocket error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            close_code: WebSocket close code
-            headers: Optional response headers
-        """
-        self.close_code = close_code
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=500,
-            headers=headers
-        )
-
-
-class DuplicateError(CustomException):
-    """
-    Duplicate resource errors.
-    
-    Raised when trying to create a resource that already exists.
-    
-    Examples:
-        - Username already taken
-        - Email already registered
-        - Duplicate record
-    """
-    def __init__(
-        self, 
-        detail: str = "Resource already exists", 
-        code: str = "duplicate_error",
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize duplicate error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            headers: Optional response headers
-        """
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=409,
-            headers=headers
-        )
-
-
-class SyncError(CustomException):
-    """
-    Synchronization-related errors.
-    
-    Raised when data synchronization operations fail.
-    
-    Examples:
-        - Conflict during merge
-        - Inconsistent state
-        - Version mismatch
-    """
-    def __init__(
-        self, 
-        detail: str = "Synchronization error", 
-        code: str = "sync_error",
-        conflict_items: Optional[List[Dict[str, Any]]] = None,
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize synchronization error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            conflict_items: Optional list of conflicting items
-            headers: Optional response headers
-        """
-        self.conflict_items = conflict_items or []
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=409,
-            headers=headers
-        )
-
-
-class FunctionCallError(CustomException):
-    """
-    Function call-related errors.
-    
-    Raised when function calls made through the API tools fail.
-    
-    Examples:
-        - Invalid function arguments
-        - Function execution failed
-        - Unsupported function
-    """
-    def __init__(
-        self, 
-        detail: str = "Function call failed", 
-        code: str = "function_call_error",
-        function_name: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize function call error.
-        
-        Args:
-            detail: Human-readable error description
-            code: Machine-readable error code
-            function_name: Optional name of the failed function
-            headers: Optional response headers
-        """
-        self.function_name = function_name
-        super().__init__(
-            detail=detail,
-            code=code,
-            status_code=400,
-            headers=headers
-        )
+# --- Specific Application Logic Errors (Add as needed) ---
+# class MemoryOperationError(AppException):
+#     def __init__(self, detail: str = "Memory operation failed"):
+#         super().__init__(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)

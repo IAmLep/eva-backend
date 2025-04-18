@@ -1,337 +1,333 @@
 """
-Authentication module for EVA backend.
+Authentication Logic module for EVA backend.
 
-This module handles user authentication, JWT token generation, and validation.
-It provides functions for securing API endpoints and managing user sessions.
-
-"""
-"""
-Version 3 working
+Handles password hashing/verification, JWT token creation/decoding,
+user authentication checks, and dependency functions for securing endpoints.
+Does NOT contain API route definitions.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # Use timezone-aware datetimes
 from typing import Annotated, Dict, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+# --- FastAPI & Security ---
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from google.auth.transport import requests as google_requests
-from google.oauth2 import id_token
 
+# --- Google Auth ---
+# Use try-except for robustness
+try:
+    from google.auth.transport import requests as google_requests
+    from google.oauth2 import id_token
+    GOOGLE_AUTH_AVAILABLE = True
+except ImportError:
+    GOOGLE_AUTH_AVAILABLE = False
+    google_requests = None
+    id_token = None
+
+# --- Local Imports ---
 from config import get_settings
-from database import get_user_by_username, verify_user_exists
+# Import the specific DB function needed here
+from database import get_user_by_username # Use the specific function
 from exceptions import AuthenticationError, AuthorizationError
-from models import User, UserInDB
+# Import models used for type hinting and data structures
+from models import User, UserInDB # Use UserInDB for internal representation
 
-# Setup router
-router = APIRouter()
-
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# OAuth2 password bearer scheme
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+# --- Setup ---
 
 # Logger configuration
 logger = logging.getLogger(__name__)
 
+# Password hashing context using bcrypt
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-class Token(BaseModel):
-    """
-    Token response model.
-    
-    Attributes:
-        access_token: JWT access token
-        token_type: Type of token (always 'bearer')
-        expires_at: Timestamp when token expires
-    """
-    access_token: str
-    token_type: str
-    expires_at: datetime
+# OAuth2 password bearer scheme (points to the login endpoint)
+# Note: tokenUrl should match the path defined in auth_router.py
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login") # Updated path
 
+# --- Pydantic Models for Token Data ---
 
 class TokenData(BaseModel):
-    """
-    Token data extracted from JWT.
-    
-    Attributes:
-        username: Username extracted from token
-        scopes: Optional list of permission scopes
-    """
-    username: str
-    scopes: Optional[list[str]] = None
+    """Data extracted from JWT payload."""
+    username: Optional[str] = None # Subject claim ('sub') usually holds username
 
+# --- Password Utilities ---
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """
-    Verify a password against a hash.
-    
-    Args:
-        plain_password: Plain text password to verify
-        hashed_password: Hashed password to compare against
-        
-    Returns:
-        bool: True if password matches hash, False otherwise
-    """
-    return pwd_context.verify(plain_password, hashed_password)
-
+    """Verifies a plain password against its hashed version."""
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        # Log unexpected errors during verification but treat as mismatch
+        logger.error(f"Error verifying password hash: {e}", exc_info=True)
+        return False
 
 def get_password_hash(password: str) -> str:
-    """
-    Hash a password.
-    
-    Args:
-        password: Plain text password to hash
-        
-    Returns:
-        str: Hashed password
-    """
+    """Generates a bcrypt hash for a given password."""
     return pwd_context.hash(password)
 
+# --- User Authentication ---
 
-async def authenticate_user(username: str, password: str) -> Union[UserInDB, None]:
+async def authenticate_user(username: str, password: str) -> Optional[UserInDB]:
     """
-    Authenticate a user with username and password.
-    
+    Authenticates a user based on username and password.
+
+    Fetches the user from the database and verifies the password.
+
     Args:
-        username: Username to authenticate
-        password: Password to verify
-        
+        username: The username to authenticate.
+        password: The password to verify.
+
     Returns:
-        UserInDB: User object if authentication is successful
-        None: If authentication fails
+        The UserInDB object if authentication is successful, otherwise None.
     """
     user = await get_user_by_username(username)
     if not user:
-        logger.warning(f"Authentication failed: User {username} not found")
+        logger.warning(f"Authentication failed: User '{username}' not found.")
         return None
-    if not verify_password(password, user.hashed_password):
-        logger.warning(f"Authentication failed: Invalid password for user {username}")
-        return None
-    return user
+    # Ensure we have the hashed password (UserInDB includes it)
+    # If get_user_by_username returns User, we need UserInDB
+    # Assuming get_user_by_username can return UserInDB or similar with hash
+    if not hasattr(user, 'hashed_password') or not user.hashed_password:
+         logger.error(f"Authentication error: Hashed password missing for user '{username}'.")
+         return None # Cannot verify without hash
 
+    if not verify_password(password, user.hashed_password):
+        logger.warning(f"Authentication failed: Invalid password for user '{username}'.")
+        return None
+
+    # Return the full UserInDB object on success
+    # Ensure the object returned by get_user_by_username is compatible
+    # If it returns User, we might need another DB call or adjust get_user_by_username
+    # For now, assuming it returns an object convertible to UserInDB
+    if isinstance(user, User) and not isinstance(user, UserInDB):
+         # If we only got a User model, try fetching UserInDB explicitly (less efficient)
+         # This depends heavily on database.py implementation details.
+         # Ideally, get_user_by_username should fetch the necessary fields.
+         logger.warning(f"authenticate_user received User model, expected UserInDB for {username}.")
+         # Let's assume for now get_user_by_username returns required fields or is UserInDB
+         pass # Proceed, assuming 'user' has hashed_password
+
+    # Convert to UserInDB if necessary and possible, otherwise trust the input type
+    try:
+        user_in_db = UserInDB(**user.model_dump())
+        return user_in_db
+    except Exception as e:
+         logger.error(f"Failed to cast user {username} to UserInDB: {e}")
+         return None # Failed conversion
+
+
+# --- JWT Token Utilities ---
 
 def create_access_token(data: Dict, expires_delta: Optional[timedelta] = None) -> str:
     """
-    Create a JWT access token.
-    
+    Creates a JWT access token.
+
     Args:
-        data: Data to encode in the token
-        expires_delta: Optional expiration time delta
-        
+        data: Data to encode in the token payload (e.g., {'sub': username}).
+        expires_delta: Optional timedelta for token expiration. Defaults to config setting.
+
     Returns:
-        str: Encoded JWT token
+        The encoded JWT token string.
     """
     settings = get_settings()
     to_encode = data.copy()
-    
+
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-    
-    return encoded_jwt
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 
+    to_encode.update({"exp": expire, "iat": datetime.now(timezone.utc)}) # Add issued-at time
 
-async def validate_google_id_token(token: str) -> dict:
-    """
-    Validate a Google ID token.
-    
-    Args:
-        token: Google-issued ID token
-        
-    Returns:
-        dict: Token payload if valid
-        
-    Raises:
-        AuthenticationError: If token is invalid
-    """
     try:
-        # Get the expected audience (your service URL)
-        settings = get_settings()
-        audience = settings.SERVICE_URL or "https://eva-backend-533306620971.europe-west1.run.app"
-        
-        # Verify the token
-        request = google_requests.Request()
-        payload = id_token.verify_oauth2_token(
-            token,
-            request,
-            audience=audience
+        encoded_jwt = jwt.encode(
+            to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM
         )
-        
-        # Check if token is expired
-        if datetime.fromtimestamp(payload['exp']) < datetime.utcnow():
-            logger.error("Google ID token has expired")
-            raise AuthenticationError(detail="Token expired")
-            
-        return payload
-    except Exception as e:
-        logger.error(f"Google ID token validation failed: {str(e)}")
-        raise AuthenticationError(
-            detail=f"Invalid Google ID token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
+        return encoded_jwt
+    except JWTError as e:
+         logger.error(f"Failed to encode JWT: {e}", exc_info=True)
+         raise AuthenticationError(detail="Could not create access token.")
 
+
+async def decode_access_token(token: str) -> TokenData:
+     """
+     Decodes a JWT access token and returns the payload data.
+
+     Args:
+         token: The JWT token string.
+
+     Returns:
+         TokenData containing the username.
+
+     Raises:
+         AuthenticationError: If the token is invalid, expired, or missing data.
+     """
+     settings = get_settings()
+     credentials_exception = AuthenticationError(
+         detail="Could not validate credentials",
+         headers={"WWW-Authenticate": "Bearer"},
+     )
+
+     try:
+         payload = jwt.decode(
+             token,
+             settings.SECRET_KEY,
+             algorithms=[settings.ALGORITHM],
+             options={"verify_aud": False} # Add audience verification if needed
+         )
+         username: Optional[str] = payload.get("sub")
+         if username is None:
+             logger.error("Token validation failed: 'sub' claim (username) missing.")
+             raise credentials_exception
+
+         # Check expiration (already handled by jwt.decode, but good practice)
+         # exp = payload.get("exp")
+         # if exp is None or datetime.fromtimestamp(exp, timezone.utc) < datetime.now(timezone.utc):
+         #     logger.warning("Token validation failed: Token expired.")
+         #     raise AuthenticationError(detail="Token has expired", headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""})
+
+         token_data = TokenData(username=username)
+         return token_data
+
+     except JWTError as e:
+         logger.warning(f"Token validation failed: {e}")
+         if "expired" in str(e).lower():
+              raise AuthenticationError(detail="Token has expired", headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""})
+         else:
+              raise credentials_exception # General validation error
+
+
+# --- FastAPI Dependency Functions ---
 
 async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> User:
     """
-    Get the current user from JWT token.
-    
+    FastAPI dependency to get the current user from a JWT token.
+
+    Verifies the token and fetches the corresponding user from the database.
+
     Args:
-        token: JWT token from authorization header
-        
+        token: The JWT token extracted from the request by OAuth2PasswordBearer.
+
     Returns:
-        User: Current authenticated user
-        
+        The authenticated User object.
+
     Raises:
-        AuthenticationError: If token is invalid or expired
+        AuthenticationError: If authentication fails (invalid token, user not found).
     """
-    settings = get_settings()
-    credentials_exception = AuthenticationError(
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            logger.error("Token validation failed: missing subject claim")
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError as e:
-        logger.error(f"Token validation failed: {str(e)}")
-        raise credentials_exception
-    
+    if token is None:
+         # This case might happen if auto_error=False in OAuth2PasswordBearer
+         # and no token is provided. Handle it explicitly.
+         raise AuthenticationError(
+              detail="Not authenticated",
+              headers={"WWW-Authenticate": "Bearer"}
+         )
+
+    token_data = await decode_access_token(token) # Handles decoding and validation exceptions
+
     user = await get_user_by_username(token_data.username)
     if user is None:
-        logger.error(f"Token validation failed: user {token_data.username} not found")
-        raise credentials_exception
-    
-    return user
+        logger.error(f"Token validation failed: User '{token_data.username}' not found in database.")
+        # Raise specific exception even if token was valid, user doesn't exist anymore
+        raise AuthenticationError(
+            detail="User associated with token not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Return the User model (without sensitive data)
+    return User(**user.model_dump())
 
 
 async def get_current_active_user(
     current_user: Annotated[User, Depends(get_current_user)]
 ) -> User:
     """
-    Get the current active user.
-    
+    FastAPI dependency ensuring the authenticated user is active (not disabled).
+
     Args:
-        current_user: User from get_current_user dependency
-        
+        current_user: The user object obtained from get_current_user dependency.
+
     Returns:
-        User: Current active user
-        
+        The active User object.
+
     Raises:
-        AuthorizationError: If user is disabled
+        AuthorizationError: If the user is disabled.
     """
+    # We fetch the user again inside get_current_user, so the disabled status should be current.
+    # If User model didn't include 'disabled', we'd fetch again here.
     if current_user.disabled:
-        logger.warning(f"Access attempt by disabled user: {current_user.username}")
+        logger.warning(f"Access attempt by disabled user: {current_user.username} (ID: {current_user.id})")
         raise AuthorizationError(detail="Inactive user")
     return current_user
 
 
-@router.post("/token", response_model=Token)
-async def login_for_access_token(
-    form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
-) -> Dict:
+# --- Google ID Token Validation ---
+
+async def validate_google_id_token(token: str) -> Dict[str, Any]:
     """
-    Login endpoint to get access token.
-    
+    Validates a Google-issued ID token.
+
     Args:
-        form_data: OAuth2 form with username and password
-        
+        token: The Google ID token string.
+
     Returns:
-        Dict: Token response with access_token, token_type, and expires_at
-        
+        The token payload dictionary if validation is successful.
+
     Raises:
-        HTTPException: If authentication fails
+        AuthenticationError: If the token is invalid or expired, or auth library unavailable.
+        ConfigurationError: If required settings (SERVICE_URL) are missing.
     """
+    if not GOOGLE_AUTH_AVAILABLE:
+        logger.error("Google Auth library is not available. Cannot validate Google ID token.")
+        raise AuthenticationError(detail="Google Sign-In not supported by server configuration.")
+
     settings = get_settings()
-    user = await authenticate_user(form_data.username, form_data.password)
-    
-    if not user:
-        logger.warning(f"Failed login attempt for user: {form_data.username}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
+    # Google requires an audience check. Use SERVICE_URL or fallback to a configured client ID.
+    # Using SERVICE_URL is typical for Cloud Run.
+    audience = str(settings.SERVICE_URL) if settings.SERVICE_URL else None
+    if not audience:
+        # Alternatively, use a Client ID configured in settings if SERVICE_URL isn't reliable
+        # audience = settings.GOOGLE_CLIENT_ID
+        logger.error("SERVICE_URL is not configured. Cannot validate Google ID token audience.")
+        raise ConfigurationError("Server configuration missing required URL for Google token validation.")
+
+    try:
+        request = google_requests.Request()
+        # Verify the token against Google's public keys and check audience/issuer.
+        payload = id_token.verify_oauth2_token(
+            token,
+            request,
+            audience=audience
+            # Can also specify clock_skew_in_seconds if needed
         )
-    
-    # Calculate expiration time
-    expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    expires_at = datetime.utcnow() + expires_delta
-    
-    # Create token with subject as username
-    access_token = create_access_token(
-        data={"sub": user.username}, 
-        expires_delta=expires_delta
-    )
-    
-    logger.info(f"Generated access token for user: {user.username}")
-    return {
-        "access_token": access_token, 
-        "token_type": "bearer",
-        "expires_at": expires_at
-    }
 
+        # Optional: Check issuer if necessary
+        # if payload['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+        #     raise AuthenticationError(detail="Invalid token issuer.")
 
-async def validate_request_auth(request: Request) -> User:
-    """
-    Validate authentication from request.
-    
-    Args:
-        request: FastAPI request object
-        
-    Returns:
-        User: Authenticated user
-        
-    Raises:
-        AuthenticationError: If authentication is invalid
-    """
-    auth_header = request.headers.get("Authorization")
-    if not auth_header:
-        logger.warning("Missing Authorization header in request")
-        raise AuthenticationError(detail="Missing Authorization header")
-    
-    parts = auth_header.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        logger.warning(f"Invalid Authorization header format: {auth_header}")
-        raise AuthenticationError(detail="Invalid Authorization header format")
-    
-    token = parts[1]
-    
-    # First try to validate as Google ID token for service accounts
-    try:
-        payload = await validate_google_id_token(token)
-        # For service account tokens, create or get user
-        email = payload.get('email', '')
-        if email.endswith('.gserviceaccount.com'):
-            # Return a system user for service accounts
-            logger.info(f"Authenticated service account: {email}")
-            return User(
-                username=email,
-                email=email,
-                full_name="Service Account",
-                disabled=False,
-                is_service_account=True,
-                scopes=["api:all"]  # Grant full access to service accounts
-            )
-    except AuthenticationError as e:
-        # If Google token validation fails, try regular JWT token
-        logger.debug(f"Google ID token validation failed, trying JWT: {str(e)}")
-        pass
-    
-    # Fall back to regular JWT validation
-    try:
-        return await get_current_user(token)
+        # id_token.verify_oauth2_token already checks expiration.
+        # Manual check is redundant unless custom logic needed.
+        # if datetime.fromtimestamp(payload['exp'], timezone.utc) < datetime.now(timezone.utc):
+        #     logger.error("Google ID token has expired (should have been caught by verify_oauth2_token).")
+        #     raise AuthenticationError(detail="Token expired")
+
+        logger.info(f"Google ID token validated successfully for email: {payload.get('email')}")
+        return payload
+
+    except ValueError as e:
+        # Catches errors from verify_oauth2_token like invalid format, signature, expired, audience mismatch etc.
+        logger.warning(f"Google ID token validation failed: {e}")
+        raise AuthenticationError(
+            detail=f"Invalid Google ID token: {e}",
+            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""}
+        )
     except Exception as e:
-        logger.error(f"Authentication failed after trying both methods: {str(e)}")
-        raise AuthenticationError(detail="Invalid authentication token")
+        # Catch other potential errors (network issues during key fetching, etc.)
+        logger.error(f"Unexpected error validating Google ID token: {e}", exc_info=True)
+        raise AuthenticationError(
+            detail=f"Could not validate Google ID token: {e}",
+            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""}
+        )

@@ -1,675 +1,193 @@
 """
-API Sync module for EVA backend.
+API Sync Router for EVA backend.
 
-This module provides synchronization functionality for the offline-first
-approach between device databases and Firestore backup.
-"""
-"""
-Version 3 working
+Provides endpoints for clients to synchronize data (primarily memories)
+with the server, supporting offline-first approaches.
 """
 
 import logging
-import uuid
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple, Any
+from datetime import datetime
+from typing import Annotated, Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
 
-from auth import get_current_active_user
-from config import get_settings
-from database import get_db_manager
-from exceptions import DatabaseError, SyncError
-from firestore_manager import get_firestore_client
-from models import Memory, SyncState, User
+# --- Local Imports ---
+from auth import get_current_active_user # Dependency for authentication
+from database import get_db_manager, DatabaseManager # Use the main DB manager
+from memory_manager import get_memory_manager, MemoryManager # Use memory manager if needed (e.g., for complex logic)
+from models import User, Memory, SyncState # Import relevant models
+from exceptions import DatabaseError, NotFoundException
 
-# Setup router
+# --- Router Setup ---
 router = APIRouter()
 
 # Logger configuration
 logger = logging.getLogger(__name__)
 
+# --- Sync Logic ---
 
-class SyncRequest(BaseModel):
-    """
-    Synchronization request model.
-    
-    Attributes:
-        device_id: Unique identifier for the device
-        last_sync: Optional timestamp of last synchronization
-        memories: List of memories to synchronize
-        deleted_ids: Optional list of locally deleted memory IDs
-    """
-    device_id: str
-    last_sync: Optional[datetime] = None
-    memories: List[Memory]
-    deleted_ids: List[str] = Field(default_factory=list)
+# Constants for sync
+SYNC_BATCH_SIZE = 100 # How many records to process per sync request
 
+@router.get(
+    "/memories",
+    response_model=List[Memory], # Return a list of Memory objects
+    summary="Get memories modified since last sync"
+)
+async def get_memories_for_sync(
+    last_sync_time: Optional[datetime] = Query(None, description="Timestamp of the last successful sync (ISO 8601 format)"),
+    limit: int = Query(SYNC_BATCH_SIZE, ge=1, le=500, description="Maximum number of memories to retrieve"),
+    current_user: Annotated[User, Depends(get_current_active_user)] = None,
+    db: DatabaseManager = Depends(get_db_manager)
+) -> List[Memory]:
+    """
+    Retrieves memories for the current user that have been created or modified
+    since the provided `last_sync_time`.
 
-class SyncConflict(BaseModel):
+    If `last_sync_time` is omitted, retrieves all memories (up to the limit).
     """
-    Synchronization conflict model.
-    
-    Attributes:
-        memory_id: Memory ID with conflict
-        device_version: Device version of the memory
-        server_version: Server version of the memory
-        resolution: How the conflict was resolved
-    """
-    memory_id: str
-    device_version: datetime
-    server_version: datetime
-    resolution: str = "server_wins"  # Options: server_wins, device_wins, merged
+    user_id = current_user.id
+    logger.info(f"Sync request: Get memories for user {user_id} since {last_sync_time or 'beginning'}.")
 
-
-class SyncResponse(BaseModel):
-    """
-    Synchronization response model.
-    
-    Attributes:
-        sync_id: Unique identifier for this sync operation
-        device_id: Device identifier from the request
-        timestamp: Timestamp of synchronization
-        added_count: Number of memories added to server
-        updated_count: Number of memories updated on server
-        deleted_count: Number of memories deleted
-        conflicts: List of conflicts detected and resolved
-        server_memories: List of memories from server
-        last_sync: New last sync timestamp to use in next request
-    """
-    sync_id: str
-    device_id: str
-    timestamp: datetime
-    added_count: int
-    updated_count: int
-    deleted_count: int
-    conflicts: List[SyncConflict] = Field(default_factory=list)
-    server_memories: List[Memory] = Field(default_factory=list)
-    last_sync: datetime
-
-
-class SyncStats(BaseModel):
-    """
-    Synchronization statistics model.
-    
-    Attributes:
-        device_id: Device identifier
-        last_sync: Last successful sync timestamp
-        total_syncs: Total number of syncs performed
-        total_memories: Total number of memories synced
-        memory_count: Current number of memories
-        sync_frequency: Average time between syncs (in hours)
-    """
-    device_id: str
-    last_sync: Optional[datetime]
-    total_syncs: int
-    total_memories: int
-    memory_count: int
-    sync_frequency: Optional[float] = None
-
-
-class CleanupRequest(BaseModel):
-    """
-    Cleanup request model.
-    
-    Attributes:
-        days_threshold: Age threshold in days for memories to clean up
-        device_id: Optional device ID to limit cleanup scope
-        dry_run: Whether to simulate cleanup without deleting
-    """
-    days_threshold: int = 30
-    device_id: Optional[str] = None
-    dry_run: bool = False
-
-
-class CleanupResponse(BaseModel):
-    """
-    Cleanup response model.
-    
-    Attributes:
-        deleted_count: Number of memories deleted
-        duplicate_count: Number of duplicates removed
-        affected_devices: List of affected device IDs
-        dry_run: Whether this was a simulation
-    """
-    deleted_count: int
-    duplicate_count: int
-    affected_devices: List[str]
-    dry_run: bool
-
-
-async def synchronize_memories(
-    user_id: str,
-    device_id: str,
-    memories: List[Memory],
-    deleted_ids: List[str] = None,
-    last_sync: Optional[datetime] = None
-) -> Tuple[SyncResponse, List[Memory]]:
-    """
-    Synchronize memories between device and server.
-    
-    Implements the offline-first approach with conflict resolution
-    and tracking of sync state.
-    
-    Args:
-        user_id: User ID owning the memories
-        device_id: Device ID for sync tracking
-        memories: List of memories from device
-        deleted_ids: List of memory IDs deleted on device
-        last_sync: Last synchronization timestamp
-        
-    Returns:
-        Tuple[SyncResponse, List[Memory]]: 
-            Sync response and merged memories list
-            
-    Raises:
-        DatabaseError: If sync operation fails
-        SyncError: If synchronization conflicts cannot be resolved
-    """
     try:
-        # Generate sync ID
-        sync_id = str(uuid.uuid4())
-        now = datetime.utcnow()
-        deleted_ids = deleted_ids or []
-        
-        # Get database and Firestore clients
-        db = get_db_manager()
-        fs = get_firestore_client()
-        
-        # Get current sync state for device
-        sync_ref = (fs.collection("sync_states")
-                   .document(f"{user_id}_{device_id}"))
-        sync_doc = sync_ref.get()
-        
-        # Initialize tracking variables
-        added_count = 0
-        updated_count = 0
-        deleted_count = 0
-        conflicts = []
-        
-        # Get or create sync state
-        current_sync = None
-        if sync_doc.exists:
-            current_sync = SyncState(**sync_doc.to_dict())
+        # --- Firestore Query ---
+        # Query needs to filter by user_id and updated_at > last_sync_time
+        # Order by updated_at to ensure consistency
+        if db.db and auth.FieldFilter: # Check if Firestore is active and FieldFilter available
+            query = db.db.collection("memories").where(filter=auth.FieldFilter("user_id", "==", user_id))
+            if last_sync_time:
+                # Ensure last_sync_time is timezone-aware (UTC) if needed
+                query = query.where(filter=auth.FieldFilter("updated_at", ">", last_sync_time))
+            query = query.order_by("updated_at", direction=auth.firebase_firestore.Query.ASCENDING).limit(limit)
+            results = await asyncio.to_thread(query.stream)
+            memories = [Memory(**doc.to_dict()) for doc in results]
+
+        elif not db.db: # In-memory fallback
+             user_mems = [Memory(**m) for m in db.in_memory_db["memories"].values() if m.get("user_id") == user_id]
+             if last_sync_time:
+                  user_mems = [m for m in user_mems if m.updated_at > last_sync_time]
+             user_mems.sort(key=lambda m: m.updated_at) # Sort ascending
+             memories = user_mems[:limit]
         else:
-            current_sync = SyncState(
-                user_id=user_id,
-                device_id=device_id,
-                last_sync=None,
-                synced_memory_ids=[]
-            )
-        
-        # Get server memories for this user
-        server_memories_query = (fs.collection("memories")
-                                .where("user_id", "==", user_id))
-        server_memories = [Memory(**doc.to_dict()) for doc in server_memories_query.stream()]
-        
-        # Index server memories by ID for quick lookup
-        server_memory_map = {m.memory_id: m for m in server_memories}
-        
-        # Process device memories
-        device_memory_map = {m.memory_id: m for m in memories}
-        
-        # Track processed memories
-        processed_ids = set()
-        synced_ids = set(current_sync.synced_memory_ids)
-        final_memories = []
-        
-        # First, handle deletions from device
-        for memory_id in deleted_ids:
-            if memory_id in server_memory_map:
-                # Delete from server
-                await db.delete_memory(user_id, memory_id)
-                deleted_count += 1
-                
-                # Remove from tracking sets
-                if memory_id in synced_ids:
-                    synced_ids.remove(memory_id)
-                if memory_id in server_memory_map:
-                    del server_memory_map[memory_id]
-            
-            processed_ids.add(memory_id)
-        
-        # Process device memories - new and updated
-        for memory_id, device_memory in device_memory_map.items():
-            # Skip already processed (deleted)
-            if memory_id in processed_ids:
-                continue
-                
-            # Verify memory belongs to user
-            if device_memory.user_id != user_id:
-                logger.warning(f"Sync attempt with memory owned by {device_memory.user_id} from user {user_id}")
-                continue
-            
-            # Check if memory exists on server
-            if memory_id in server_memory_map:
-                server_memory = server_memory_map[memory_id]
-                
-                # Check for conflicts - both sides updated since last sync
-                if (last_sync and 
-                    server_memory.updated_at > last_sync and 
-                    device_memory.updated_at > last_sync):
-                    
-                    # Resolve conflict - server wins by default
-                    # In a more sophisticated implementation, you might merge fields
-                    conflict = SyncConflict(
-                        memory_id=memory_id,
-                        device_version=device_memory.updated_at,
-                        server_version=server_memory.updated_at,
-                        resolution="server_wins"
-                    )
-                    conflicts.append(conflict)
-                    
-                    # Keep server version
-                    final_memories.append(server_memory)
-                
-                # No conflict, just newer on device
-                elif not last_sync or device_memory.updated_at > server_memory.updated_at:
-                    # Update server with device version
-                    device_memory.is_synced = True
-                    await db.update_memory(memory_id, device_memory.model_dump())
-                    updated_count += 1
-                    
-                    # Add to final memories
-                    final_memories.append(device_memory)
-                    
-                else:
-                    # Server version is newer or same, keep it
-                    final_memories.append(server_memory)
-            
-            else:
-                # New memory, add to server
-                device_memory.is_synced = True
-                await db.create_memory(device_memory)
-                added_count += 1
-                
-                # Add to final memories
-                final_memories.append(device_memory)
-            
-            # Mark as processed and synced
-            processed_ids.add(memory_id)
-            synced_ids.add(memory_id)
-        
-        # Add server memories not on device to final list
-        for memory_id, server_memory in server_memory_map.items():
-            if memory_id not in processed_ids:
-                final_memories.append(server_memory)
-        
-        # Update sync state
-        new_sync = SyncState(
-            user_id=user_id,
-            device_id=device_id,
-            last_sync=now,
-            synced_memory_ids=list(synced_ids)
-        )
-        sync_ref.set(new_sync.model_dump())
-        
-        # Create response
-        response = SyncResponse(
-            sync_id=sync_id,
-            device_id=device_id,
-            timestamp=now,
-            added_count=added_count,
-            updated_count=updated_count,
-            deleted_count=deleted_count,
-            conflicts=conflicts,
-            server_memories=[m for m in server_memories if m.memory_id not in device_memory_map],
-            last_sync=now
-        )
-        
-        logger.info(f"Completed sync {sync_id} for user {user_id}, device {device_id}: "
-                   f"added={added_count}, updated={updated_count}, deleted={deleted_count}, "
-                   f"conflicts={len(conflicts)}")
-        
-        return response, final_memories
-    
+            # Firestore available but FieldFilter missing (older library version?)
+            logger.error("Firestore FieldFilter not available, cannot perform time-based sync query.")
+            raise HTTPException(status_code=501, detail="Server configuration does not support time-based sync query.")
+
+
+        logger.info(f"Sync: Returning {len(memories)} memories for user {user_id}.")
+        return memories
+
     except Exception as e:
-        logger.error(f"Error during memory synchronization for user {user_id}: {str(e)}")
-        raise DatabaseError(f"Failed to synchronize memories: {str(e)}")
-
-
-@router.post("/sync", response_model=SyncResponse)
-async def sync_endpoint(
-    sync_request: SyncRequest,
-    current_user: User = Depends(get_current_active_user)
-) -> SyncResponse:
-    """
-    Synchronize memories between device and server.
-    
-    Args:
-        sync_request: Synchronization request
-        current_user: Current authenticated user
-        
-    Returns:
-        SyncResponse: Synchronization results
-        
-    Raises:
-        HTTPException: If synchronization fails
-    """
-    try:
-        # Validate memory ownership
-        for memory in sync_request.memories:
-            if memory.user_id != current_user.id:
-                logger.warning(f"Sync attempt with memory owned by {memory.user_id} from user {current_user.id}")
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Cannot sync memories owned by other users"
-                )
-        
-        # Perform synchronization
-        response, _ = await synchronize_memories(
-            current_user.id,
-            sync_request.device_id,
-            sync_request.memories,
-            sync_request.deleted_ids,
-            sync_request.last_sync
-        )
-        
-        return response
-    
-    except DatabaseError as e:
-        logger.error(f"Database error during sync: {str(e)}")
+        logger.error(f"Error retrieving memories for sync (User: {user_id}): {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
-    except Exception as e:
-        logger.error(f"Error during sync: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Sync failed: {str(e)}"
+            detail=f"Failed to retrieve memories for sync: {e}"
         )
 
-
-@router.get("/sync/stats", response_model=Dict[str, SyncStats])
-async def get_sync_stats(
-    current_user: User = Depends(get_current_active_user)
-) -> Dict[str, SyncStats]:
-    """
-    Get synchronization statistics for user devices.
-    
-    Args:
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict[str, SyncStats]: Stats for each device
-        
-    Raises:
-        HTTPException: If stats retrieval fails
-    """
-    try:
-        # Get Firestore client
-        fs = get_firestore_client()
-        
-        # Query sync states for user
-        sync_query = (fs.collection("sync_states")
-                     .where("user_id", "==", current_user.id))
-        
-        # Collect stats for each device
-        stats = {}
-        for doc in sync_query.stream():
-            sync_state = SyncState(**doc.to_dict())
-            device_id = sync_state.device_id
-            
-            # Count memories for this device
-            memory_query = (fs.collection("memories")
-                           .where("user_id", "==", current_user.id))
-            
-            memory_count = len(list(memory_query.stream()))
-            
-            # Get sync history for frequency calculation
-            history_query = (fs.collection("sync_history")
-                            .where("user_id", "==", current_user.id)
-                            .where("device_id", "==", device_id)
-                            .order_by("timestamp", direction="DESCENDING")
-                            .limit(10))
-            
-            sync_history = list(history_query.stream())
-            total_syncs = len(sync_history)
-            
-            # Calculate average time between syncs
-            sync_frequency = None
-            if total_syncs >= 2:
-                timestamps = [h.get("timestamp") for h in sync_history]
-                intervals = [(timestamps[i] - timestamps[i+1]).total_seconds() / 3600
-                            for i in range(len(timestamps)-1)]
-                sync_frequency = sum(intervals) / len(intervals)
-            
-            # Create stats object
-            stats[device_id] = SyncStats(
-                device_id=device_id,
-                last_sync=sync_state.last_sync,
-                total_syncs=total_syncs,
-                total_memories=len(sync_state.synced_memory_ids),
-                memory_count=memory_count,
-                sync_frequency=sync_frequency
-            )
-        
-        return stats
-    
-    except Exception as e:
-        logger.error(f"Error retrieving sync stats: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve sync stats: {str(e)}"
-        )
-
-
-@router.post("/cleanup", response_model=CleanupResponse)
-async def cleanup_memories(
-    cleanup_request: CleanupRequest,
-    current_user: User = Depends(get_current_active_user)
-) -> CleanupResponse:
-    """
-    Clean up old memories and remove duplicates.
-    
-    Args:
-        cleanup_request: Cleanup parameters
-        current_user: Current authenticated user
-        
-    Returns:
-        CleanupResponse: Cleanup results
-        
-    Raises:
-        HTTPException: If cleanup fails
-    """
-    try:
-        # Get database and Firestore clients
-        db = get_db_manager()
-        fs = get_firestore_client()
-        
-        # Track results
-        deleted_count = 0
-        duplicate_count = 0
-        affected_devices = set()
-        
-        # Run in dry-run mode if requested
-        if cleanup_request.dry_run:
-            logger.info(f"Performing DRY RUN cleanup for user {current_user.id}")
-        
-        # Clean up old memories
-        cutoff_date = datetime.utcnow() - timedelta(days=cleanup_request.days_threshold)
-        
-        # Find old memories
-        old_memories_query = (fs.collection("memories")
-                             .where("user_id", "==", current_user.id)
-                             .where("updated_at", "<", cutoff_date))
-        
-        old_memories = list(old_memories_query.stream())
-        
-        if not cleanup_request.dry_run:
-            # Delete old memories
-            for memory_doc in old_memories:
-                memory_id = memory_doc.id
-                await db.delete_memory(current_user.id, memory_id)
-                deleted_count += 1
-                
-                # Update sync states to remove references
-                sync_states_query = (fs.collection("sync_states")
-                                    .where("user_id", "==", current_user.id))
-                
-                for sync_doc in sync_states_query.stream():
-                    sync_data = sync_doc.to_dict()
-                    device_id = sync_data.get("device_id")
-                    synced_ids = set(sync_data.get("synced_memory_ids", []))
-                    
-                    if memory_id in synced_ids:
-                        synced_ids.remove(memory_id)
-                        sync_doc.reference.update({"synced_memory_ids": list(synced_ids)})
-                        affected_devices.add(device_id)
-        else:
-            # Just count in dry-run mode
-            deleted_count = len(old_memories)
-            
-            # Find affected devices
-            for memory_doc in old_memories:
-                memory_id = memory_doc.id
-                sync_states_query = (fs.collection("sync_states")
-                                   .where("user_id", "==", current_user.id))
-                
-                for sync_doc in sync_states_query.stream():
-                    sync_data = sync_doc.to_dict()
-                    device_id = sync_data.get("device_id")
-                    synced_ids = set(sync_data.get("synced_memory_ids", []))
-                    
-                    if memory_id in synced_ids:
-                        affected_devices.add(device_id)
-        
-        # Remove duplicates - specific device or all
-        if cleanup_request.device_id:
-            # Cleanup for specific device
-            device_id = cleanup_request.device_id
-            if not cleanup_request.dry_run:
-                duplicate_count = await fs.cleanup_duplicate_memories(current_user.id)
-                affected_devices.add(device_id)
-            else:
-                # Count duplicates in dry-run mode
-                memories = await db.get_user_memories(current_user.id)
-                content_map = {}
-                for memory in memories:
-                    content = memory.content
-                    if content in content_map:
-                        duplicate_count += 1
-                    else:
-                        content_map[content] = memory.memory_id
-                
-                affected_devices.add(device_id)
-        else:
-            # Cleanup for all devices
-            if not cleanup_request.dry_run:
-                duplicate_count = await fs.cleanup_duplicate_memories(current_user.id)
-                
-                # Get all affected devices
-                sync_states_query = (fs.collection("sync_states")
-                                    .where("user_id", "==", current_user.id))
-                
-                for sync_doc in sync_states_query.stream():
-                    sync_data = sync_doc.to_dict()
-                    device_id = sync_data.get("device_id")
-                    affected_devices.add(device_id)
-            else:
-                # Count duplicates in dry-run mode
-                memories = await db.get_user_memories(current_user.id)
-                content_map = {}
-                for memory in memories:
-                    content = memory.content
-                    if content in content_map:
-                        duplicate_count += 1
-                    else:
-                        content_map[content] = memory.memory_id
-                
-                # Get all affected devices
-                sync_states_query = (fs.collection("sync_states")
-                                    .where("user_id", "==", current_user.id))
-                
-                for sync_doc in sync_states_query.stream():
-                    sync_data = sync_doc.to_dict()
-                    device_id = sync_data.get("device_id")
-                    affected_devices.add(device_id)
-        
-        logger.info(f"Cleanup for user {current_user.id}: "
-                   f"deleted={deleted_count}, duplicates={duplicate_count}, "
-                   f"affected_devices={len(affected_devices)}, dry_run={cleanup_request.dry_run}")
-        
-        return CleanupResponse(
-            deleted_count=deleted_count,
-            duplicate_count=duplicate_count,
-            affected_devices=list(affected_devices),
-            dry_run=cleanup_request.dry_run
-        )
-    
-    except Exception as e:
-        logger.error(f"Error during memory cleanup: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to cleanup memories: {str(e)}"
-        )
-
-
-@router.post("/reset-sync/{device_id}")
-async def reset_sync_state(
-    device_id: str,
-    current_user: User = Depends(get_current_active_user)
+@router.post(
+    "/memories",
+    status_code=status.HTTP_200_OK,
+    summary="Push client-side memory changes to server"
+)
+async def push_memory_changes(
+    memories_to_update: List[Memory], # Client sends full Memory objects
+    current_user: Annotated[User, Depends(get_current_active_user)] = None,
+    db: DatabaseManager = Depends(get_db_manager),
+    mem_manager: MemoryManager = Depends(get_memory_manager) # Inject MemoryManager too
 ) -> Dict[str, Any]:
     """
-    Reset sync state for a device.
-    
-    Useful when a device needs to be re-initialized or
-    sync problems need to be resolved.
-    
-    Args:
-        device_id: Device ID to reset
-        current_user: Current authenticated user
-        
-    Returns:
-        Dict[str, Any]: Reset confirmation
-        
-    Raises:
-        HTTPException: If reset fails
+    Receives a list of memories created or modified on the client and
+    updates the server-side storage.
+
+    - Checks ownership.
+    - Compares `updated_at` timestamps to handle conflicts (server wins).
+    - Creates new memories or updates existing ones.
+    - Returns a summary of successes and failures.
     """
-    try:
-        # Get Firestore client
-        fs = get_firestore_client()
-        
-        # Find sync state for device
-        sync_ref = (fs.collection("sync_states")
-                   .document(f"{current_user.id}_{device_id}"))
-        
-        sync_doc = sync_ref.get()
-        
-        if not sync_doc.exists:
-            logger.warning(f"Sync state not found for user {current_user.id}, device {device_id}")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Sync state not found for this device"
-            )
-        
-        # Create a reset sync state
-        new_sync = SyncState(
-            user_id=current_user.id,
-            device_id=device_id,
-            last_sync=None,
-            synced_memory_ids=[]
-        )
-        
-        # Update sync state
-        sync_ref.set(new_sync.model_dump())
-        
-        logger.info(f"Reset sync state for user {current_user.id}, device {device_id}")
-        
-        return {
-            "success": True,
-            "message": f"Sync state reset for device {device_id}",
-            "device_id": device_id,
-            "timestamp": datetime.utcnow()
-        }
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error resetting sync state: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to reset sync state: {str(e)}"
-        )
+    user_id = current_user.id
+    success_count = 0
+    failed_ids = []
+    conflict_ids = []
+
+    logger.info(f"Sync request: Push {len(memories_to_update)} memory changes for user {user_id}.")
+
+    if len(memories_to_update) > SYNC_BATCH_SIZE * 2: # Limit batch size
+        raise HTTPException(status_code=413, detail=f"Payload too large. Max {SYNC_BATCH_SIZE * 2} memories per request.")
+
+    for client_memory in memories_to_update:
+        memory_id = client_memory.memory_id
+        try:
+            # --- Security Check: Ensure memory belongs to the current user ---
+            if client_memory.user_id != user_id:
+                logger.warning(f"Sync push rejected: Memory {memory_id} user_id mismatch "
+                               f"(Client: {client_memory.user_id}, Auth: {user_id})")
+                failed_ids.append({"id": memory_id, "reason": "User ID mismatch"})
+                continue
+
+            # --- Get existing server memory (if any) ---
+            # Use MemoryManager's get_memory for potential caching/logic, or DB directly
+            # Using DB directly here for simplicity
+            server_memory = await db.get_memory(memory_id)
+
+            if server_memory:
+                # --- Update Existing Memory ---
+                # Conflict Resolution: Server timestamp wins if different
+                if server_memory.updated_at > client_memory.updated_at:
+                    logger.warning(f"Sync conflict: Server memory {memory_id} is newer. Ignoring client update.")
+                    conflict_ids.append(memory_id)
+                    continue # Skip update, server version is newer
+
+                # Prepare updates dictionary from client memory
+                # Ensure updated_at reflects the client's latest change time
+                update_data = client_memory.model_dump(exclude={"memory_id"}, exclude_none=True)
+                # Mark as synced since the server is now processing this state
+                update_data["is_synced"] = True
+                # Explicitly set updated_at from client? Or use server time now?
+                # Using client's updated_at allows preserving modification time across syncs
+                # update_data["updated_at"] = client_memory.updated_at # Keep client time
+
+                # Use MemoryManager's update for potential validation/logic
+                # Or DB directly
+                # success = await mem_manager.update_memory(memory_id, user_id, update_data)
+                # Using DB directly requires ensuring ownership again if needed
+                success = await db.update_memory(memory_id, update_data)
+
+                if success:
+                    success_count += 1
+                else:
+                    logger.error(f"Sync push: Failed to update memory {memory_id} in DB.")
+                    failed_ids.append({"id": memory_id, "reason": "Database update failed"})
+
+            else:
+                # --- Create New Memory ---
+                # Client is pushing a memory the server doesn't have
+                logger.info(f"Sync push: Creating new memory {memory_id} from client.")
+                # Mark as synced since server is receiving it
+                client_memory.is_synced = True
+                # Use MemoryManager or DB to create
+                # success = await mem_manager.create_memory(...) # Needs splitting data
+                success = await db.create_memory(client_memory) # Pass the full object
+
+                if success:
+                    success_count += 1
+                else:
+                    logger.error(f"Sync push: Failed to create new memory {memory_id} in DB.")
+                    failed_ids.append({"id": memory_id, "reason": "Database creation failed"})
+
+        except Exception as e:
+            logger.error(f"Sync push: Error processing memory {memory_id}: {e}", exc_info=True)
+            failed_ids.append({"id": memory_id, "reason": str(e)})
+
+    logger.info(f"Sync push completed for user {user_id}: "
+                f"{success_count} succeeded, {len(failed_ids)} failed, {len(conflict_ids)} conflicts.")
+
+    return {
+        "processed_count": len(memories_to_update),
+        "success_count": success_count,
+        "failed_memories": failed_ids,
+        "conflicts_ignored": conflict_ids, # IDs where server version was newer
+        "sync_timestamp": datetime.now(auth.timezone.utc) # Provide server time for next sync
+    }
+
+# TODO: Add endpoints for other data types if needed (e.g., conversations, user settings)
+# TODO: Consider adding a /sync/state endpoint to manage SyncState model if used.

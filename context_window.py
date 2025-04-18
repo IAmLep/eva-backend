@@ -1,12 +1,8 @@
 """
 Context Window Manager for EVA backend.
 
-This module provides intelligent management of the conversation context window,
-including token tracking, dynamic context assembly, and automatic summarization
-to optimize Gemini API interactions.
-
-Current Date: 2025-04-12
-Current User: IAmLep
+Manages the conversation context for the LLM, including history,
+memory injection, system prompts, token counting, and summarization.
 """
 
 import json
@@ -17,390 +13,491 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
 
+# --- Local Imports ---
 from config import get_settings
-from memory_manager import get_memory_manager, MemoryType, MemoryRelevance
-from models import User, Memory, Conversation
+# Import specific types from memory_manager
+from memory_manager import get_memory_manager, MemoryType, MemoryCategory
+from models import User, Memory, Conversation # Import relevant models
+from llm_service import GeminiService # Import for summarization
 
 # Logger configuration
 logger = logging.getLogger(__name__)
 
+# --- Constants ---
+# Rough estimate, adjust based on tokenizer if known
+CHARS_PER_TOKEN_ESTIMATE = 4
+# Importance scores (relative)
+IMPORTANCE_SYSTEM = 3.0
+IMPORTANCE_MEMORY_HIGH = 2.5
+IMPORTANCE_MEMORY_MEDIUM = 2.0
+IMPORTANCE_MEMORY_LOW = 1.5
+IMPORTANCE_SUMMARY = 1.8
+IMPORTANCE_RECENT_MESSAGE = 1.0
+IMPORTANCE_OLD_MESSAGE = 0.5
+
 
 class ContextItem(BaseModel):
-    """
-    Context item model for context window assembly.
-    
-    Attributes:
-        content: The actual text content
-        token_count: Approximate token count
-        importance: Importance score (higher = more important)
-        source: Source of the context item
-        timestamp: When the item was created/added
-    """
+    """Represents an item within the context window."""
     content: str
     token_count: int
-    importance: float = 1.0
-    source: str  # "message", "memory", "summary", etc.
+    importance: float
+    source: str  # e.g., "system", "memory:core", "summary", "message"
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
 class ConversationSummary(BaseModel):
-    """
-    Conversation summary model.
-    
-    Attributes:
-        summary_text: Summarized conversation content
-        turn_count: Number of conversation turns in the summary
-        entities: Key entities mentioned in conversation
-        sentiment: Overall sentiment of the conversation
-        token_count: Approximate token count
-    """
+    """Represents a summary of part of the conversation."""
     summary_text: str
-    turn_count: int
+    turn_count: int # Number of original turns this summary replaces
     entities: List[str] = Field(default_factory=list)
-    sentiment: Optional[str] = None
+    sentiment: Optional[str] = None # Placeholder for future sentiment analysis
     token_count: int
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
 class ContextWindow:
     """
-    Dynamic context window manager for optimizing Gemini API interactions.
-    
-    This class manages the conversation context, handles token limits,
-    and provides context assembly for different types of interactions.
+    Manages the dynamic context window for LLM interactions.
+
+    Handles token limits, context assembly from various sources
+    (messages, memories, summaries, system prompts), and triggers
+    summarization when needed.
     """
-    
-    def __init__(self, max_tokens: int = 8000, summarize_after_turns: int = 10):
-        """
-        Initialize context window manager.
-        
-        Args:
-            max_tokens: Maximum tokens in context window
-            summarize_after_turns: Number of turns before summarization
-        """
+
+    def __init__(self):
+        """Initialize context window manager using settings."""
         self.settings = get_settings()
-        self.max_tokens = max_tokens
-        self.summarize_after_turns = summarize_after_turns
+        self.max_tokens = self.settings.CONTEXT_MAX_TOKENS
+        self.summarize_after_turns = self.settings.SUMMARIZE_AFTER_TURNS
+        self.keep_recent_messages = 5 # Always keep at least N recent messages
+
         self.memory_manager = get_memory_manager()
-        
-        # Context components
-        self.recent_messages: List[ContextItem] = []
-        self.summaries: List[ConversationSummary] = []
-        self.active_memories: List[ContextItem] = []
+        self.gemini_service = GeminiService() # For summarization
+
+        # --- Context Components ---
         self.system_instructions: List[ContextItem] = []
+        self.active_memories: List[ContextItem] = []
+        self.summaries: List[ContextItem] = []
+        self.recent_messages: List[ContextItem] = []
+
+        # --- State ---
         self.current_token_count: int = 0
-        self.current_turn_count: int = 0
-        
-        # Entity tracking
-        self.mentioned_entities: Dict[str, float] = {}  # entity -> importance
-        
-        logger.info(f"Context window initialized: max_tokens={max_tokens}, "
-                   f"summarize_after={summarize_after_turns} turns")
-    
-    def estimate_tokens(self, text: str) -> int:
-        """
-        Estimate token count for a text.
-        Simple approximation: ~4 chars per token.
-        
-        Args:
-            text: Text to estimate
-            
-        Returns:
-            int: Estimated token count
-        """
+        self.current_turn_count: int = 0 # Turns since last summary
+        self.mentioned_entities: Dict[str, float] = {} # entity -> importance/recency score
+
+        logger.info(f"Context window initialized: max_tokens={self.max_tokens}, "
+                   f"summarize_after={self.summarize_after_turns} turns")
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count for text (simple approximation)."""
         if not text:
             return 0
-        return len(text) // 4 + 1  # Simple approximation
-    
-    def add_message(self, role: str, content: str) -> None:
-        """
-        Add a message to the context window.
-        
-        Args:
-            role: Message role ("user" or "assistant")
-            content: Message content
-        """
-        token_count = self.estimate_tokens(content)
-        
-        # Create context item
+        # A slightly more robust estimate than just chars/4
+        # Count words and add a buffer. Real tokenizer is better.
+        words = len(text.split())
+        chars = len(text)
+        return max(words, chars // CHARS_PER_TOKEN_ESTIMATE) + 1
+
+    def _add_item(self, item: ContextItem):
+        """Internal method to add an item and update token count."""
+        self.current_token_count += item.token_count
+        # Note: Specific lists (system, memory, etc.) are appended to directly
+
+    def _remove_item(self, item: ContextItem):
+        """Internal method to remove an item and update token count."""
+        self.current_token_count -= item.token_count
+        # Note: Specific lists must be managed externally
+
+    def add_system_instruction(self, instruction: str, importance: float = IMPORTANCE_SYSTEM):
+        """Adds a system instruction."""
+        if not instruction: return
+        token_count = self._estimate_tokens(instruction)
         item = ContextItem(
-            content=f"{role}: {content}",
-            token_count=token_count,
-            importance=1.0,  # Recent messages are important
-            source="message"
-        )
-        
-        # Add to recent messages
-        self.recent_messages.append(item)
-        self.current_token_count += token_count
-        self.current_turn_count += 1
-        
-        # Extract entities from message
-        self._extract_entities(content)
-        
-        # Check if summarization is needed
-        if self.current_turn_count >= self.summarize_after_turns:
-            self._create_conversation_summary()
-        
-        # Ensure we're within token limits
-        self._manage_token_limit()
-        
-        logger.debug(f"Added {role} message: {token_count} tokens, "
-                    f"total: {self.current_token_count}/{self.max_tokens} tokens")
-    
-    def add_system_instruction(self, instruction: str, importance: float = 2.0) -> None:
-        """
-        Add a system instruction to the context window.
-        
-        Args:
-            instruction: System instruction text
-            importance: Importance score (higher = harder to drop)
-        """
-        token_count = self.estimate_tokens(instruction)
-        
-        # Create context item
-        item = ContextItem(
-            content=f"System: {instruction}",
+            content=f"System Instruction: {instruction}", # Prefix for clarity
             token_count=token_count,
             importance=importance,
             source="system"
         )
-        
         self.system_instructions.append(item)
-        self.current_token_count += token_count
-        
-        # Ensure we're within token limits
-        self._manage_token_limit()
-        
-        logger.debug(f"Added system instruction: {token_count} tokens")
-    
-    def add_memory(self, memory: Memory, relevance_score: float) -> None:
-        """
-        Add a memory to the context window.
-        
-        Args:
-            memory: Memory object to add
-            relevance_score: Relevance to current conversation (0-1)
-        """
-        # Format memory based on type
-        if memory.source == "core":
-            formatted_content = f"Memory ({memory.metadata.get('category', 'fact')}): {memory.content}"
-        elif memory.source == "event":
-            event_time = memory.metadata.get("event_time", "")
-            formatted_content = f"Upcoming event ({event_time}): {memory.content}"
+        self._add_item(item)
+        self._manage_token_limit() # Ensure limits after adding
+        logger.debug(f"Added system instruction ({token_count} tokens). Total: {self.current_token_count}")
+
+    def add_message(self, role: str, content: str):
+        """Adds a user or assistant message."""
+        if not content: return
+        # Basic sanitization or validation could happen here
+        token_count = self._estimate_tokens(content)
+        item = ContextItem(
+            content=f"{role.capitalize()}: {content}", # Format message
+            token_count=token_count,
+            importance=IMPORTANCE_RECENT_MESSAGE, # New messages are important initially
+            source=f"message:{role}"
+        )
+        self.recent_messages.append(item)
+        self._add_item(item)
+
+        # Update turn count only for user messages to trigger summarization correctly
+        if role == "user":
+            self.current_turn_count += 1
+
+        # Update entity tracking based on message content
+        self._extract_entities(content)
+
+        # Check if summarization is needed (after adding message)
+        # We'll call summarize externally or based on turn count check later
+        # if self.current_turn_count >= self.summarize_after_turns:
+        #    asyncio.create_task(self.summarize_conversation()) # Run async
+
+        self._manage_token_limit() # Ensure limits after adding
+        logger.debug(f"Added {role} message ({token_count} tokens). Total: {self.current_token_count}")
+
+
+    def add_memory(self, memory: Memory, relevance_score: float):
+        """Adds a relevant memory to the context."""
+        if not memory or not memory.content: return
+
+        # Format memory content for context
+        if memory.source == MemoryType.CORE.value:
+            category = memory.metadata.get('category', 'Fact')
+            formatted_content = f"Relevant Memory ({category}): {memory.content}"
+            base_importance = IMPORTANCE_MEMORY_MEDIUM
+        elif memory.source == MemoryType.EVENT.value:
+            event_time_str = memory.metadata.get("event_time", "Unknown time")
+            try: # Format time nicely if possible
+                event_dt = datetime.fromisoformat(event_time_str.replace('Z', '+00:00'))
+                event_time_str = event_dt.strftime("%Y-%m-%d %H:%M")
+            except ValueError: pass
+            formatted_content = f"Relevant Event ({event_time_str}): {memory.content}"
+            base_importance = IMPORTANCE_MEMORY_HIGH # Events often time-sensitive
+        elif memory.source == MemoryType.CONVERSATIONAL.value:
+             formatted_content = f"Relevant Past Conversation Snippet: {memory.content}"
+             base_importance = IMPORTANCE_MEMORY_LOW
         else:
-            formatted_content = f"Past conversation: {memory.content}"
-        
-        token_count = self.estimate_tokens(formatted_content)
-        
-        # Create context item
+            formatted_content = f"Relevant Info: {memory.content}"
+            base_importance = IMPORTANCE_MEMORY_MEDIUM
+
+        token_count = self._estimate_tokens(formatted_content)
+        # Scale importance by relevance and base importance
+        importance = base_importance * relevance_score
+
         item = ContextItem(
             content=formatted_content,
             token_count=token_count,
-            importance=relevance_score * 2.0,  # Scale importance by relevance
+            importance=importance,
             source=f"memory:{memory.source}"
         )
-        
         self.active_memories.append(item)
-        self.current_token_count += token_count
-        
-        # Ensure we're within token limits
-        self._manage_token_limit()
-        
-        logger.debug(f"Added memory: {token_count} tokens, relevance: {relevance_score:.2f}")
-    
-    def clear(self) -> None:
-        """Clear the context window completely."""
-        self.recent_messages = []
-        self.summaries = []
-        self.active_memories = []
+        self._add_item(item)
+        # Don't manage token limit here, do it after refresh is complete
+
+    def _add_summary(self, summary: ConversationSummary):
+        """Adds a conversation summary item."""
+        item = ContextItem(
+            content=f"Summary of previous conversation ({summary.turn_count} turns): {summary.summary_text}",
+            token_count=summary.token_count,
+            importance=IMPORTANCE_SUMMARY,
+            source="summary",
+            timestamp=summary.timestamp
+        )
+        self.summaries.append(item)
+        self._add_item(item)
+        # Don't manage token limit here, do it after summarization is complete
+
+    def clear(self):
+        """Clears the entire context window."""
         self.system_instructions = []
+        self.active_memories = []
+        self.summaries = []
+        self.recent_messages = []
         self.current_token_count = 0
         self.current_turn_count = 0
         self.mentioned_entities = {}
-        
         logger.info("Context window cleared")
-    
-    async def refresh_memories(self, user_id: str, current_message: str) -> None:
-        """
-        Refresh relevant memories based on current conversation.
-        
-        Args:
-            user_id: User ID to fetch memories for
-            current_message: Current message for relevance
-        """
-        # Get top entities
-        top_entities = [entity for entity, _ in sorted(
-            self.mentioned_entities.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )[:5]]  # Get top 5 entities
-        
-        # Fetch relevant memories
-        relevant_memories = await self.memory_manager.get_relevant_memories(
-            user_id=user_id,
-            query=current_message,
-            entities=top_entities,
-            limit=5
-        )
-        
-        # Clear current memories
-        old_memories = self.active_memories
-        self.active_memories = []
-        self.current_token_count -= sum(m.token_count for m in old_memories)
-        
-        # Add new memories
-        for memory, relevance in relevant_memories:
-            self.add_memory(memory, relevance)
-            
-        logger.info(f"Refreshed memories: added {len(relevant_memories)} relevant memories")
-    
-    def assemble_context(self) -> str:
-        """
-        Assemble the full context for the LLM.
-        
-        Returns:
-            str: Assembled context
-        """
-        # Start with system instructions (highest priority)
-        context_parts = [item.content for item in sorted(
-            self.system_instructions, 
-            key=lambda x: x.importance, 
-            reverse=True
-        )]
-        
-        # Add memories (second priority)
-        if self.active_memories:
-            context_parts.append("Relevant memories:")
-            memory_parts = [item.content for item in sorted(
-                self.active_memories, 
-                key=lambda x: x.importance, 
-                reverse=True
-            )]
-            context_parts.extend(memory_parts)
-        
-        # Add most recent summary if we have one
-        if self.summaries:
-            most_recent_summary = self.summaries[-1]
-            context_parts.append(f"Previous conversation summary: {most_recent_summary.summary_text}")
-        
-        # Add recent messages (always include)
+
+    async def refresh_memories(self, user_id: str):
+        """Fetches and adds relevant memories based on recent context."""
+        # Clear existing memories first
+        self._clear_active_memories()
+
+        # Determine query based on recent messages or entities
         if self.recent_messages:
-            context_parts.append("Recent conversation:")
-            message_parts = [item.content for item in self.recent_messages]
-            context_parts.extend(message_parts)
-        
-        # Assemble final context
-        return "\n\n".join(context_parts)
-    
-    def get_mentioned_entities(self) -> List[str]:
-        """
-        Get list of entities mentioned in conversation.
-        
-        Returns:
-            List[str]: List of entity names
-        """
-        return list(self.mentioned_entities.keys())
-    
-    def _extract_entities(self, text: str) -> None:
-        """
-        Extract potential entities from text.
-        This is a simple implementation - in production you might
-        use NLP for better entity extraction.
-        
-        Args:
-            text: Text to extract entities from
-        """
-        # Simple entity extraction - proper nouns and capitalized phrases
-        # This is a naive implementation - in production use a proper NER model
-        potential_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        
-        # Update entity importance
-        for entity in potential_entities:
-            if entity in self.mentioned_entities:
-                # Increase importance for repeated mentions
-                self.mentioned_entities[entity] += 0.5
+            # Use content of last few messages as query context
+            query_context = "\n".join(
+                msg.content for msg in self.recent_messages[-self.keep_recent_messages:]
+            )
+        else:
+            query_context = "General context" # Fallback if no messages
+
+        # Get top N entities based on recency/importance
+        top_entities = sorted(
+            self.mentioned_entities.items(),
+            key=lambda item: item[1], # Sort by score
+            reverse=True
+        )[:5] # Get top 5 entities
+        entity_names = [name for name, score in top_entities]
+
+        try:
+            relevant_memories = await self.memory_manager.get_relevant_memories(
+                user_id=user_id,
+                query=query_context,
+                entities=entity_names,
+                limit=self.settings.MEMORY_REFRESH_BATCH_SIZE # Use setting
+            )
+
+            if relevant_memories:
+                logger.info(f"Refreshing memories: Found {len(relevant_memories)} relevant memories.")
+                for memory, relevance in relevant_memories:
+                    self.add_memory(memory, relevance)
+                self._manage_token_limit() # Manage limit after adding all new memories
             else:
-                # New entity
-                self.mentioned_entities[entity] = 1.0
-    
-    async def _create_conversation_summary(self) -> None:
-        """Create a summary of the current conversation."""
-        if not self.recent_messages:
+                 logger.info("Refreshing memories: No relevant memories found.")
+
+        except Exception as e:
+            logger.error(f"Failed to refresh memories for user {user_id}: {e}", exc_info=True)
+
+    def _clear_active_memories(self):
+        """Removes all active memories and updates token count."""
+        if not self.active_memories:
             return
-            
-        # Collect message contents
-        message_texts = [item.content for item in self.recent_messages]
-        messages_to_summarize = "\n".join(message_texts)
-        
-        # In a real implementation, we'd use the LLM to create this summary
-        # For now, we'll create a placeholder
-        summary_text = f"Conversation about {', '.join(list(self.mentioned_entities.keys())[:3])}"
-        summary_tokens = self.estimate_tokens(summary_text)
-        
-        # Create summary object
-        summary = ConversationSummary(
-            summary_text=summary_text,
-            turn_count=self.current_turn_count,
-            entities=list(self.mentioned_entities.keys()),
-            token_count=summary_tokens
+        removed_tokens = sum(item.token_count for item in self.active_memories)
+        self.current_token_count -= removed_tokens
+        self.active_memories = []
+        logger.debug(f"Cleared active memories (removed {removed_tokens} tokens).")
+
+
+    def assemble_context(self) -> str:
+        """Assembles the context string to be sent to the LLM."""
+
+        # Get all context items
+        all_items = (
+            self.system_instructions +
+            self.active_memories +
+            self.summaries +
+            self.recent_messages
         )
-        
-        # Add summary and reset turns
-        self.summaries.append(summary)
-        self.current_turn_count = 0
-        
-        # In a real implementation, you might decide to clear some messages after summarization
-        # But this is a simple approach that keeps all messages in memory until token limit is hit
-        logger.info(f"Created conversation summary: {summary_tokens} tokens")
-    
-    def _manage_token_limit(self) -> None:
+
+        # Sort items primarily by importance (desc), then by timestamp (asc) for tie-breaking
+        # This ensures important items stay, and among equally important, older ones might be dropped first if needed
+        # (though pruning logic primarily uses importance)
+        sorted_items = sorted(
+            all_items,
+            key=lambda x: (x.importance, x.timestamp),
+            reverse=True # Higher importance first
+        )
+
+        # Build context string respecting max_tokens (conservative approach)
+        final_context_parts = []
+        current_tokens = 0
+        added_sources = set()
+
+        # Always include system instructions first if they fit
+        system_tokens = sum(item.token_count for item in self.system_instructions)
+        if system_tokens <= self.max_tokens:
+            final_context_parts.extend(item.content for item in self.system_instructions)
+            current_tokens += system_tokens
+            added_sources.add("system")
+
+        # Add other items based on sorted importance until token limit is reached
+        for item in sorted_items:
+             # Skip system instructions if already added
+            if item.source == "system" and "system" in added_sources:
+                continue
+
+            # Check if adding this item exceeds the limit
+            if current_tokens + item.token_count <= self.max_tokens:
+                final_context_parts.append(item.content)
+                current_tokens += item.token_count
+                added_sources.add(item.source)
+            else:
+                 # If we can't add the item, break (since they are sorted by importance)
+                 # Log which important item got cut off
+                 logger.debug(f"Context limit reached. Item dropped: source='{item.source}', "
+                              f"importance={item.importance:.2f}, tokens={item.token_count}")
+                 break # Stop adding items
+
+        # Structure the final context (optional, helps LLM differentiate sections)
+        structured_context = ""
+        if any(item.source == "system" for item in all_items if item.content in final_context_parts):
+             structured_context += "--- System Instructions ---\n"
+             structured_context += "\n".join(item.content for item in self.system_instructions if item.content in final_context_parts) + "\n\n"
+        if any(item.source.startswith("memory:") for item in all_items if item.content in final_context_parts):
+             structured_context += "--- Relevant Information ---\n"
+             structured_context += "\n".join(item.content for item in self.active_memories if item.content in final_context_parts) + "\n\n"
+        if any(item.source == "summary" for item in all_items if item.content in final_context_parts):
+             structured_context += "--- Conversation Summary ---\n"
+             structured_context += "\n".join(item.content for item in self.summaries if item.content in final_context_parts) + "\n\n"
+        if any(item.source.startswith("message:") for item in all_items if item.content in final_context_parts):
+             structured_context += "--- Current Conversation ---\n"
+             # Ensure messages are in chronological order in the final output
+             final_messages = sorted(
+                 [item for item in self.recent_messages if item.content in final_context_parts],
+                 key=lambda x: x.timestamp
+             )
+             structured_context += "\n".join(item.content for item in final_messages) + "\n"
+
+
+        logger.info(f"Assembled context: {current_tokens} tokens used out of {self.max_tokens} limit.")
+        return structured_context.strip()
+
+
+    def _extract_entities(self, text: str):
+        """Rudimentary entity extraction (proper nouns)."""
+        # Decay existing entity scores slightly
+        for entity in self.mentioned_entities:
+            self.mentioned_entities[entity] *= 0.95
+
+        # Simple regex for capitalized words/phrases (adjust as needed)
+        # This is basic; a proper NER model would be much better.
+        potential_entities = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', text)
+        for entity in potential_entities:
+            # Increase score for mention, reset decay
+            self.mentioned_entities[entity] = self.mentioned_entities.get(entity, 0) * 0.95 + 1.0
+            logger.debug(f"Extracted/updated entity: '{entity}'")
+
+        # Prune entities with very low scores
+        self.mentioned_entities = {e: s for e, s in self.mentioned_entities.items() if s > 0.1}
+
+
+    async def summarize_conversation(self) -> bool:
         """
-        Ensure context stays within token limit by removing low-importance items.
+        Checks if summarization is needed and performs it.
+        Replaces older messages with a summary item.
+        Returns True if summarization was performed, False otherwise.
         """
-        # If we're under the limit, no action needed
+        if self.current_turn_count < self.summarize_after_turns or len(self.recent_messages) <= self.keep_recent_messages:
+            return False # Not enough turns or messages to summarize
+
+        messages_to_summarize = self.recent_messages[:-self.keep_recent_messages]
+        if not messages_to_summarize:
+            return False # Should not happen based on above check, but safety first
+
+        logger.info(f"Attempting to summarize {len(messages_to_summarize)} messages...")
+
+        # --- Prepare prompt for LLM summarization ---
+        conversation_text = "\n".join([item.content for item in messages_to_summarize])
+        prompt = f"""Summarize the following conversation excerpt concisely, capturing the key points, decisions, and important information exchanged. Focus on details that would be useful to remember later.
+
+Conversation Excerpt:
+---
+{conversation_text}
+---
+
+Summary:"""
+
+        try:
+            # Call LLM to generate summary
+            summary_text, token_info, _ = await self.gemini_service.generate_text(
+                prompt,
+                temperature=0.3, # Lower temp for factual summary
+                max_tokens=max(150, self.max_tokens // 10) # Limit summary token size
+            )
+
+            if not summary_text:
+                 logger.warning("Summarization attempt yielded empty text.")
+                 return False
+
+            summary_token_count = self._estimate_tokens(summary_text)
+            original_token_count = sum(item.token_count for item in messages_to_summarize)
+
+            # Check if summary is actually shorter (worthwhile)
+            if summary_token_count >= original_token_count * 0.9: # Only summarize if it saves > 10% tokens
+                 logger.info(f"Summarization deemed not efficient: Original {original_token_count} tokens vs Summary {summary_token_count} tokens.")
+                 # Reset turn count anyway to avoid constant re-attempts if summarization isn't helping
+                 self.current_turn_count = 0
+                 return False
+
+            # --- Create and add summary ---
+            summary = ConversationSummary(
+                summary_text=summary_text.strip(),
+                turn_count=len(messages_to_summarize), # How many messages it replaces
+                entities=list(self.mentioned_entities.keys()), # Include current entities snapshot
+                token_count=summary_token_count,
+                timestamp=messages_to_summarize[-1].timestamp # Timestamp of the last message summarized
+            )
+            self._add_summary(summary)
+
+            # --- Remove summarized messages ---
+            num_to_remove = len(messages_to_summarize)
+            removed_items = self.recent_messages[:num_to_remove]
+            self.recent_messages = self.recent_messages[num_to_remove:] # Keep only the most recent ones
+            for item in removed_items:
+                self._remove_item(item)
+
+            self.current_turn_count = 0 # Reset turn count after successful summary
+            logger.info(f"Summarized {num_to_remove} messages into {summary_token_count} tokens. "
+                       f"Saved {original_token_count - summary_token_count} tokens.")
+
+            self._manage_token_limit() # Ensure limits after replacement
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to create conversation summary: {e}", exc_info=True)
+            # Don't reset turn count on failure, maybe try again later
+            return False
+
+    def _manage_token_limit(self):
+        """Prunes context items if total tokens exceed max_tokens."""
         if self.current_token_count <= self.max_tokens:
-            return
-            
-        # First, try removing lowest importance memories
-        if self.active_memories:
-            sorted_memories = sorted(self.active_memories, key=lambda x: x.importance)
-            while (self.current_token_count > self.max_tokens and sorted_memories):
-                item = sorted_memories.pop(0)  # Remove lowest importance memory
-                self.active_memories.remove(item)
-                self.current_token_count -= item.token_count
-                logger.debug(f"Removed memory to meet token limit: {item.content[:30]}...")
-        
-        # Next, try removing older messages if we're still over the limit
-        if self.current_token_count > self.max_tokens and len(self.recent_messages) > 5:
-            # Always keep at least the 5 most recent messages
-            # Remove older messages first
-            while (self.current_token_count > self.max_tokens and len(self.recent_messages) > 5):
-                item = self.recent_messages.pop(0)  # Remove oldest message
-                self.current_token_count -= item.token_count
-                logger.debug(f"Removed old message to meet token limit: {item.content[:30]}...")
-        
-        # If we're still over limit after these steps, this is a more complex scenario
-        # In a production system, you might implement more sophisticated pruning strategies
-        if self.current_token_count > self.max_tokens:
-            logger.warning(f"Context still over token limit after pruning: "
-                          f"{self.current_token_count}/{self.max_tokens}")
+            return # Within limits
+
+        logger.warning(f"Token limit exceeded ({self.current_token_count}/{self.max_tokens}). Pruning context...")
+
+        # Combine potential items to prune (excluding system instructions)
+        prunable_items = (
+             self.active_memories +
+             self.summaries +
+             # Only consider older messages for pruning
+             self.recent_messages[:-self.keep_recent_messages]
+        )
+
+        # Sort by importance (ascending) then timestamp (ascending) - least important / oldest first
+        prunable_items.sort(key=lambda x: (x.importance, x.timestamp))
+
+        items_removed_count = 0
+        tokens_saved = 0
+
+        while self.current_token_count > self.max_tokens and prunable_items:
+            item_to_remove = prunable_items.pop(0) # Get least important item
+
+            # Find and remove it from its original list
+            removed = False
+            if item_to_remove in self.active_memories:
+                self.active_memories.remove(item_to_remove)
+                removed = True
+            elif item_to_remove in self.summaries:
+                self.summaries.remove(item_to_remove)
+                removed = True
+            elif item_to_remove in self.recent_messages:
+                 # Double check it's not one of the ones we must keep
+                 if self.recent_messages.index(item_to_remove) < len(self.recent_messages) - self.keep_recent_messages:
+                      self.recent_messages.remove(item_to_remove)
+                      removed = True
+
+            if removed:
+                self._remove_item(item_to_remove)
+                items_removed_count += 1
+                tokens_saved += item_to_remove.token_count
+                logger.debug(f"Pruned item: source='{item_to_remove.source}', "
+                             f"importance={item_to_remove.importance:.2f}, tokens={item_to_remove.token_count}")
+            else:
+                 logger.warning(f"Could not find item to remove during pruning: {item_to_remove.source}")
 
 
-# Singleton instance
+        if items_removed_count > 0:
+             logger.info(f"Pruning complete. Removed {items_removed_count} items, saved {tokens_saved} tokens. "
+                        f"New total: {self.current_token_count}/{self.max_tokens}")
+        elif self.current_token_count > self.max_tokens:
+             logger.error(f"Failed to bring context within token limits after pruning attempt. "
+                         f"Current: {self.current_token_count}/{self.max_tokens}. System instructions might be too large.")
+
+
+# --- Singleton Instance ---
 _context_window: Optional[ContextWindow] = None
 
-
 def get_context_window() -> ContextWindow:
-    """
-    Get the context window singleton.
-    
-    Returns:
-        ContextWindow: Context window manager instance
-    """
+    """Gets the singleton ContextWindow instance."""
     global _context_window
     if _context_window is None:
-        settings = get_settings()
-        max_tokens = getattr(settings, "CONTEXT_MAX_TOKENS", 8000)
-        summarize_after = getattr(settings, "SUMMARIZE_AFTER_TURNS", 10)
-        _context_window = ContextWindow(max_tokens, summarize_after)
+        _context_window = ContextWindow()
     return _context_window

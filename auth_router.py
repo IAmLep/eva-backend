@@ -1,484 +1,347 @@
 """
 Authentication Router module for EVA backend.
 
-This module provides API endpoints for authentication-related operations
-including user registration, login, token management, and verification.
-
-"""
-"""
-Version 3 working
+Provides API endpoints for user registration, login (token generation),
+user info retrieval, token refresh, password changes, and token verification.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from auth import Token, create_access_token, get_current_active_user, get_password_hash
-from config import get_settings
-from database import get_db_manager
-from exceptions import AuthenticationError, DatabaseError
-from models import User, UserInDB
+# --- Local Imports ---
+# Import functions and dependencies from the auth logic module
+import auth
+# Import database manager and specific functions if needed
+from database import get_db_manager, get_user_by_username, get_user # Import get_user as well
+# Import exceptions used
+from exceptions import AuthenticationError, AuthorizationError, DatabaseError, DuplicateError
+# Import models used in request/response bodies and dependencies
+from models import User, UserInDB, UserRole
+# Import Pydantic schemas used for request/response validation
+from schemas import UserCreate, UserResponse, Token # Use schemas defined there
 
-# Setup router
+# --- Router Setup ---
 router = APIRouter()
 
 # Logger configuration
 logger = logging.getLogger(__name__)
 
-
-class UserCreate(BaseModel):
-    """
-    User creation request model.
-    
-    Attributes:
-        username: Username (must be unique)
-        email: Email address
-        password: Password (will be hashed)
-        full_name: Optional full name
-    """
-    username: str
-    email: EmailStr
-    password: str
-    full_name: Optional[str] = None
-    
-    @field_validator('password')
-    def password_strength(cls, v):
-        """Validate password strength."""
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters long')
-        # Could add more validation rules here (uppercase, lowercase, numbers, etc.)
-        return v
-    
-    @field_validator('username')
-    def username_valid(cls, v):
-        """Validate username format."""
-        if not v.isalnum():
-            raise ValueError('Username must contain only alphanumeric characters')
-        if len(v) < 3:
-            raise ValueError('Username must be at least 3 characters long')
-        return v
-
-
-class UserResponse(BaseModel):
-    """
-    User response model (excludes sensitive information).
-    
-    Attributes:
-        id: User ID
-        username: Username
-        email: Email address
-        full_name: Optional full name
-        created_at: Creation timestamp
-        is_active: Whether user is active
-    """
-    id: str
-    username: str
-    email: EmailStr
-    full_name: Optional[str] = None
-    created_at: datetime
-    is_active: bool = True
-
+# --- Pydantic Models for this Router ---
+# (Could be in schemas.py, but defining here if specific to auth routes)
 
 class LoginResponse(BaseModel):
-    """
-    Login response model including token and user information.
-    
-    Attributes:
-        access_token: JWT access token
-        token_type: Type of token (always 'bearer')
-        expires_at: Timestamp when token expires
-        user: User information
-    """
+    """Response model for successful login."""
     access_token: str
-    token_type: str
+    token_type: str = "bearer"
     expires_at: datetime
-    user: UserResponse
+    user: UserResponse # Include user details on login
 
+class PasswordChangeRequest(BaseModel):
+    """Request model for changing password."""
+    old_password: str
+    new_password: str
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register_user(user_data: UserCreate) -> Dict:
-    """
-    Register a new user.
-    
-    Args:
-        user_data: User creation data
-        
-    Returns:
-        Dict: Created user information
-        
-    Raises:
-        HTTPException: If registration fails
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Check if username already exists
-        existing_user = await db.get_user_by_username(user_data.username)
-        if existing_user:
-            logger.warning(f"Registration attempt with existing username: {user_data.username}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username already registered"
-            )
-        
-        # Create new user with hashed password
-        hashed_password = get_password_hash(user_data.password)
-        new_user = UserInDB(
-            username=user_data.username,
-            email=user_data.email,
-            hashed_password=hashed_password,
-            full_name=user_data.full_name,
-            created_at=datetime.utcnow(),
-            is_active=True,
-            disabled=False
-        )
-        
-        # Add user to database
-        user_id = await db.create_user(new_user)
-        
-        # Retrieve the created user (with ID)
-        created_user = await db.get_user_by_id(user_id)
-        if not created_user:
-            logger.error(f"User created but not found: {user_id}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="User created but retrieval failed"
-            )
-        
-        logger.info(f"Successfully registered new user: {user_data.username}")
-        
-        # Return user without sensitive information
-        return {
-            "id": user_id,
-            "username": created_user.username,
-            "email": created_user.email,
-            "full_name": created_user.full_name,
-            "created_at": created_user.created_at,
-            "is_active": not created_user.disabled
-        }
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error registering user: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Registration failed: {str(e)}"
-        )
+    @field_validator('new_password')
+    def password_strong(cls, v):
+        """Validate new password strength."""
+        if len(v) < 8:
+            raise ValueError('New password must be at least 8 characters')
+        # Add more rules if needed (uppercase, digit, etc.) matching UserCreate
+        return v
 
+# --- API Endpoints ---
 
-@router.post("/login", response_model=LoginResponse)
-async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]) -> Dict:
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a new user"
+)
+async def register_user(user_data: UserCreate) -> UserResponse:
     """
-    Login user and get access token.
-    
-    Args:
-        form_data: OAuth2 form with username and password
-        
-    Returns:
-        Dict: Login response with token and user information
-        
-    Raises:
-        HTTPException: If login fails
-    """
-    try:
-        # Use the token endpoint from auth.py
-        from auth import login_for_access_token
-        
-        # Get token
-        token_response = await login_for_access_token(form_data)
-        
-        # Get user information
-        db = get_db_manager()
-        user = await db.get_user_by_username(form_data.username)
-        
-        if not user:
-            logger.error(f"User not found after successful token generation: {form_data.username}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="User retrieval failed"
-            )
-        
-        logger.info(f"User logged in successfully: {form_data.username}")
-        
-        # Return token and user information
-        return {
-            **token_response,
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "full_name": user.full_name,
-                "created_at": user.created_at,
-                "is_active": not user.disabled
-            }
-        }
-    
-    except AuthenticationError as e:
-        logger.warning(f"Login failed due to authentication error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e),
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error during login: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Login failed: {str(e)}"
-        )
+    Registers a new user in the system.
 
+    - Checks if the username or email already exists.
+    - Hashes the password securely.
+    - Stores the new user in the database.
+    """
+    db = get_db_manager()
+    logger.info(f"Registration attempt for username: {user_data.username}")
 
-@router.get("/me", response_model=UserResponse)
-async def get_user_me(
-    current_user: Annotated[User, Depends(get_current_active_user)]
-) -> Dict:
-    """
-    Get current authenticated user information.
-    
-    Args:
-        current_user: Current authenticated user from dependency
-        
-    Returns:
-        Dict: User information
-    """
-    return {
-        "id": current_user.id,
-        "username": current_user.username,
-        "email": current_user.email,
-        "full_name": current_user.full_name,
-        "created_at": current_user.created_at,
-        "is_active": not current_user.disabled
-    }
+    # Check if username or email already exists
+    existing_user = await db.get_user_by_username(user_data.username)
+    if existing_user:
+        logger.warning(f"Registration failed: Username '{user_data.username}' already exists.")
+        raise DuplicateError(detail="Username already registered")
 
+    existing_email = await db.get_user_by_email(user_data.email)
+    if existing_email:
+         logger.warning(f"Registration failed: Email '{user_data.email}' already exists.")
+         raise DuplicateError(detail="Email already registered")
 
-@router.put("/me", response_model=UserResponse)
-async def update_user_me(
-    user_update: Dict,
-    current_user: Annotated[User, Depends(get_current_active_user)]
-) -> Dict:
-    """
-    Update current authenticated user information.
-    
-    Args:
-        user_update: Fields to update
-        current_user: Current authenticated user from dependency
-        
-    Returns:
-        Dict: Updated user information
-        
-    Raises:
-        HTTPException: If update fails
-    """
-    try:
-        # Get database manager
-        db = get_db_manager()
-        
-        # Handle password update separately
-        if "password" in user_update:
-            user_update["hashed_password"] = get_password_hash(user_update.pop("password"))
-        
-        # Don't allow updating username or email directly
-        if "username" in user_update:
-            logger.warning(f"Username update attempt for user {current_user.id}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username cannot be changed"
-            )
-        
-        # Update user
-        success = await db.update_user(current_user.id, user_update)
-        
-        if not success:
-            logger.error(f"Failed to update user {current_user.id}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update user"
-            )
-        
-        # Get updated user
-        updated_user = await db.get_user_by_id(current_user.id)
-        
-        logger.info(f"User {current_user.username} updated successfully")
-        
-        # Return updated user information
-        return {
-            "id": updated_user.id,
-            "username": updated_user.username,
-            "email": updated_user.email,
-            "full_name": updated_user.full_name,
-            "created_at": updated_user.created_at,
-            "is_active": not updated_user.disabled
-        }
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error updating user: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Update failed: {str(e)}"
-        )
+    # Hash the password
+    hashed_password = auth.get_password_hash(user_data.password)
 
-
-@router.post("/refresh-token", response_model=Token)
-async def refresh_token(
-    current_user: Annotated[User, Depends(get_current_active_user)]
-) -> Dict:
-    """
-    Refresh access token.
-    
-    Args:
-        current_user: Current authenticated user from dependency
-        
-    Returns:
-        Dict: New token information
-    """
-    settings = get_settings()
-    
-    # Calculate expiration time
-    expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    expires_at = datetime.utcnow() + expires_delta
-    
-    # Create new token
-    access_token = create_access_token(
-        data={"sub": current_user.username},
-        expires_delta=expires_delta
+    # Create UserInDB object (includes hashed_password)
+    new_user = UserInDB(
+        # id will be generated by DB or default factory
+        username=user_data.username,
+        email=user_data.email,
+        hashed_password=hashed_password,
+        full_name=user_data.full_name,
+        # Set defaults for other fields
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+        disabled=False, # New users are active by default
+        role=UserRole.USER, # Default role
+        preferences={},
+        metadata={}
     )
-    
-    logger.info(f"Token refreshed for user: {current_user.username}")
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "expires_at": expires_at
-    }
+
+    # Add user to database
+    try:
+        user_id = await db.create_user(new_user) # Pass the UserInDB object
+        if not user_id: # Check if create_user indicates failure
+             raise DatabaseError("User creation failed in database layer.")
+    except DatabaseError as e:
+        logger.error(f"Database error during registration for {user_data.username}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Registration failed due to a database error."
+        )
+    except Exception as e:
+        logger.exception(f"Unexpected error during registration for {user_data.username}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during registration."
+        )
+
+    # Retrieve the created user to return standard UserResponse
+    # Use the ID returned by create_user
+    created_user_data = await db.get_user(user_id)
+    if not created_user_data:
+        logger.error(f"User '{user_data.username}' (ID: {user_id}) created but could not be retrieved.")
+        # This indicates a potential issue, but registration technically succeeded.
+        # Return a generic error or try to construct response manually?
+        # Let's raise an error as this shouldn't happen.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="User created but retrieval failed. Please contact support."
+        )
+
+    logger.info(f"Successfully registered new user: {user_data.username} (ID: {user_id})")
+
+    # Convert to UserResponse schema for the response
+    # Ensure UserResponse field names match User model fields
+    return UserResponse(
+         id=created_user_data.id,
+         username=created_user_data.username,
+         email=created_user_data.email,
+         full_name=created_user_data.full_name,
+         created_at=created_user_data.created_at,
+         updated_at=created_user_data.updated_at,
+         is_active=not created_user_data.disabled, # Map disabled to is_active
+         preferences=created_user_data.preferences
+    )
 
 
-@router.post("/logout")
+@router.post(
+    "/login",
+    response_model=LoginResponse,
+    summary="Log in to get access token"
+)
+async def login_for_access_token(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
+) -> LoginResponse:
+    """
+    Authenticates the user with username and password and returns an access token
+    along with user information.
+    """
+    logger.info(f"Login attempt for user: {form_data.username}")
+    # Authenticate user using the logic from auth.py
+    user = await auth.authenticate_user(form_data.username, form_data.password)
+
+    if not user:
+        # authenticate_user already logs failure reasons
+        raise AuthenticationError(detail="Incorrect username or password") # Use custom exception
+
+    # User authenticated successfully, create token
+    settings = auth.get_settings()
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = auth.create_access_token(
+        data={"sub": user.username}, # 'sub' claim typically holds username
+        expires_delta=access_token_expires
+    )
+    expires_at = datetime.now(timezone.utc) + access_token_expires
+
+    logger.info(f"User '{form_data.username}' logged in successfully.")
+
+    # Prepare user response part
+    user_response = UserResponse(
+         id=user.id,
+         username=user.username,
+         email=user.email,
+         full_name=user.full_name,
+         created_at=user.created_at,
+         updated_at=user.updated_at,
+         is_active=not user.disabled,
+         preferences=user.preferences
+    )
+
+    # Return the combined LoginResponse
+    return LoginResponse(
+        access_token=access_token,
+        expires_at=expires_at,
+        user=user_response
+    )
+
+
+@router.get(
+    "/me",
+    response_model=UserResponse,
+    summary="Get current user details"
+)
+async def read_users_me(
+    current_user: Annotated[User, Depends(auth.get_current_active_user)]
+) -> UserResponse:
+    """
+    Returns the details of the currently authenticated and active user.
+    """
+    # The dependency already fetches and validates the user.
+    # We just need to format it as UserResponse.
+    return UserResponse(
+         id=current_user.id,
+         username=current_user.username,
+         email=current_user.email,
+         full_name=current_user.full_name,
+         created_at=current_user.created_at,
+         updated_at=current_user.updated_at,
+         is_active=not current_user.disabled,
+         preferences=current_user.preferences
+    )
+
+# TODO: Add PUT /me endpoint if needed for profile updates (similar to original file)
+
+@router.post(
+     "/refresh-token",
+     response_model=Token, # Use the simple Token model from schemas
+     summary="Refresh access token"
+)
+async def refresh_access_token(
+    current_user: Annotated[User, Depends(auth.get_current_active_user)]
+) -> Token:
+    """
+    Generates a new access token for the currently authenticated user.
+    Requires a valid, non-expired token to access this endpoint.
+    """
+    logger.info(f"Refreshing token for user: {current_user.username}")
+    settings = auth.get_settings()
+    new_expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    new_access_token = auth.create_access_token(
+        data={"sub": current_user.username},
+        expires_delta=new_expires_delta
+    )
+    new_expires_at = datetime.now(timezone.utc) + new_expires_delta
+
+    return Token(access_token=new_access_token, expires_at=new_expires_at, token_type="bearer")
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_200_OK,
+    summary="Log out user (client-side action)"
+)
 async def logout(
-    response: Response,
-    current_user: Annotated[User, Depends(get_current_active_user)]
-) -> Dict:
+    response: Response, # Inject Response object to potentially clear cookies
+    current_user: Annotated[User, Depends(auth.get_current_active_user)] # Verify user is logged in
+) -> Dict[str, str]:
     """
-    Logout user.
-    
-    Note: JWT tokens cannot be invalidated server-side.
-    This endpoint is mainly for client-side cleanup purposes.
-    
-    Args:
-        response: FastAPI response
-        current_user: Current authenticated user from dependency
-        
-    Returns:
-        Dict: Logout confirmation
+    Logs the logout action. JWT tokens cannot be invalidated server-side.
+    This endpoint primarily serves to allow the client to perform cleanup
+    and potentially clear any client-side storage (like cookies).
     """
-    # Log the logout event
-    logger.info(f"User logged out: {current_user.username}")
-    
-    # Set an expired cookie to help client clear the token
-    response.delete_cookie(key="access_token")
-    
+    logger.info(f"User logged out: {current_user.username} (ID: {current_user.id})")
+
+    # Optional: Clear an HttpOnly cookie if the token was stored there
+    # response.delete_cookie(key="access_token", httponly=True, secure=True, samesite="lax")
+
     return {"message": "Successfully logged out"}
 
 
-@router.post("/change-password")
+@router.post(
+    "/change-password",
+    status_code=status.HTTP_200_OK,
+    summary="Change current user's password"
+)
 async def change_password(
-    password_data: Dict,
-    current_user: Annotated[User, Depends(get_current_active_user)]
-) -> Dict:
+    password_data: PasswordChangeRequest,
+    current_user: Annotated[User, Depends(auth.get_current_active_user)]
+) -> Dict[str, str]:
     """
-    Change user password.
-    
-    Args:
-        password_data: Password change data including old_password and new_password
-        current_user: Current authenticated user from dependency
-        
-    Returns:
-        Dict: Password change confirmation
-        
-    Raises:
-        HTTPException: If password change fails
+    Allows the currently authenticated user to change their password
+    after verifying their old password.
     """
-    try:
-        # Validate request
-        if "old_password" not in password_data or "new_password" not in password_data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Both old_password and new_password are required"
-            )
-        
-        # Validate new password
-        if len(password_data["new_password"]) < 8:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="New password must be at least 8 characters long"
-            )
-        
-        # Verify old password
-        from auth import verify_password
-        db = get_db_manager()
-        user = await db.get_user_by_username(current_user.username)
-        
-        if not verify_password(password_data["old_password"], user.hashed_password):
-            logger.warning(f"Password change attempt with incorrect old password: {current_user.username}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Incorrect old password"
-            )
-        
-        # Update password
-        new_hashed_password = get_password_hash(password_data["new_password"])
-        success = await db.update_user(
-            current_user.id, 
-            {"hashed_password": new_hashed_password}
-        )
-        
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update password"
-            )
-        
-        logger.info(f"Password changed successfully for user: {current_user.username}")
-        
-        return {"message": "Password changed successfully"}
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error changing password: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Password change failed: {str(e)}"
-        )
+    db = get_db_manager()
+    logger.info(f"Password change attempt for user: {current_user.username}")
+
+    # Fetch the user data including the hashed password
+    user_in_db = await db.get_user(current_user.id) # Fetch full user data again
+    if not user_in_db or not hasattr(user_in_db, 'hashed_password'):
+         logger.error(f"Could not retrieve hashed password for user {current_user.username} during password change.")
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify user data.")
+
+    # Verify the old password
+    if not auth.verify_password(password_data.old_password, user_in_db.hashed_password):
+        logger.warning(f"Password change failed for {current_user.username}: Incorrect old password.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect old password")
+
+    # Hash the new password
+    new_hashed_password = auth.get_password_hash(password_data.new_password)
+
+    # Update the user's password in the database
+    success = await db.update_user(current_user.id, {"hashed_password": new_hashed_password})
+
+    if not success:
+        logger.error(f"Failed to update password in database for user {current_user.username}.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update password")
+
+    logger.info(f"Password changed successfully for user: {current_user.username}")
+    return {"message": "Password changed successfully"}
 
 
-@router.get("/verify-token")
+@router.get(
+    "/verify-token",
+    status_code=status.HTTP_200_OK,
+    summary="Verify if the current token is valid"
+)
 async def verify_token(
-    current_user: Annotated[User, Depends(get_current_active_user)]
-) -> Dict:
+    current_user: Annotated[User, Depends(auth.get_current_active_user)] # Dependency handles verification
+) -> Dict[str, Any]:
     """
-    Verify if access token is valid.
-    
-    Args:
-        current_user: Current authenticated user from dependency
-        
-    Returns:
-        Dict: Token verification result
+    Confirms that the provided access token is valid and the user is active.
+    Useful for client-side checks upon application load.
     """
+    # If the dependency `get_current_active_user` runs successfully, the token is valid.
+    logger.debug(f"Token verified successfully for user: {current_user.username}")
     return {
         "valid": True,
+        "user_id": current_user.id,
         "username": current_user.username
     }
+
+# TODO: Add endpoint for Google Sign-In if needed, using auth.validate_google_id_token
+# Example:
+# @router.post("/google-login")
+# async def google_login(token_request: Dict[str, str]):
+#     google_token = token_request.get("google_id_token")
+#     if not google_token: raise HTTPException(...)
+#     payload = await auth.validate_google_id_token(google_token)
+#     email = payload.get("email")
+#     # Find or create user based on email
+#     # Generate JWT token for the user
+#     # Return LoginResponse

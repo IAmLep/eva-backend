@@ -1,13 +1,8 @@
 """
 WebSocket Manager for EVA backend.
 
-This module provides WebSocket connections for real-time communication
-with the EVA backend, including streaming responses and memory integration.
-
-Update your existing websocket_manager.py with this enhanced version.
-
-Current Date: 2025-04-13
-Current User: IAmLep
+Handles real-time WebSocket connections for chat and audio streaming,
+integrating with ConversationHandler for processing and response generation.
 """
 
 import asyncio
@@ -22,12 +17,15 @@ from typing import Any, Dict, List, Optional, Set, Union
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, Field
 
-from auth import get_current_user
+# --- Local Imports ---
+from auth import get_current_user, validate_request_auth # Use generalized auth validation
 from config import get_settings
-from context_window import get_context_window
-from memory_manager import get_memory_manager, MemoryType, MemoryCommand
-from llm_service import GeminiService, process_audio_stream, generate_voice_response
+# Import the handler
+from conversation_handler import ConversationHandler
+# Import LLM service functions used directly (audio)
+from llm_service import transcribe_audio, generate_voice_response # Keep direct audio functions for now
 from models import User
+from exceptions import AuthenticationError # Import specific exception
 
 # Setup router
 router = APIRouter()
@@ -35,530 +33,320 @@ router = APIRouter()
 # Logger configuration
 logger = logging.getLogger(__name__)
 
-# Active connections store
+# --- Connection Management ---
+# Use dictionaries keyed by session_id for better tracking
 active_connections: Dict[str, WebSocket] = {}
-user_sessions: Dict[str, Dict[str, Any]] = {}
+# Store handler instances associated with sessions
+active_sessions: Dict[str, ConversationHandler] = {}
 
-
+# --- WebSocket Message Models ---
 class WebSocketMessage(BaseModel):
-    """
-    WebSocket message model.
-    
-    Attributes:
-        message_type: Type of message: text, audio, command
-        content: Message content
-        session_id: Optional session identifier
-        metadata: Optional additional metadata
-    """
+    """Incoming WebSocket message structure."""
     message_type: str = Field(..., description="Type of message: text, audio, command")
     content: Any
-    session_id: Optional[str] = None
+    session_id: Optional[str] = None # Client might send existing session ID to resume
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
-
 class StreamingResponse(BaseModel):
-    """
-    Streaming response model.
-    
-    Attributes:
-        response_type: Type of response: text, audio, error, etc.
-        content: Response content
-        session_id: Session identifier
-        is_final: Whether this is the final chunk
-        function_calls: Optional function calls
-    """
-    response_type: str
+    """Outgoing WebSocket message structure."""
+    response_type: str # e.g., "text_chunk", "full_text", "function_call", "error", "info", "transcription"
     content: Any
     session_id: str
-    is_final: bool = False
-    function_calls: Optional[List[Dict[str, Any]]] = None
+    is_final: bool = False # Indicates the end of a logical response sequence
+    # Add other fields as needed, e.g., for function calls
+    function_call_info: Optional[Dict[str, Any]] = None
 
 
-class ConversationSession:
-    """
-    Conversation session manager for WebSocket connections.
-    
-    Manages the state of an ongoing conversation with context and memory.
-    """
-    def __init__(self, user: User, session_id: Optional[str] = None):
-        """
-        Initialize a conversation session.
-        
-        Args:
-            user: The user who owns this session
-            session_id: Optional session ID (generated if not provided)
-        """
-        self.user = user
-        self.session_id = session_id or str(uuid.uuid4())
-        self.context_window = get_context_window()
-        self.memory_manager = get_memory_manager()
-        self.gemini_service = GeminiService()
-        self.start_time = datetime.utcnow()
-        self.last_activity = self.start_time
-        self.message_count = 0
-        
-        # Add system instructions
-        self._add_system_instructions()
-        
-        logger.info(f"Created conversation session {self.session_id} for user {user.id}")
-    
-    def _add_system_instructions(self):
-        """Add system instructions to the context window."""
-        # Add persona instruction
-        self.context_window.add_system_instruction(
-            "You are EVA, an advanced AI assistant designed to be helpful, accurate, and conversational. "
-            "You have a friendly, supportive personality and should respond in a natural, human-like way. "
-            "Always maintain a helpful, positive tone while remaining truthful and informative."
-        )
-        
-        # Add current date/time instruction
-        current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        self.context_window.add_system_instruction(
-            f"Current date and time: {current_time}"
-        )
-        
-        # Add user-specific instruction
-        self.context_window.add_system_instruction(
-            f"You are speaking with {self.user.username}. Refer to them by name occasionally "
-            f"to personalize the conversation."
-        )
-    
-    async def process_message(self, message: str) -> Optional[MemoryCommand]:
-        """
-        Process a user message and update the context.
-        
-        Args:
-            message: User message
-            
-        Returns:
-            Optional[MemoryCommand]: Memory command if detected
-        """
-        # Check for memory commands
-        memory_command = await self.memory_manager.extract_memory_command(message)
-        
-        # Add message to context
-        self.context_window.add_message("user", message)
-        self.message_count += 1
-        self.last_activity = datetime.utcnow()
-        
-        return memory_command
-    
-    async def get_response(
-        self, 
-        stream: bool = True,
-        websocket: Optional[WebSocket] = None
-    ) -> str:
-        """
-        Get response for the current context.
-        
-        Args:
-            stream: Whether to stream the response
-            websocket: Optional WebSocket for streaming
-            
-        Returns:
-            str: Generated response
-        """
-        try:
-            # Refresh relevant memories
-            await self.context_window.refresh_memories(
-                self.user.id,
-                # Use the last few messages to find relevant memories
-                " ".join([m.content for m in self.context_window.recent_messages[-3:]])
-            )
-            
-            # Assemble context
-            context = self.context_window.assemble_context()
-            
-            if stream and websocket:
-                # Stream the response
-                full_response = ""
-                async for chunk in self.gemini_service.stream_conversation(context):
-                    full_response += chunk
-                    await send_stream_response(
-                        websocket,
-                        chunk,
-                        self.session_id,
-                        False
-                    )
-                
-                # Send final message
-                await send_stream_response(
-                    websocket,
-                    full_response,
-                    self.session_id,
-                    True
-                )
-                
-                # Add assistant response to context
-                self.context_window.add_message("assistant", full_response)
-                return full_response
-            else:
-                # Generate complete response
-                response, _, _ = await self.gemini_service.generate_text(context)
-                
-                # Add assistant response to context
-                self.context_window.add_message("assistant", response)
-                return response
-                
-        except Exception as e:
-            logger.error(f"Error generating response: {str(e)}")
-            raise
-    
-    async def handle_memory_command(self, command: MemoryCommand) -> str:
-        """
-        Handle a memory command.
-        
-        Args:
-            command: Memory command to execute
-            
-        Returns:
-            str: Response confirming the action
-        """
-        try:
-            if command.command_type == "remember":
-                # Create a core memory
-                category = command.category or MemoryType.CORE
-                await self.memory_manager.create_core_memory(
-                    user_id=self.user.id,
-                    content=command.content,
-                    category=category,
-                    entity=command.entity
-                )
-                return f"I'll remember that: {command.content}"
-                
-            elif command.command_type == "remind":
-                # Create an event memory
-                if command.event_time:
-                    await self.memory_manager.create_event_memory(
-                        user_id=self.user.id,
-                        content=command.content,
-                        event_time=command.event_time,
-                        expiration=command.expiration
-                    )
-                    event_time_str = command.event_time.strftime("%Y-%m-%d %H:%M")
-                    return f"I'll remind you at {event_time_str}: {command.content}"
-                else:
-                    return "I couldn't determine the time for your reminder. Please specify a time."
-                
-            elif command.command_type == "forget":
-                # This would require searching for the memory first
-                return "I'm not sure which memory to forget. Could you be more specific?"
-                
-            return "I'm not sure how to process that command."
-            
-        except Exception as e:
-            logger.error(f"Error handling memory command: {str(e)}")
-            return f"I encountered an error processing your request: {str(e)}"
-
+# --- Helper Functions ---
 
 async def authenticate_websocket(websocket: WebSocket) -> Optional[User]:
-    """
-    Authenticate WebSocket connection.
-    
-    Args:
-        websocket: WebSocket connection
-        
-    Returns:
-        Optional[User]: Authenticated user or None if authentication failed
-    """
-    try:
-        # Get token from query parameters or headers
-        token = websocket.query_params.get("token")
-        if not token and "authorization" in websocket.headers:
-            auth_header = websocket.headers["authorization"]
-            if auth_header.startswith("Bearer "):
-                token = auth_header[7:]  # Remove 'Bearer ' prefix
-        
-        if not token:
-            return None
-            
-        # Validate token and get user
-        from auth import get_current_user
-        user = await get_current_user(token)
-        return user
-    except Exception as e:
-        logger.error(f"WebSocket authentication error: {str(e)}")
+    """Authenticates WebSocket connection using token from query param or header."""
+    token: Optional[str] = None
+    # 1. Check query parameter
+    token = websocket.query_params.get("token")
+
+    # 2. Check Authorization header if no query param
+    if not token:
+        auth_header = websocket.headers.get("authorization")
+        if auth_header and auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1]
+
+    # 3. Check Sec-WebSocket-Protocol (less common but possible)
+    if not token:
+         protocols = websocket.headers.get("sec-websocket-protocol", "").split(',')
+         for proto in protocols:
+              proto = proto.strip()
+              if proto.lower().startswith("bearer_"):
+                   token = proto.split('_', 1)[1]
+                   break # Found token
+
+    if not token:
+        logger.warning("WebSocket connection attempt without token.")
         return None
 
-
-async def send_stream_response(
-    websocket: WebSocket,
-    content: str,
-    session_id: str,
-    is_final: bool = False
-) -> None:
-    """
-    Send streaming response to WebSocket.
-    
-    Args:
-        websocket: WebSocket connection
-        content: Response content
-        session_id: Session identifier
-        is_final: Whether this is the final chunk
-    """
     try:
-        response = StreamingResponse(
-            response_type="text",
-            content=content,
-            session_id=session_id,
-            is_final=is_final
-        )
-        await websocket.send_json(response.dict())
+        # Use the same validation as HTTP requests for consistency
+        # Need to simulate a request object or adapt validate_request_auth
+        # Simplified: directly use get_current_user which expects token string
+        user = await get_current_user(token)
+        if user and not user.disabled:
+            logger.info(f"WebSocket authenticated for user: {user.id} ({user.username})")
+            return user
+        elif user:
+            logger.warning(f"WebSocket authentication failed: User {user.id} is disabled.")
+            return None
+        else:
+             # get_current_user raises exception on invalid token/user not found
+             return None
+    except AuthenticationError as e:
+        logger.warning(f"WebSocket authentication failed: {e.detail}")
+        return None
     except Exception as e:
-        logger.error(f"Error sending stream response: {str(e)}")
+        logger.error(f"Unexpected WebSocket authentication error: {e}", exc_info=True)
+        return None
 
-
-async def send_error(
-    websocket: WebSocket,
-    error_message: str,
-    session_id: str
-) -> None:
-    """
-    Send error message to WebSocket.
-    
-    Args:
-        websocket: WebSocket connection
-        error_message: Error message
-        session_id: Session identifier
-    """
+async def send_websocket_response(websocket: WebSocket, response_data: StreamingResponse):
+    """Sends a structured response over the WebSocket."""
     try:
-        response = StreamingResponse(
-            response_type="error",
-            content=error_message,
-            session_id=session_id,
-            is_final=True
-        )
-        await websocket.send_json(response.dict())
+        await websocket.send_json(response_data.model_dump(exclude_none=True))
+    except WebSocketDisconnect:
+        # Handle disconnect during send if necessary, though usually caught in main loop
+        logger.warning(f"Attempted to send to disconnected WebSocket (Session: {response_data.session_id})")
     except Exception as e:
-        logger.error(f"Error sending error message: {str(e)}")
+        logger.error(f"Error sending WebSocket response (Session: {response_data.session_id}): {e}", exc_info=True)
 
+async def close_websocket_session(session_id: str, code: int = status.WS_1000_NORMAL_CLOSURE, reason: str = "Session ended"):
+    """Closes a WebSocket connection and cleans up resources."""
+    websocket = active_connections.pop(session_id, None)
+    session_handler = active_sessions.pop(session_id, None) # Changed variable name
+    if websocket:
+        try:
+            await websocket.close(code=code, reason=reason)
+            logger.info(f"WebSocket connection closed for session {session_id}. Reason: {reason}")
+        except RuntimeError as e:
+             # Catch errors if socket is already closed
+             logger.warning(f"Error closing WebSocket for session {session_id} (possibly already closed): {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error closing WebSocket for session {session_id}: {e}", exc_info=True)
+    if session_handler:
+         # Perform any cleanup needed for the handler/context
+         # e.g., session_handler.context_window.save_state() if needed
+         logger.debug(f"Cleaned up handler for session {session_id}")
+
+
+# --- WebSocket Endpoints ---
 
 @router.websocket("/chat")
-async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time chat.
-    
-    This endpoint handles authentication, message processing, and streaming responses.
-    """
-    # Authenticate user
+async def websocket_chat_endpoint(websocket: WebSocket):
+    """Handles real-time text-based chat conversations via WebSocket."""
     user = await authenticate_websocket(websocket)
     if not user:
+        # Close unauthorized connection immediately
+        await websocket.accept() # Must accept before closing with code
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Unauthorized")
         return
-    
-    # Accept connection
+
     await websocket.accept()
-    logger.info(f"WebSocket connection accepted for user {user.id}")
-    
-    # Create session or get existing one
+
+    # Initialize session
     session_id = str(uuid.uuid4())
-    session = ConversationSession(user, session_id)
-    
-    # Store connection
+    handler = ConversationHandler(user, session_id)
     active_connections[session_id] = websocket
-    user_sessions[session_id] = session
-    
+    active_sessions[session_id] = handler # Store handler instance
+    logger.info(f"Chat WebSocket session {session_id} started for user {user.id}")
+
+    # Send session ID confirmation
+    await send_websocket_response(websocket, StreamingResponse(
+        response_type="info",
+        content={"message": "Session started.", "session_id": session_id},
+        session_id=session_id,
+        is_final=True # This specific info message is final
+    ))
+
     try:
-        # Send initial greeting
-        await send_stream_response(
-            websocket,
-            "Hello! How can I help you today?",
-            session_id,
-            True
-        )
-        
-        # Main message loop
         while True:
-            # Receive message
-            data = await websocket.receive_json()
-            
+            raw_data = await websocket.receive_text() # Use receive_text for flexibility, parse JSON manually
             try:
-                # Parse message
+                data = json.loads(raw_data)
                 message = WebSocketMessage(**data)
-                
+                logger.debug(f"Received message (Session: {session_id}): Type={message.message_type}")
+
                 if message.message_type == "text":
-                    # Process text message
-                    memory_command = await session.process_message(message.content)
-                    
-                    if memory_command:
-                        # Handle memory command
-                        response = await session.handle_memory_command(memory_command)
-                        await send_stream_response(websocket, response, session_id, True)
-                    else:
-                        # Get normal response
-                        await session.get_response(stream=True, websocket=websocket)
-                        
-                elif message.message_type == "audio":
-                    # Process audio message
-                    try:
-                        audio_data = base64.b64decode(message.content)
-                        text = await process_audio_stream(audio_data)
-                        
-                        # Process the transcribed text
-                        memory_command = await session.process_message(text)
-                        
-                        # Send transcription back to client
-                        await send_stream_response(
-                            websocket,
-                            f"Transcription: {text}",
-                            session_id,
-                            False
-                        )
-                        
-                        if memory_command:
-                            response = await session.handle_memory_command(memory_command)
-                            await send_stream_response(websocket, response, session_id, True)
-                        else:
-                            await session.get_response(stream=True, websocket=websocket)
-                    except Exception as e:
-                        logger.error(f"Audio processing error: {str(e)}")
-                        await send_error(websocket, f"Failed to process audio: {str(e)}", session_id)
-                
+                    if not message.content or not isinstance(message.content, str):
+                         raise ValueError("Text message content cannot be empty.")
+
+                    # Use the ConversationHandler's generator
+                    response_generator = handler.process_message(message.content)
+                    async for chunk in response_generator:
+                        response_type = "text_chunk" # Default for text
+                        is_final = chunk.get("is_final", False)
+                        content = None
+                        func_call_info = None
+
+                        if "text" in chunk:
+                            content = chunk["text"]
+                            # Could differentiate final text chunk type if desired
+                            # if is_final: response_type = "full_text"
+                        elif "function_call" in chunk:
+                            response_type = "function_call"
+                            content = f"Function call requested: {chunk['function_call']['name']}" # Info for client
+                            func_call_info = chunk['function_call']
+                            # Decide if function call implies is_final=True for this turn
+                            # is_final = True # Or based on chunk flag
+                        elif "error" in chunk:
+                            response_type = "error"
+                            content = chunk["error"]
+                            is_final = True # Errors are usually final for the turn
+
+                        if content is not None:
+                            await send_websocket_response(websocket, StreamingResponse(
+                                response_type=response_type,
+                                content=content,
+                                session_id=session_id,
+                                is_final=is_final,
+                                function_call_info=func_call_info
+                            ))
+
                 elif message.message_type == "command":
-                    # Process custom command
+                    # Handle client-side commands like clear context, end session
                     command = message.content
-                    if command == "clear_context":
-                        session.context_window.clear()
-                        session._add_system_instructions()
-                        await send_stream_response(
-                            websocket,
-                            "Context cleared. Starting a fresh conversation.",
-                            session_id,
-                            True
-                        )
+                    if command == "end_session":
+                         logger.info(f"Client requested end_session for session {session_id}")
+                         await close_websocket_session(session_id, reason="Client ended session")
+                         break # Exit loop
+                    # Add other commands as needed
+                    # elif command == "clear_context":
+                    #     handler.context_window.clear() ... send confirmation
                     else:
-                        await send_error(
-                            websocket,
-                            f"Unknown command: {command}",
-                            session_id
-                        )
-                
-                else:
-                    await send_error(
-                        websocket,
-                        f"Unsupported message type: {message.message_type}",
-                        session_id
-                    )
-                    
-            except Exception as e:
-                logger.error(f"Error processing message: {str(e)}")
-                await send_error(websocket, f"Error: {str(e)}", session_id)
-    
+                         await send_websocket_response(websocket, StreamingResponse(
+                              response_type="error", content=f"Unknown command: {command}", session_id=session_id, is_final=True
+                         ))
+
+                # Add handling for other message types if needed (e.g., function_result)
+
+            except json.JSONDecodeError:
+                logger.warning(f"Received invalid JSON via WebSocket (Session: {session_id})")
+                await send_websocket_response(websocket, StreamingResponse(
+                    response_type="error", content="Invalid JSON message format.", session_id=session_id, is_final=True
+                ))
+            except Exception as e: # Catch errors during message processing
+                logger.exception(f"Error processing WebSocket message (Session: {session_id}): {e}", exc_info=True)
+                await send_websocket_response(websocket, StreamingResponse(
+                    response_type="error", content=f"An error occurred: {e}", session_id=session_id, is_final=True
+                ))
+
     except WebSocketDisconnect:
-        # Handle disconnection
-        logger.info(f"WebSocket disconnected for session {session_id}")
-        if session_id in active_connections:
-            del active_connections[session_id]
-        if session_id in user_sessions:
-            del user_sessions[session_id]
-    
+        logger.info(f"Chat WebSocket disconnected (Session: {session_id})")
     except Exception as e:
-        # Handle other errors
-        logger.error(f"WebSocket error: {str(e)}")
-        try:
-            await send_error(websocket, f"Server error: {str(e)}", session_id)
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        except:
-            pass
-        
-        if session_id in active_connections:
-            del active_connections[session_id]
-        if session_id in user_sessions:
-            del user_sessions[session_id]
+        logger.exception(f"Unexpected error in chat WebSocket loop (Session: {session_id}): {e}", exc_info=True)
+    finally:
+        # Ensure cleanup happens regardless of how the loop exits
+        await close_websocket_session(session_id, reason="Connection closed or error")
 
 
-@router.websocket("/audio-stream")
-async def audio_streaming_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for audio streaming.
-    
-    This endpoint handles real-time audio transcription and response generation.
-    """
-    # Similar authentication and session setup as the chat endpoint
+@router.websocket("/audio")
+async def websocket_audio_endpoint(websocket: WebSocket):
+    """Handles real-time audio streaming, transcription, and voice response."""
     user = await authenticate_websocket(websocket)
     if not user:
+        await websocket.accept()
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Unauthorized")
         return
-    
-    # Accept connection
+
     await websocket.accept()
-    logger.info(f"Audio WebSocket connection accepted for user {user.id}")
-    
-    # Create session
+
     session_id = str(uuid.uuid4())
-    session = ConversationSession(user, session_id)
-    
-    # Handle audio streaming
-    # This is a simplified implementation
+    handler = ConversationHandler(user, session_id) # Use the same handler
+    active_connections[session_id] = websocket
+    active_sessions[session_id] = handler
+    logger.info(f"Audio WebSocket session {session_id} started for user {user.id}")
+
+    await send_websocket_response(websocket, StreamingResponse(
+        response_type="info",
+        content={"message": "Audio session started.", "session_id": session_id},
+        session_id=session_id,
+        is_final=True
+    ))
+
+    audio_buffer = bytearray()
+    # Add state for VAD (Voice Activity Detection) if implementing chunking
+
     try:
         while True:
-            # Receive audio chunk
-            message = await websocket.receive_text()
-            data = json.loads(message)
-            
-            if "audio" in data:
-                # Process audio chunk
-                audio_data = base64.b64decode(data["audio"])
-                
-                # For simplicity, we're assuming complete audio in each message
-                # In a real implementation, you might buffer chunks until complete
-                try:
-                    text = await process_audio_stream(audio_data)
-                    
-                    # Process the transcribed text
-                    memory_command = await session.process_message(text)
-                    
-                    # Send transcription to client
-                    await send_stream_response(
-                        websocket,
-                        f"Transcription: {text}",
-                        session_id,
-                        False
-                    )
-                    
-                    # Generate and send response
-                    if memory_command:
-                        response = await session.handle_memory_command(memory_command)
-                    else:
-                        response = await session.get_response(stream=False)
-                    
-                    # Generate voice response if requested
-                    if data.get("voice_response", False):
-                        try:
-                            audio_bytes = await generate_voice_response(response)
-                            voice_response = StreamingResponse(
-                                response_type="audio",
-                                content=audio_bytes.decode(),
-                                session_id=session_id,
-                                is_final=True
-                            )
-                            await websocket.send_json(voice_response.dict())
-                        except Exception as e:
-                            logger.error(f"Voice generation error: {str(e)}")
-                            # Fall back to text response
-                            await send_stream_response(websocket, response, session_id, True)
-                    else:
-                        await send_stream_response(websocket, response, session_id, True)
-                
-                except Exception as e:
-                    logger.error(f"Audio processing error: {str(e)}")
-                    await send_error(websocket, f"Failed to process audio: {str(e)}", session_id)
-            
-            elif data.get("command") == "end_session":
-                await send_stream_response(
-                    websocket,
-                    "Audio session ended",
-                    session_id,
-                    True
-                )
-                break
-    
+            # Receive binary audio data or control messages (JSON)
+            raw_data = await websocket.receive_bytes() # Primarily expect bytes for audio
+
+            # Basic check: If data looks like JSON, treat as control message
+            try:
+                 # Attempt to decode as UTF-8 and parse JSON
+                 control_msg_str = raw_data.decode('utf-8')
+                 control_msg_data = json.loads(control_msg_str)
+                 message = WebSocketMessage(**control_msg_data)
+
+                 if message.message_type == "command":
+                      if message.content == "end_audio_stream":
+                           logger.info(f"Client signaled end of audio stream for session {session_id}. Processing buffer...")
+                           # Process any remaining audio in the buffer
+                           if audio_buffer:
+                                # --- Process buffered audio ---
+                                try:
+                                    transcribed_text = await transcribe_audio(bytes(audio_buffer))
+                                    audio_buffer.clear() # Clear buffer after processing
+                                    if not transcribed_text: raise ValueError("Transcription failed or empty.")
+
+                                    await send_websocket_response(websocket, StreamingResponse(
+                                        response_type="transcription", content=transcribed_text, session_id=session_id, is_final=False
+                                    ))
+
+                                    # Process text with conversation handler (streaming response)
+                                    response_generator = handler.process_message(transcribed_text)
+                                    async for chunk in response_generator:
+                                        # ... (send chunks as in chat endpoint) ...
+                                        response_type = "text_chunk"
+                                        is_final = chunk.get("is_final", False)
+                                        content = chunk.get("text") or chunk.get("error") # Prioritize text/error
+                                        func_call_info = chunk.get("function_call")
+
+                                        if content:
+                                            await send_websocket_response(websocket, StreamingResponse(
+                                                response_type="error" if "error" in chunk else response_type,
+                                                content=content, session_id=session_id, is_final=is_final,
+                                                function_call_info=func_call_info
+                                            ))
+                                except Exception as audio_proc_err:
+                                     logger.error(f"Error processing buffered audio (Session: {session_id}): {audio_proc_err}", exc_info=True)
+                                     await send_websocket_response(websocket, StreamingResponse(
+                                          response_type="error", content=f"Error processing audio: {audio_proc_err}", session_id=session_id, is_final=True
+                                     ))
+                           else:
+                                logger.info(f"End of audio stream signal received, buffer empty (Session: {session_id}).")
+                           # Optionally wait for final response processing before breaking?
+                           # For now, break after processing buffer.
+
+                      elif message.content == "end_session":
+                           logger.info(f"Client requested end_session via audio socket for session {session_id}")
+                           await close_websocket_session(session_id, reason="Client ended session")
+                           break # Exit loop
+                      else:
+                           logger.warning(f"Received unknown command via audio socket: {message.content}")
+                 continue # Skip audio processing if it was a control message
+
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                 # Assume it's binary audio data if decoding/parsing fails
+                 audio_buffer.extend(raw_data)
+                 logger.debug(f"Received audio chunk: {len(raw_data)} bytes. Buffer size: {len(audio_buffer)} (Session: {session_id})")
+                 # TODO: Implement VAD or chunking logic here.
+                 # If a complete utterance is detected (e.g., silence after speech),
+                 # process the audio_buffer like in the "end_audio_stream" block above.
+                 # For now, we only process on explicit "end_audio_stream" command.
+
     except WebSocketDisconnect:
-        logger.info(f"Audio WebSocket disconnected for session {session_id}")
-    
+        logger.info(f"Audio WebSocket disconnected (Session: {session_id})")
+        # Process any remaining buffer on disconnect? Optional.
+        if audio_buffer:
+             logger.info(f"Processing remaining audio buffer ({len(audio_buffer)} bytes) on disconnect (Session: {session_id}).")
+             # Add processing logic here if desired
     except Exception as e:
-        logger.error(f"Audio WebSocket error: {str(e)}")
-        try:
-            await send_error(websocket, f"Server error: {str(e)}", session_id)
-        except:
-            pass
+        logger.exception(f"Unexpected error in audio WebSocket loop (Session: {session_id}): {e}", exc_info=True)
+    finally:
+        await close_websocket_session(session_id, reason="Connection closed or error")

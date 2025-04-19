@@ -1,19 +1,30 @@
-fastapi>=0.108.0
-uvicorn[standard]>=0.25.0
-pydantic>=2.5.2
-pydantic-settings>=2.1.0
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-cryptography>=41.0.7
-firebase-admin>=6.2.0
-google-cloud-firestore>=2.13.1
-google-generativeai>=0.3.1
-google-auth>=2.15.0
-python-dateutil>=2.8.2
-cachetools>=5.0.0
-python-json-logger>=2.0.0
-httpx>=0.25.2 # For api_tools (weather)
-email-validator>=2.1.0 # For pydantic EmailStr
-python-multipart>=0.0.6 # For OAuth2PasswordRequestForm
+# --- Core Web Framework ---
+fastapi>=0.108.0               # The main asynchronous web framework for building APIs
+uvicorn[standard]>=0.25.0      # ASGI server to run FastAPI (includes performance extras like uvloop)
+
+# --- Data Validation and Settings ---
+pydantic                       # Data validation and parsing library (used heavily by FastAPI)
+pydantic-settings              # For loading application settings from env vars, .env files using Pydantic models
+
+# --- Authentication and Security ---
+python-jose[cryptography]>=3.3.0 # For handling JSON Web Tokens (JWT) encoding/decoding
+passlib[bcrypt]>=1.7.4         # For securely hashing and verifying passwords (using bcrypt)
+cryptography>=41.0.7           # Low-level cryptographic library (often a dependency for security libs)
+email-validator>=2.1.0         # For validating email addresses (used by Pydantic's EmailStr)
+python-multipart>=0.0.6        # Required by FastAPI for parsing form data (e.g., for OAuth2 password flow)
+
+# --- Database (Firebase/Firestore) ---
+firebase-admin>=6.2.0          # Google's SDK for interacting with Firebase services (incl. Firestore) from backend
+google-cloud-firestore>=2.13.1 # Specific client library for Google Cloud Firestore (often used by firebase-admin)
+
+# --- LLM / AI Services (Google Gemini) ---
+google-generativeai>=0.3.1     # Google's client library for interacting with Gemini models
+google-auth>=2.15.0            # Google's library for handling authentication (used by many Google Cloud libs)
+
+# --- Utilities ---
+python-dateutil>=2.8.2         # Useful for parsing dates/times in various formats
+cachetools>=5.0.0              # Simple in-memory caching utilities (used for rate limiting, etc.)
+python-json-logger>=2.0.0      # For outputting logs in JSON format, useful for structured logging
+httpx>=0.25.2                  # Modern asynchronous HTTP client (useful for calling external APIs, like weather)
 
 # Add others like requests, tiktoken, testing libs etc. if used

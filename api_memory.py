@@ -2,12 +2,7 @@
 Memory API endpoints for EVA backend.
 
 This module provides API endpoints for managing the memory system,
-including creating, retrieving, updating, and deleting memories.
-
-Create this new file to add memory management endpoints.
-
-Current Date: 2025-04-13 11:13:26
-Current User: IAmLep
+including creating, retrieving, updating, deleting, and extracting memories.
 """
 
 import logging
@@ -19,9 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Path, Body, status
 from pydantic import BaseModel, Field
 
 from auth import get_current_user
-from memory_manager import get_memory_manager, MemoryType, MemoryCategory
-from memory_extractor import get_memory_extractor
-from models import Memory, User, CoreMemory, EventMemory
+# Corrected import from memory_manager
+from memory_manager import get_memory_manager, MemoryCategory
+from memory_extractor import get_memory_extractor, MemoryCommand # Import MemoryCommand if extractor returns it
+# Corrected import from models - Removed CoreMemory, EventMemory
+from models import Memory, User, MemorySource # Import MemorySource
 from config import get_settings
 
 # Logger configuration
@@ -31,22 +28,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/memory",
     tags=["memory"],
-    responses={404: {"description": "Not found"}}
+    responses={
+        401: {"description": "Unauthorized"},
+        404: {"description": "Not found"},
+        400: {"description": "Bad Request"},
+        500: {"description": "Internal Server Error"}
+    }
 )
 
 
-# Request and response models
+# --- Request and Response Models ---
+
 class CreateCoreMemoryRequest(BaseModel):
-    """
-    Request model for creating core memories.
-    
-    Attributes:
-        content: Memory content
-        category: Memory category
-        entity: Optional entity this memory relates to
-        importance: Importance score (1-10)
-        metadata: Optional additional metadata
-    """
+    """Request model for creating core memories."""
     content: str = Field(..., min_length=1, max_length=2000)
     category: MemoryCategory
     entity: Optional[str] = None
@@ -55,15 +49,7 @@ class CreateCoreMemoryRequest(BaseModel):
 
 
 class CreateEventMemoryRequest(BaseModel):
-    """
-    Request model for creating event memories.
-    
-    Attributes:
-        content: Event description
-        event_time: When the event occurs
-        expiration: Optional expiration time
-        metadata: Optional additional metadata
-    """
+    """Request model for creating event memories."""
     content: str = Field(..., min_length=1, max_length=2000)
     event_time: datetime
     expiration: Optional[datetime] = None
@@ -71,542 +57,290 @@ class CreateEventMemoryRequest(BaseModel):
 
 
 class MemoryResponse(BaseModel):
-    """
-    Response model for memory operations.
-    
-    Attributes:
-        memory_id: Memory identifier
-        content: Memory content
-        source: Memory source/type
-        metadata: Additional metadata
-        created_at: Creation timestamp
-        updated_at: Last update timestamp
-    """
+    """Response model for memory operations. Uses the base Memory model structure."""
     memory_id: str
     content: str
-    source: str
+    source: MemorySource
     metadata: Dict[str, Any]
     tags: List[str]
+    importance: int # Added importance to response
     created_at: datetime
     updated_at: datetime
+    expiration: Optional[datetime] = None # Added expiration to response
+
+    class Config:
+        from_attributes = True
 
 
 class MemoryListResponse(BaseModel):
-    """
-    Response model for memory list operations.
-    
-    Attributes:
-        memories: List of memories
-        count: Total count
-        has_more: Whether there are more results
-    """
+    """Response model for memory list operations."""
     memories: List[MemoryResponse]
     count: int
     has_more: bool
 
 
 class CreateMemoryResponse(BaseModel):
-    """
-    Response model for memory creation.
-    
-    Attributes:
-        memory_id: Created memory identifier
-        success: Success status
-    """
+    """Response model for memory creation."""
     memory_id: str
     success: bool
 
 
 class UpdateMemoryRequest(BaseModel):
-    """
-    Request model for updating memories.
-    
-    Attributes:
-        content: Optional new content
-        metadata: Optional metadata updates
-        tags: Optional tags updates
-    """
+    """Request model for updating memories. Allows partial updates."""
     content: Optional[str] = Field(None, min_length=1, max_length=2000)
     metadata: Optional[Dict[str, Any]] = None
     tags: Optional[List[str]] = None
+    importance: Optional[int] = Field(None, ge=1, le=10)
 
 
-# API endpoints
-@router.post("/core", response_model=CreateMemoryResponse)
+class ExtractMemoryResponse(BaseModel):
+    """Response model for memory extraction from text."""
+    command_found: bool = False
+    command_type: Optional[str] = None
+    command_content: Optional[str] = None
+    command_category: Optional[MemoryCategory] = None
+    command_entity: Optional[str] = None
+    command_event_time: Optional[datetime] = None
+    potential_memory: bool = False
+    potential_content: Optional[str] = None
+    potential_category: Optional[MemoryCategory] = None
+    potential_importance: Optional[int] = None
+
+
+# --- API Endpoints ---
+
+@router.post("/core", response_model=CreateMemoryResponse, status_code=status.HTTP_201_CREATED)
 async def create_core_memory(
     request: CreateCoreMemoryRequest,
-    user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user),
+    memory_manager = Depends(get_memory_manager)
 ):
-    """
-    Create a new core memory.
-    
-    Args:
-        request: Memory creation request
-        user: Authenticated user
-        
-    Returns:
-        CreateMemoryResponse: Creation response
-    """
+    """Create a new core memory (source = CORE)."""
     try:
-        memory_manager = get_memory_manager()
-        
-        memory = await memory_manager.create_core_memory(
+        final_metadata = request.metadata or {}
+        final_metadata['category'] = request.category.value
+        if request.entity:
+            final_metadata['entity'] = request.entity
+
+        memory = await memory_manager.add_memory(
             user_id=user.id,
             content=request.content,
-            category=request.category,
-            entity=request.entity,
+            source=MemorySource.CORE,
             importance=request.importance,
-            metadata=request.metadata or {}
+            metadata=final_metadata
         )
-        
         logger.info(f"Created core memory {memory.memory_id} for user {user.id}")
-        
-        return CreateMemoryResponse(
-            memory_id=memory.memory_id,
-            success=True
-        )
-    
+        return CreateMemoryResponse(memory_id=memory.memory_id, success=True)
     except Exception as e:
-        logger.error(f"Error creating core memory: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create memory: {str(e)}"
-        )
+        logger.exception(f"Error creating core memory for user {user.id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create core memory.")
 
 
-@router.post("/event", response_model=CreateMemoryResponse)
+@router.post("/event", response_model=CreateMemoryResponse, status_code=status.HTTP_201_CREATED)
 async def create_event_memory(
     request: CreateEventMemoryRequest,
-    user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user),
+    memory_manager = Depends(get_memory_manager)
 ):
-    """
-    Create a new event memory.
-    
-    Args:
-        request: Event memory creation request
-        user: Authenticated user
-        
-    Returns:
-        CreateMemoryResponse: Creation response
-    """
+    """Create a new event memory (source = EVENT)."""
     try:
-        memory_manager = get_memory_manager()
-        
-        memory = await memory_manager.create_event_memory(
+        final_metadata = request.metadata or {}
+        final_metadata['event_time'] = request.event_time.isoformat()
+        if request.expiration:
+            final_metadata['expiration'] = request.expiration.isoformat()
+
+        memory = await memory_manager.add_memory(
             user_id=user.id,
             content=request.content,
-            event_time=request.event_time,
-            expiration=request.expiration,
-            metadata=request.metadata or {}
+            source=MemorySource.EVENT,
+            importance=5, # Default importance for events
+            metadata=final_metadata,
+            expiration=request.expiration
         )
-        
         logger.info(f"Created event memory {memory.memory_id} for user {user.id}")
-        
-        return CreateMemoryResponse(
-            memory_id=memory.memory_id,
-            success=True
-        )
-    
+        return CreateMemoryResponse(memory_id=memory.memory_id, success=True)
     except Exception as e:
-        logger.error(f"Error creating event memory: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create event memory: {str(e)}"
-        )
+        logger.exception(f"Error creating event memory for user {user.id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create event memory.")
 
 
 @router.get("/{memory_id}", response_model=MemoryResponse)
 async def get_memory(
-    memory_id: str = Path(..., title="Memory ID"),
-    user: User = Depends(get_current_user)
+    memory_id: str = Path(..., title="Memory ID", description="The unique ID of the memory to retrieve."),
+    user: User = Depends(get_current_user),
+    memory_manager = Depends(get_memory_manager)
 ):
-    """
-    Get a specific memory.
-    
-    Args:
-        memory_id: Memory ID to retrieve
-        user: Authenticated user
-        
-    Returns:
-        MemoryResponse: Memory data
-        
-    Raises:
-        HTTPException: If memory not found or unauthorized
-    """
+    """Get a specific memory by its ID."""
     try:
-        memory_manager = get_memory_manager()
-        
-        memory = await memory_manager.get_memory(memory_id, user.id)
-        
+        memory = await memory_manager.get_memory(user_id=user.id, memory_id=memory_id)
         if not memory:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Memory {memory_id} not found"
-            )
-        
-        return MemoryResponse(
-            memory_id=memory.memory_id,
-            content=memory.content,
-            source=memory.source,
-            metadata=memory.metadata,
-            tags=memory.tags,
-            created_at=memory.created_at,
-            updated_at=memory.updated_at
-        )
-    
+            logger.warning(f"Memory {memory_id} not found for user {user.id}")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found.")
+        return MemoryResponse.model_validate(memory)
     except HTTPException:
         raise
-        
     except Exception as e:
-        logger.error(f"Error retrieving memory {memory_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve memory: {str(e)}"
-        )
+        logger.exception(f"Error retrieving memory {memory_id} for user {user.id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve memory.")
 
 
-@router.get("/core", response_model=MemoryListResponse)
-async def get_core_memories(
-    category: Optional[MemoryCategory] = None,
-    entity: Optional[str] = None,
-    limit: int = Query(10, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    user: User = Depends(get_current_user)
+@router.get("/query/", response_model=MemoryListResponse)
+async def query_memories(
+    user: User = Depends(get_current_user),
+    memory_manager = Depends(get_memory_manager),
+    source: Optional[MemorySource] = Query(None, description="Filter by memory source (core, event, etc.)."),
+    category: Optional[MemoryCategory] = Query(None, description="Filter core memories by category."),
+    entity: Optional[str] = Query(None, description="Filter core memories by associated entity."),
+    query: Optional[str] = Query(None, description="Perform semantic search using this query text."),
+    include_past_events: bool = Query(False, description="For event source, include events that have passed."),
+    days_ahead: int = Query(7, ge=0, description="For event source, look this many days ahead (0 means today only)."),
+    limit: int = Query(10, ge=1, le=100, description="Maximum number of memories to return."),
+    offset: int = Query(0, ge=0, description="Number of memories to skip for pagination.")
 ):
-    """
-    Get core memories, optionally filtered by category or entity.
-    
-    Args:
-        category: Optional category filter
-        entity: Optional entity filter
-        limit: Maximum number of memories to return
-        offset: Pagination offset
-        user: Authenticated user
-        
-    Returns:
-        MemoryListResponse: List of memories
-    """
+    """Query memories based on various filters and semantic search."""
     try:
-        memory_manager = get_memory_manager()
-        
-        memories = await memory_manager.get_core_memories(
-            user_id=user.id,
-            category=category,
-            entity=entity,
-            limit=limit + 1  # Request one extra to check for more
-        )
-        
-        # Check if there are more results
+        search_params = {
+            "user_id": user.id, "source": source, "category": category, "entity": entity,
+            "query": query, "include_past_events": include_past_events, "days_ahead": days_ahead,
+            "limit": limit + 1, "offset": offset
+        }
+        memories = await memory_manager.search_memories(**search_params)
         has_more = len(memories) > limit
         if has_more:
-            memories = memories[:limit]  # Remove the extra one
-        
-        memory_responses = [
-            MemoryResponse(
-                memory_id=memory.memory_id,
-                content=memory.content,
-                source=memory.source,
-                metadata=memory.metadata,
-                tags=memory.tags,
-                created_at=memory.created_at,
-                updated_at=memory.updated_at
-            )
-            for memory in memories
-        ]
-        
-        return MemoryListResponse(
-            memories=memory_responses,
-            count=len(memory_responses),
-            has_more=has_more
-        )
-    
+            memories = memories[:limit]
+        memory_responses = [MemoryResponse.model_validate(mem) for mem in memories]
+        return MemoryListResponse(memories=memory_responses, count=len(memory_responses), has_more=has_more)
     except Exception as e:
-        logger.error(f"Error retrieving core memories: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve memories: {str(e)}"
-        )
-
-
-@router.get("/event", response_model=MemoryListResponse)
-async def get_event_memories(
-    include_past: bool = Query(False),
-    days_ahead: int = Query(7, ge=1, le=30),
-    limit: int = Query(10, ge=1, le=100),
-    user: User = Depends(get_current_user)
-):
-    """
-    Get upcoming event memories.
-    
-    Args:
-        include_past: Whether to include past events
-        days_ahead: How many days ahead to look
-        limit: Maximum number of events to return
-        user: Authenticated user
-        
-    Returns:
-        MemoryListResponse: List of event memories
-    """
-    try:
-        memory_manager = get_memory_manager()
-        
-        events = await memory_manager.get_event_memories(
-            user_id=user.id,
-            include_past=include_past,
-            days_ahead=days_ahead,
-            limit=limit + 1  # Request one extra to check for more
-        )
-        
-        # Check if there are more results
-        has_more = len(events) > limit
-        if has_more:
-            events = events[:limit]  # Remove the extra one
-        
-        event_responses = [
-            MemoryResponse(
-                memory_id=event.memory_id,
-                content=event.content,
-                source=event.source,
-                metadata=event.metadata,
-                tags=event.tags,
-                created_at=event.created_at,
-                updated_at=event.updated_at
-            )
-            for event in events
-        ]
-        
-        return MemoryListResponse(
-            memories=event_responses,
-            count=len(event_responses),
-            has_more=has_more
-        )
-    
-    except Exception as e:
-        logger.error(f"Error retrieving event memories: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve events: {str(e)}"
-        )
+        logger.exception(f"Error querying memories for user {user.id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to query memories.")
 
 
 @router.put("/{memory_id}", response_model=MemoryResponse)
 async def update_memory(
     request: UpdateMemoryRequest,
-    memory_id: str = Path(..., title="Memory ID"),
-    user: User = Depends(get_current_user)
+    memory_id: str = Path(..., title="Memory ID", description="The unique ID of the memory to update."),
+    user: User = Depends(get_current_user),
+    memory_manager = Depends(get_memory_manager)
 ):
-    """
-    Update a memory.
-    
-    Args:
-        request: Update request
-        memory_id: Memory ID to update
-        user: Authenticated user
-        
-    Returns:
-        MemoryResponse: Updated memory
-        
-    Raises:
-        HTTPException: If memory not found or unauthorized
-    """
+    """Update an existing memory. Allows partial updates to content, metadata, tags, importance."""
     try:
-        memory_manager = get_memory_manager()
-        
-        # Verify memory exists and user owns it
-        existing_memory = await memory_manager.get_memory(memory_id, user.id)
-        
-        if not existing_memory:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Memory {memory_id} not found"
-            )
-        
-        # Prepare updates
-        updates = {}
-        
-        if request.content is not None:
-            updates["content"] = request.content
-            
-        if request.metadata is not None:
-            updates["metadata"] = {**existing_memory.metadata, **request.metadata}
-            
-        if request.tags is not None:
-            updates["tags"] = request.tags
-        
-        # Update memory
-        success = await memory_manager.update_memory(memory_id, user.id, updates)
-        
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update memory"
-            )
-        
-        # Get updated memory
-        updated_memory = await memory_manager.get_memory(memory_id, user.id)
-        
+        updates = request.model_dump(exclude_unset=True)
+        if not updates:
+             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No update fields provided.")
+
+        updated_memory = await memory_manager.update_memory(user_id=user.id, memory_id=memory_id, updates=updates)
+        if not updated_memory:
+            logger.warning(f"Update failed for memory {memory_id}, user {user.id}. Memory not found or ownership issue.")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found or update failed.")
+
         logger.info(f"Updated memory {memory_id} for user {user.id}")
-        
-        return MemoryResponse(
-            memory_id=updated_memory.memory_id,
-            content=updated_memory.content,
-            source=updated_memory.source,
-            metadata=updated_memory.metadata,
-            tags=updated_memory.tags,
-            created_at=updated_memory.created_at,
-            updated_at=updated_memory.updated_at
-        )
-    
+        return MemoryResponse.model_validate(updated_memory)
     except HTTPException:
         raise
-        
     except Exception as e:
-        logger.error(f"Error updating memory {memory_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update memory: {str(e)}"
-        )
+        logger.exception(f"Error updating memory {memory_id} for user {user.id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update memory.")
 
 
-@router.delete("/{memory_id}")
+@router.delete("/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_memory(
-    memory_id: str = Path(..., title="Memory ID"),
-    user: User = Depends(get_current_user)
+    memory_id: str = Path(..., title="Memory ID", description="The unique ID of the memory to delete."),
+    user: User = Depends(get_current_user),
+    memory_manager = Depends(get_memory_manager)
 ):
-    """
-    Delete a memory.
-    
-    Args:
-        memory_id: Memory ID to delete
-        user: Authenticated user
-        
-    Returns:
-        dict: Success response
-        
-    Raises:
-        HTTPException: If memory not found or unauthorized
-    """
+    """Delete a specific memory by its ID."""
     try:
-        memory_manager = get_memory_manager()
-        
-        success = await memory_manager.delete_memory(user.id, memory_id)
-        
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Memory {memory_id} not found"
-            )
-        
+        deleted = await memory_manager.delete_memory(user_id=user.id, memory_id=memory_id)
+        if not deleted:
+            logger.warning(f"Delete failed for memory {memory_id}, user {user.id}. Memory not found or ownership issue.")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found or delete failed.")
         logger.info(f"Deleted memory {memory_id} for user {user.id}")
-        
-        return {"success": True, "message": f"Memory {memory_id} deleted"}
-    
+        return None # Return None for 204 status code
     except HTTPException:
         raise
-        
     except Exception as e:
-        logger.error(f"Error deleting memory {memory_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete memory: {str(e)}"
-        )
+        logger.exception(f"Error deleting memory {memory_id} for user {user.id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete memory.")
 
 
-@router.post("/event/{memory_id}/complete")
+@router.post("/event/{memory_id}/complete", status_code=status.HTTP_200_OK)
 async def complete_event(
-    memory_id: str = Path(..., title="Memory ID"),
-    user: User = Depends(get_current_user)
+    memory_id: str = Path(..., title="Event Memory ID", description="The unique ID of the event memory to mark as complete."),
+    user: User = Depends(get_current_user),
+    memory_manager = Depends(get_memory_manager)
 ):
-    """
-    Mark an event memory as completed.
-    
-    Args:
-        memory_id: Memory ID to update
-        user: Authenticated user
-        
-    Returns:
-        dict: Success response
-        
-    Raises:
-        HTTPException: If memory not found or unauthorized
-    """
+    """Mark an event memory as completed by updating its metadata."""
     try:
-        memory_manager = get_memory_manager()
-        
-        success = await memory_manager.complete_event(memory_id, user.id)
-        
+        success = await memory_manager.complete_event(user_id=user.id, memory_id=memory_id)
         if not success:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Event memory {memory_id} not found"
-            )
-        
+             logger.warning(f"Failed to mark event {memory_id} as complete for user {user.id}. Not found, not an event, or ownership issue.")
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event memory not found or could not be marked as complete.")
         logger.info(f"Marked event {memory_id} as completed for user {user.id}")
-        
         return {"success": True, "message": f"Event {memory_id} marked as completed"}
-    
     except HTTPException:
         raise
-        
     except Exception as e:
-        logger.error(f"Error completing event {memory_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to complete event: {str(e)}"
-        )
+        logger.exception(f"Error completing event {memory_id} for user {user.id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to complete event.")
 
 
-@router.post("/text/extract")
+# --- COMPLETED FUNCTION ---
+@router.post("/text/extract", status_code=status.HTTP_200_OK, response_model=ExtractMemoryResponse)
 async def extract_memory_from_text(
-    text: str = Body(..., embed=True),
-    user: User = Depends(get_current_user)
+    text_input: str = Body(..., embed=True, alias="text", description="The text to analyze for potential memories or commands."),
+    user: User = Depends(get_current_user), # User might be needed if extraction logic is user-specific
+    memory_extractor = Depends(get_memory_extractor) # Inject dependency
 ):
     """
-    Extract memory commands from text.
-    
+    Analyze text to extract explicit memory commands (e.g., "remember", "forget")
+    or identify potentially useful information to store as a memory.
+
     Args:
-        text: Text to analyze
-        user: Authenticated user
-        
+        text_input: The text provided by the user.
+        user: Authenticated user.
+        memory_extractor: Injected MemoryExtractor instance.
+
     Returns:
-        dict: Extraction results
+        An ExtractMemoryResponse object detailing what was found (command or potential memory).
     """
     try:
-        memory_extractor = get_memory_extractor()
-        
-        # Extract memory command
-        command = await memory_extractor.extract_memory_command(text)
-        
+        logger.debug(f"Extracting memory from text for user {user.id}. Text: '{text_input[:100]}...'")
+
+        # Attempt to extract an explicit command first
+        command: Optional[MemoryCommand] = await memory_extractor.extract_memory_command(text_input)
+
         if command:
-            return {
-                "command_found": True,
-                "command_type": command.command_type,
-                "content": command.content,
-                "entity": command.entity,
-                "category": command.category.value if command.category else None,
-                "event_time": command.event_time.isoformat() if command.event_time else None
-            }
-        
-        # Check for potential memory
-        potential_memory = await memory_extractor.identify_potential_memory(text)
-        
-        if potential_memory:
-            return {
-                "command_found": False,
-                "potential_memory": True,
-                "content": potential_memory.get("content"),
-                "category": potential_memory.get("category").value,
-                "importance": potential_memory.get("importance")
-            }
-        
-        return {
-            "command_found": False,
-            "potential_memory": False
-        }
-    
+            logger.info(f"Extracted command '{command.command_type}' for user {user.id}")
+            return ExtractMemoryResponse(
+                command_found=True,
+                command_type=command.command_type,
+                command_content=command.content,
+                command_category=command.category,
+                command_entity=command.entity,
+                command_event_time=command.event_time
+            )
+
+        # If no command, check for potentially storable memory fragments
+        # Assuming identify_potential_memory returns a dict or None
+        potential_memory_info: Optional[Dict] = await memory_extractor.identify_potential_memory(text_input)
+
+        if potential_memory_info:
+             logger.info(f"Identified potential memory for user {user.id}")
+             return ExtractMemoryResponse(
+                  potential_memory=True,
+                  potential_content=potential_memory_info.get("content"),
+                  potential_category=potential_memory_info.get("category"),
+                  potential_importance=potential_memory_info.get("importance")
+             )
+
+        # If neither command nor potential memory found
+        logger.info(f"No command or potential memory found in text for user {user.id}")
+        return ExtractMemoryResponse(command_found=False, potential_memory=False)
+
     except Exception as e:
-        logger.error(f"Error extracting memory from text: {str(e)}")
+        logger.exception(f"Error extracting memory from text for user {user.id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to extract memory: {str(e)}"
+            detail="Failed to process text for memory extraction."
         )
+# --- END OF FILE ---

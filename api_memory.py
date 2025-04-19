@@ -15,10 +15,10 @@ from pydantic import BaseModel, Field
 
 from auth import get_current_user
 # Corrected import from memory_manager
-from memory_manager import get_memory_manager, MemoryCategory
+from memory_manager import get_memory_manager
 from memory_extractor import get_memory_extractor, MemoryCommand # Import MemoryCommand if extractor returns it
-# Corrected import from models - Removed CoreMemory, EventMemory
-from models import Memory, User, MemorySource # Import MemorySource
+# Corrected import from models - Removed CoreMemory, EventMemory, Added MemoryCategory
+from models import Memory, User, MemorySource, MemoryCategory # Import MemoryCategory from models
 from config import get_settings
 
 # Logger configuration
@@ -42,7 +42,7 @@ router = APIRouter(
 class CreateCoreMemoryRequest(BaseModel):
     """Request model for creating core memories."""
     content: str = Field(..., min_length=1, max_length=2000)
-    category: MemoryCategory
+    category: MemoryCategory # Use the enum directly here
     entity: Optional[str] = None
     importance: int = Field(5, ge=1, le=10)
     metadata: Optional[Dict[str, Any]] = None
@@ -118,16 +118,19 @@ async def create_core_memory(
     """Create a new core memory (source = CORE)."""
     try:
         final_metadata = request.metadata or {}
+        # Use the enum value for storage if needed by DB layer, but MemoryManager likely handles this
         final_metadata['category'] = request.category.value
         if request.entity:
             final_metadata['entity'] = request.entity
 
+        # Pass the enum directly to MemoryManager if it accepts it
         memory = await memory_manager.add_memory(
             user_id=user.id,
             content=request.content,
             source=MemorySource.CORE,
             importance=request.importance,
-            metadata=final_metadata
+            metadata=final_metadata,
+            category=request.category # Pass category if add_memory uses it
         )
         logger.info(f"Created core memory {memory.memory_id} for user {user.id}")
         return CreateMemoryResponse(memory_id=memory.memory_id, success=True)
@@ -204,11 +207,21 @@ async def query_memories(
             "query": query, "include_past_events": include_past_events, "days_ahead": days_ahead,
             "limit": limit + 1, "offset": offset
         }
-        memories = await memory_manager.search_memories(**search_params)
-        has_more = len(memories) > limit
+        # Assuming memory_manager.search_memories exists and handles these params
+        memories_with_scores = await memory_manager.search_memories(**search_params) # Assuming it returns list of (Memory, score)
+
+        # Adjust if search_memories returns just Memory objects
+        # memories = await memory_manager.search_memories(**search_params)
+        # memories_with_scores = [(mem, 1.0) for mem in memories] # Assign dummy score if needed
+
+        has_more = len(memories_with_scores) > limit
         if has_more:
-            memories = memories[:limit]
-        memory_responses = [MemoryResponse.model_validate(mem) for mem in memories]
+            memories_with_scores = memories_with_scores[:limit]
+
+        # Extract Memory objects from the tuples
+        memory_objects = [mem for mem, score in memories_with_scores]
+
+        memory_responses = [MemoryResponse.model_validate(mem) for mem in memory_objects]
         return MemoryListResponse(memories=memory_responses, count=len(memory_responses), has_more=has_more)
     except Exception as e:
         logger.exception(f"Error querying memories for user {user.id}: {e}", exc_info=True)
@@ -228,10 +241,14 @@ async def update_memory(
         if not updates:
              raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No update fields provided.")
 
+        # Pass updates to memory manager, assuming it returns the updated Memory object
         updated_memory = await memory_manager.update_memory(user_id=user.id, memory_id=memory_id, updates=updates)
+
+        # update_memory in manager should raise NotFoundException or AuthorizationError if needed
         if not updated_memory:
-            logger.warning(f"Update failed for memory {memory_id}, user {user.id}. Memory not found or ownership issue.")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found or update failed.")
+            # Fallback if manager returns None on failure instead of raising exception
+            logger.error(f"Update operation failed for memory {memory_id}, user {user.id}.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Memory update failed.")
 
         logger.info(f"Updated memory {memory_id} for user {user.id}")
         return MemoryResponse.model_validate(updated_memory)
@@ -251,9 +268,12 @@ async def delete_memory(
     """Delete a specific memory by its ID."""
     try:
         deleted = await memory_manager.delete_memory(user_id=user.id, memory_id=memory_id)
+        # delete_memory in manager should raise NotFoundException or AuthorizationError if needed
         if not deleted:
-            logger.warning(f"Delete failed for memory {memory_id}, user {user.id}. Memory not found or ownership issue.")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found or delete failed.")
+            # Fallback if manager returns False on failure
+             logger.warning(f"Delete failed for memory {memory_id}, user {user.id}. Not found or ownership issue.")
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found or delete failed.")
+
         logger.info(f"Deleted memory {memory_id} for user {user.id}")
         return None # Return None for 204 status code
     except HTTPException:
@@ -272,6 +292,7 @@ async def complete_event(
     """Mark an event memory as completed by updating its metadata."""
     try:
         success = await memory_manager.complete_event(user_id=user.id, memory_id=memory_id)
+        # complete_event should raise specific exceptions if needed
         if not success:
              logger.warning(f"Failed to mark event {memory_id} as complete for user {user.id}. Not found, not an event, or ownership issue.")
              raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event memory not found or could not be marked as complete.")

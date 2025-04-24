@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # --- Configuration and Core Components ---
-from config import get_settings
+from config import settings
 from database import get_db_manager
 from memory_manager import get_memory_manager
 from context_window import get_context_window
@@ -40,7 +40,7 @@ import secrets_router
 import websocket_manager
 
 # Load settings (CORS_ORIGINS is now a string in the settings object)
-settings = get_settings()
+
 configure_logging()
 logger = get_logger(__name__)
 

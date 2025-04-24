@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, Set
 from pydantic import BaseModel, Field
 
 # --- Local Imports ---
-from config import get_settings
+from config import settings
 from database import get_db_manager # Assuming database.py provides this interface
 from exceptions import DatabaseError, NotFoundException, AuthorizationError
 # Import models used by this manager
@@ -53,7 +53,7 @@ class MemoryManager:
 
     def __init__(self):
         """Initialize memory manager with database connection and settings."""
-        self.settings = get_settings()
+        self.settings = settings
         self.db = get_db_manager() # Get the singleton DB manager instance
 
         # Basic in-memory stats (could be expanded)

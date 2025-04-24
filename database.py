@@ -45,7 +45,7 @@ except ImportError:
 
 
 # --- Local Imports ---
-from config import get_settings
+from config import settings
 from models import Memory, User, UserInDB, Conversation, SyncState, ApiKey, UserRateLimit, MemorySource, MemoryCategory # Added UserInDB
 from exceptions import DatabaseError, ConfigurationError, NotFoundException # Import NotFoundException
 
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 class DatabaseManager:
     def __init__(self):
         """Initialize database connection (Firestore or in-memory)."""
-        self.settings = get_settings()
+        self.settings = settings # <-- CORRECTED LINE 57
         self.db = None
         self.in_memory_db = {
             "users": {}, "memories": {}, "conversations": {},
@@ -63,6 +63,7 @@ class DatabaseManager:
 
         if FIRESTORE_AVAILABLE:
             try:
+                # Use self.settings now
                 if self.settings.USE_GCP_DEFAULT_CREDENTIALS:
                     # Use Application Default Credentials (ADC) - preferred for Cloud Run/GCP
                     cred = None # firebase_admin uses ADC if cred is None
@@ -76,14 +77,17 @@ class DatabaseManager:
 
                 # Initialize Firebase Admin SDK (only once)
                 if not firebase_admin._apps:
+                    # Use self.settings now
                     firebase_admin.initialize_app(cred, {
                         'projectId': self.settings.FIREBASE_PROJECT_ID,
                     })
 
                 self.db = firebase_firestore.client()
+                # Use self.settings now
                 logger.info(f"Firestore client initialized for project: {self.settings.FIREBASE_PROJECT_ID}")
 
             except FileNotFoundError:
+                 # Use self.settings now
                  logger.error(f"Firebase credentials file not found at {self.settings.FIREBASE_CREDENTIALS_PATH}. Using in-memory DB.")
                  self.db = None
             except ConfigurationError as e:
@@ -377,10 +381,17 @@ class DatabaseManager:
                 for mem in user_mems:
                     event_time_str = mem.metadata.get("event_time")
                     try:
-                        event_dt = datetime.fromisoformat(event_time_str.replace('Z', '+00:00'))
+                        # Ensure timezone comparison is correct
+                        event_dt_naive = datetime.fromisoformat(event_time_str.replace('Z', ''))
+                        event_dt = event_dt_naive.replace(tzinfo=timezone.utc) # Assume UTC if Z present
+                        # Ensure start/end times are timezone-aware (preferably UTC)
+                        if start_time.tzinfo is None: start_time = start_time.replace(tzinfo=timezone.utc)
+                        if end_time.tzinfo is None: end_time = end_time.replace(tzinfo=timezone.utc)
+
                         if start_time <= event_dt <= end_time:
                             memories.append(mem)
                     except (TypeError, ValueError):
+                        logger.warning(f"Skipping memory {mem.memory_id} due to invalid event_time format: {event_time_str}")
                         continue # Skip if event_time is invalid
                 memories.sort(key=lambda m: m.metadata.get("event_time", "9999"))
 
@@ -404,6 +415,10 @@ class DatabaseManager:
                     results = await asyncio.to_thread(query.stream)
                     all_user_mems = [Memory(**doc.to_dict(), memory_id=doc.id) for doc in results]
 
+                    # Ensure last_sync_time is timezone-aware (UTC) for comparison
+                    if last_sync_time and last_sync_time.tzinfo is None:
+                        last_sync_time = last_sync_time.replace(tzinfo=timezone.utc)
+
                     if last_sync_time:
                         memories = [m for m in all_user_mems if m.updated_at > last_sync_time]
                     else: # First sync, return all fetched
@@ -414,6 +429,11 @@ class DatabaseManager:
 
                 else: # FieldFilter is available
                     query = self.db.collection("memories").where(filter=FieldFilter("user_id", "==", user_id))
+
+                    # Ensure last_sync_time is timezone-aware (UTC) for Firestore query
+                    if last_sync_time and last_sync_time.tzinfo is None:
+                        last_sync_time = last_sync_time.replace(tzinfo=timezone.utc)
+
                     if last_sync_time:
                         # Ensure timestamp comparison works correctly
                         query = query.where(filter=FieldFilter("updated_at", ">", last_sync_time))
@@ -425,6 +445,11 @@ class DatabaseManager:
             else: # In-memory fallback
                 # Ensure memory objects are created for comparison
                 user_mems = [Memory(**m, memory_id=m_id) for m_id, m in self.in_memory_db["memories"].items() if m.get("user_id") == user_id]
+
+                # Ensure last_sync_time is timezone-aware (UTC) for comparison
+                if last_sync_time and last_sync_time.tzinfo is None:
+                    last_sync_time = last_sync_time.replace(tzinfo=timezone.utc)
+
                 if last_sync_time:
                     user_mems = [m for m in user_mems if m.updated_at > last_sync_time]
                 user_mems.sort(key=lambda m: m.updated_at) # Sort ascending
@@ -440,7 +465,7 @@ class DatabaseManager:
         """Placeholder: Retrieves memories based on a simple text query."""
         logger.warning("get_memories_by_query using simple keyword matching.")
         query_terms = set(q.lower() for q in query.split() if len(q) > 2)
-        all_memories = await self.get_user_memories(user_id, limit=200)
+        all_memories = await self.get_user_memories(user_id, limit=200) # Fetch a larger pool
         matched = []
         for mem in all_memories:
             content_lower = mem.content.lower()
@@ -448,36 +473,52 @@ class DatabaseManager:
                 matched.append(mem)
                 if len(matched) >= limit:
                     break
-        return matched
+        # Optional: Sort matched memories by relevance or date?
+        matched.sort(key=lambda m: m.updated_at, reverse=True)
+        return matched[:limit] # Ensure limit is applied
 
     async def cleanup_old_memories(self, user_id: str, days_threshold: int) -> int:
         """Placeholder: Deletes memories older than the specified threshold."""
         logger.warning(f"Placeholder cleanup_old_memories called for user {user_id}, threshold {days_threshold} days. No deletion performed.")
+        # Implementation would involve querying memories with updated_at < (now - threshold)
+        # and deleting them in batches.
         return 0
 
     async def cleanup_duplicate_memories(self, user_id: str) -> int:
         """Placeholder: Deletes duplicate memories based on content hash or similarity."""
         logger.warning(f"Placeholder cleanup_duplicate_memories called for user {user_id}. No deletion performed.")
+        # Implementation would involve fetching memories, calculating hashes (e.g., hashlib.sha256(m.content.encode()).hexdigest()),
+        # identifying duplicates, keeping one, and deleting others.
         return 0
 
-    # --- Conversation Operations (Stubs) ---
-    async def create_conversation(self, conversation: Conversation) -> bool: return False
-    async def get_conversation(self, conversation_id: str) -> Optional[Conversation]: return None
-    async def update_conversation(self, conversation_id: str, updates: Dict[str, Any]) -> bool: return False
+    # --- Conversation Operations (Stubs - Implement as needed) ---
+    async def create_conversation(self, conversation: Conversation) -> bool:
+        logger.warning("create_conversation not implemented.")
+        return False
+    async def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        logger.warning("get_conversation not implemented.")
+        return None
+    async def update_conversation(self, conversation_id: str, updates: Dict[str, Any]) -> bool:
+        logger.warning("update_conversation not implemented.")
+        return False
 
-    # --- Sync Operations (Stubs) ---
-    async def get_sync_state(self, user_id: str, device_id: str) -> Optional[SyncState]: return None
-    async def update_sync_state(self, sync_state: SyncState) -> bool: return False
+    # --- Sync Operations (Stubs - Implement as needed) ---
+    async def get_sync_state(self, user_id: str, device_id: str) -> Optional[SyncState]:
+        logger.warning("get_sync_state not implemented.")
+        return None
+    async def update_sync_state(self, sync_state: SyncState) -> bool:
+        logger.warning("update_sync_state not implemented.")
+        return False
 
     # --- API Key Operations ---
     async def get_api_key_by_hash(self, hashed_key: str) -> Optional[ApiKey]:
-        # This might be less efficient if not indexed well
-        keys = []
+        # This might be less efficient if not indexed well on hashed_key
         try:
             if self.db:
                 if not FIRESTORE_FIELD_FILTER_AVAILABLE:
                      logger.error("Firestore FieldFilter not available, cannot query API keys by hash.")
                      return None
+                # Ensure hashed_key is indexed in Firestore for performance
                 query = self.db.collection("api_keys").where(filter=FieldFilter("hashed_key", "==", hashed_key)).limit(1)
                 results = await asyncio.to_thread(query.stream)
                 for doc in results:
@@ -488,8 +529,9 @@ class DatabaseManager:
             else: # In-memory
                 for key_id, key_data in self.in_memory_db["api_keys"].items():
                     if key_data.get("hashed_key") == hashed_key:
-                        key_data["key_id"] = key_id
-                        return ApiKey(**key_data)
+                        key_data_copy = key_data.copy() # Avoid modifying original
+                        key_data_copy["key_id"] = key_id
+                        return ApiKey(**key_data_copy)
                 return None
         except Exception as e:
             logger.error(f"Error retrieving API key by hash: {e}", exc_info=True)
@@ -497,7 +539,7 @@ class DatabaseManager:
 
     async def get_api_keys_by_prefix(self, prefix: str) -> List[ApiKey]:
         """Gets API keys matching a given prefix."""
-        # This query requires an index on 'prefix'.
+        # This query requires an index on 'prefix' in Firestore.
         keys = []
         try:
             if self.db:
@@ -534,114 +576,206 @@ class DatabaseManager:
                 if key_id in self.in_memory_db["api_keys"]:
                     self.in_memory_db["api_keys"][key_id].update(update)
                 else:
+                    logger.warning(f"Attempted to update usage for non-existent in-memory API key: {key_id}")
                     return False
             return True
         except google_exceptions.NotFound:
-             logger.warning(f"Attempted to update usage for non-existent API key: {key_id}")
+             logger.warning(f"Attempted to update usage for non-existent Firestore API key: {key_id}")
              return False
         except Exception as e:
             logger.error(f"Error updating API key usage for {key_id}: {e}", exc_info=True)
             return False
 
     # --- Secret Category & Secret Operations ---
-    # (Assuming implementations using self.db or self.in_memory_db are correct)
+    # (Assuming implementations using self.db or self.in_memory_db are correct,
+    #  but adding basic ownership checks and error handling consistency)
+
     async def create_category(self, category_data: Dict[str, Any]) -> bool:
         cat_id = category_data.get("id")
+        if not cat_id:
+             logger.error("Category data missing 'id'.")
+             return False
         try:
             if self.db: await asyncio.to_thread(self.db.collection("categories").document(cat_id).set, category_data)
-            else: self.in_memory_db["categories"][cat_id] = category_data
+            else: self.in_memory_db["categories"][cat_id] = category_data.copy() # Store a copy
             return True
-        except Exception as e: logger.error(f"DB Error create_category: {e}"); return False
+        except Exception as e:
+             logger.error(f"DB Error create_category {cat_id}: {e}", exc_info=True)
+             return False
 
     async def get_category(self, user_id: str, category_id: str) -> Optional[Dict[str, Any]]:
         try:
             if self.db:
-                doc = await asyncio.to_thread(self.db.collection("categories").document(category_id).get)
+                doc_ref = self.db.collection("categories").document(category_id)
+                doc = await asyncio.to_thread(doc_ref.get)
                 if doc.exists:
                      data = doc.to_dict()
-                     if data.get("user_id") == user_id: return data
-                return None
-            else:
+                     if data.get("user_id") == user_id:
+                          data['id'] = doc.id # Ensure ID is included
+                          return data
+                return None # Not found or wrong user
+            else: # In-memory
                 data = self.in_memory_db["categories"].get(category_id)
-                if data and data.get("user_id") == user_id: return data
+                if data and data.get("user_id") == user_id:
+                     data_copy = data.copy()
+                     data_copy['id'] = category_id # Ensure ID is included
+                     return data_copy
                 return None
-        except Exception as e: logger.error(f"DB Error get_category: {e}"); return None
+        except Exception as e:
+             logger.error(f"DB Error get_category {category_id}: {e}", exc_info=True)
+             return None
 
     async def get_user_categories(self, user_id: str) -> List[Dict[str, Any]]:
         cats = []
         try:
             if self.db:
-                if not FIRESTORE_FIELD_FILTER_AVAILABLE: return []
+                if not FIRESTORE_FIELD_FILTER_AVAILABLE:
+                     logger.error("Firestore FieldFilter not available for get_user_categories.")
+                     return []
                 query = self.db.collection("categories").where(filter=FieldFilter("user_id", "==", user_id))
                 results = await asyncio.to_thread(query.stream)
-                cats = [doc.to_dict() for doc in results]
-            else:
-                cats = [c for c in self.in_memory_db["categories"].values() if c.get("user_id") == user_id]
+                for doc in results:
+                     cat_data = doc.to_dict()
+                     cat_data['id'] = doc.id # Ensure ID is included
+                     cats.append(cat_data)
+            else: # In-memory
+                for cat_id, cat_data in self.in_memory_db["categories"].items():
+                     if cat_data.get("user_id") == user_id:
+                          cat_data_copy = cat_data.copy()
+                          cat_data_copy['id'] = cat_id # Ensure ID is included
+                          cats.append(cat_data_copy)
             return cats
-        except Exception as e: logger.error(f"DB Error get_user_categories: {e}"); return []
+        except Exception as e:
+             logger.error(f"DB Error get_user_categories for user {user_id}: {e}", exc_info=True)
+             return []
 
-    async def delete_category(self, category_id: str) -> bool:
-        # WARNING: Need to check ownership before delete! Assumed done in router.
+    async def delete_category(self, user_id: str, category_id: str) -> bool:
+        # Perform ownership check before deleting
+        category_to_delete = await self.get_category(user_id, category_id)
+        if not category_to_delete:
+            logger.warning(f"Attempt to delete non-existent or unauthorized category {category_id} by user {user_id}")
+            return False # Not found or not owned by user
+
         try:
-            if self.db: await asyncio.to_thread(self.db.collection("categories").document(category_id).delete)
-            else: self.in_memory_db["categories"].pop(category_id, None)
-            # TODO: Delete associated secrets?
+            if self.db:
+                await asyncio.to_thread(self.db.collection("categories").document(category_id).delete)
+                # TODO: Delete associated secrets? Requires a query.
+            else: # In-memory
+                self.in_memory_db["categories"].pop(category_id, None)
+                # TODO: Delete associated secrets for in-memory.
+            logger.info(f"Deleted category {category_id} for user {user_id}")
             return True
-        except Exception as e: logger.error(f"DB Error delete_category: {e}"); return False
+        except Exception as e:
+             logger.error(f"DB Error delete_category {category_id}: {e}", exc_info=True)
+             return False
 
     async def create_secret(self, secret_data: Dict[str, Any]) -> bool:
         secret_id = secret_data.get("id")
+        if not secret_id:
+             logger.error("Secret data missing 'id'.")
+             return False
         try:
             if self.db: await asyncio.to_thread(self.db.collection("secrets").document(secret_id).set, secret_data)
-            else: self.in_memory_db["secrets"][secret_id] = secret_data
+            else: self.in_memory_db["secrets"][secret_id] = secret_data.copy() # Store a copy
             return True
-        except Exception as e: logger.error(f"DB Error create_secret: {e}"); return False
+        except Exception as e:
+             logger.error(f"DB Error create_secret {secret_id}: {e}", exc_info=True)
+             return False
 
-    async def get_secret(self, secret_id: str) -> Optional[Dict[str, Any]]:
-        # WARNING: Need to check ownership in router!
+    async def get_secret(self, user_id: str, secret_id: str) -> Optional[Dict[str, Any]]:
+        # Perform ownership check
         try:
             if self.db:
-                doc = await asyncio.to_thread(self.db.collection("secrets").document(secret_id).get)
-                return doc.to_dict() if doc.exists else None
-            else:
-                return self.in_memory_db["secrets"].get(secret_id)
-        except Exception as e: logger.error(f"DB Error get_secret: {e}"); return None
+                doc_ref = self.db.collection("secrets").document(secret_id)
+                doc = await asyncio.to_thread(doc_ref.get)
+                if doc.exists:
+                     data = doc.to_dict()
+                     if data.get("user_id") == user_id:
+                          data['id'] = doc.id # Ensure ID included
+                          return data
+                return None # Not found or wrong user
+            else: # In-memory
+                data = self.in_memory_db["secrets"].get(secret_id)
+                if data and data.get("user_id") == user_id:
+                     data_copy = data.copy()
+                     data_copy['id'] = secret_id # Ensure ID included
+                     return data_copy
+                return None
+        except Exception as e:
+             logger.error(f"DB Error get_secret {secret_id}: {e}", exc_info=True)
+             return None
 
     async def get_user_secrets(self, user_id: str, category_id: Optional[str] = None, tag: Optional[str] = None) -> List[Dict[str, Any]]:
         secrets_list = []
         try:
             if self.db:
-                if not FIRESTORE_FIELD_FILTER_AVAILABLE: return []
+                if not FIRESTORE_FIELD_FILTER_AVAILABLE:
+                     logger.error("Firestore FieldFilter not available for get_user_secrets.")
+                     return []
                 query = self.db.collection("secrets").where(filter=FieldFilter("user_id", "==", user_id))
                 if category_id: query = query.where(filter=FieldFilter("category_id", "==", category_id))
-                if tag: query = query.where(filter=FieldFilter("tags", "array_contains", tag))
+                if tag: query = query.where(filter=FieldFilter("tags", "array_contains", tag)) # Requires index on tags
                 results = await asyncio.to_thread(query.stream)
-                secrets_list = [doc.to_dict() for doc in results]
-            else:
-                user_secrets = [s for s in self.in_memory_db["secrets"].values() if s.get("user_id") == user_id]
-                if category_id: user_secrets = [s for s in user_secrets if s.get("category_id") == category_id]
-                if tag: user_secrets = [s for s in user_secrets if tag in s.get("tags", [])]
+                for doc in results:
+                     secret_data = doc.to_dict()
+                     secret_data['id'] = doc.id # Ensure ID included
+                     secrets_list.append(secret_data)
+            else: # In-memory
+                user_secrets = []
+                for secret_id, secret_data in self.in_memory_db["secrets"].items():
+                     if secret_data.get("user_id") == user_id:
+                          matches_category = (not category_id) or (secret_data.get("category_id") == category_id)
+                          matches_tag = (not tag) or (tag in secret_data.get("tags", []))
+                          if matches_category and matches_tag:
+                               secret_data_copy = secret_data.copy()
+                               secret_data_copy['id'] = secret_id # Ensure ID included
+                               user_secrets.append(secret_data_copy)
                 secrets_list = user_secrets
             return secrets_list
-        except Exception as e: logger.error(f"DB Error get_user_secrets: {e}"); return []
+        except Exception as e:
+             logger.error(f"DB Error get_user_secrets for user {user_id}: {e}", exc_info=True)
+             return []
 
-    async def update_secret(self, secret_id: str, updates: Dict[str, Any]) -> bool:
-        # WARNING: Need to check ownership before update! Assumed done in router.
-        try:
-            if self.db: await asyncio.to_thread(self.db.collection("secrets").document(secret_id).update, updates)
-            else:
-                if secret_id in self.in_memory_db["secrets"]: self.in_memory_db["secrets"][secret_id].update(updates)
-                else: return False
-            return True
-        except Exception as e: logger.error(f"DB Error update_secret: {e}"); return False
+    async def update_secret(self, user_id: str, secret_id: str, updates: Dict[str, Any]) -> bool:
+        # Perform ownership check before updating
+        secret_to_update = await self.get_secret(user_id, secret_id)
+        if not secret_to_update:
+             logger.warning(f"Attempt to update non-existent or unauthorized secret {secret_id} by user {user_id}")
+             return False
 
-    async def delete_secret(self, secret_id: str) -> bool:
-        # WARNING: Need to check ownership before delete! Assumed done in router.
+        # Prevent changing user_id or id via updates
+        if "user_id" in updates: del updates["user_id"]
+        if "id" in updates: del updates["id"]
+        updates["updated_at"] = datetime.now(timezone.utc) # Ensure timestamp update
+
         try:
-            if self.db: await asyncio.to_thread(self.db.collection("secrets").document(secret_id).delete)
-            else: self.in_memory_db["secrets"].pop(secret_id, None)
+            if self.db:
+                doc_ref = self.db.collection("secrets").document(secret_id)
+                await asyncio.to_thread(doc_ref.update, updates)
+            else: # In-memory
+                self.in_memory_db["secrets"][secret_id].update(updates)
             return True
-        except Exception as e: logger.error(f"DB Error delete_secret: {e}"); return False
+        except Exception as e:
+             logger.error(f"DB Error update_secret {secret_id}: {e}", exc_info=True)
+             return False
+
+    async def delete_secret(self, user_id: str, secret_id: str) -> bool:
+        # Perform ownership check before deleting
+        secret_to_delete = await self.get_secret(user_id, secret_id)
+        if not secret_to_delete:
+            logger.warning(f"Attempt to delete non-existent or unauthorized secret {secret_id} by user {user_id}")
+            return False # Not found or not owned
+
+        try:
+            if self.db:
+                await asyncio.to_thread(self.db.collection("secrets").document(secret_id).delete)
+            else: # In-memory
+                self.in_memory_db["secrets"].pop(secret_id, None)
+            logger.info(f"Deleted secret {secret_id} for user {user_id}")
+            return True
+        except Exception as e:
+             logger.error(f"DB Error delete_secret {secret_id}: {e}", exc_info=True)
+             return False
 
 # --- Singleton Instance ---
 _db_manager: Optional[DatabaseManager] = None

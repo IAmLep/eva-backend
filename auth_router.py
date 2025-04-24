@@ -7,7 +7,7 @@ user info retrieval, token refresh, password changes, and token verification.
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Dict, List, Optional, Union
+from typing import Annotated, Dict, List, Optional, Union, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -16,8 +16,9 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 # --- Local Imports ---
 # Import functions and dependencies from the auth logic module
 import auth
-# Import database manager and specific functions if needed
-from database import get_db_manager, get_user_by_username, get_user # Import get_user as well
+# Import database manager
+# CORRECTED: Removed 'get_user' from import as it's a class method
+from database import get_db_manager
 # Import exceptions used
 from exceptions import AuthenticationError, AuthorizationError, DatabaseError, DuplicateError
 # Import models used in request/response bodies and dependencies
@@ -70,16 +71,16 @@ async def register_user(user_data: UserCreate) -> UserResponse:
     - Hashes the password securely.
     - Stores the new user in the database.
     """
-    db = get_db_manager()
+    db = get_db_manager() # Get the manager instance
     logger.info(f"Registration attempt for username: {user_data.username}")
 
-    # Check if username or email already exists
+    # Check if username or email already exists using the manager instance
     existing_user = await db.get_user_by_username(user_data.username)
     if existing_user:
         logger.warning(f"Registration failed: Username '{user_data.username}' already exists.")
         raise DuplicateError(detail="Username already registered")
 
-    existing_email = await db.get_user_by_email(user_data.email)
+    existing_email = await db.get_user_by_email(user_data.email) # Call method on manager
     if existing_email:
          logger.warning(f"Registration failed: Email '{user_data.email}' already exists.")
          raise DuplicateError(detail="Email already registered")
@@ -103,7 +104,7 @@ async def register_user(user_data: UserCreate) -> UserResponse:
         metadata={}
     )
 
-    # Add user to database
+    # Add user to database using the manager instance
     try:
         user_id = await db.create_user(new_user) # Pass the UserInDB object
         if not user_id: # Check if create_user indicates failure
@@ -121,14 +122,10 @@ async def register_user(user_data: UserCreate) -> UserResponse:
             detail="An unexpected error occurred during registration."
         )
 
-    # Retrieve the created user to return standard UserResponse
-    # Use the ID returned by create_user
-    created_user_data = await db.get_user(user_id)
+    # Retrieve the created user to return standard UserResponse using the manager instance
+    created_user_data = await db.get_user(user_id) # Call the method on the manager instance
     if not created_user_data:
         logger.error(f"User '{user_data.username}' (ID: {user_id}) created but could not be retrieved.")
-        # This indicates a potential issue, but registration technically succeeded.
-        # Return a generic error or try to construct response manually?
-        # Let's raise an error as this shouldn't happen.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="User created but retrieval failed. Please contact support."
@@ -137,7 +134,6 @@ async def register_user(user_data: UserCreate) -> UserResponse:
     logger.info(f"Successfully registered new user: {user_data.username} (ID: {user_id})")
 
     # Convert to UserResponse schema for the response
-    # Ensure UserResponse field names match User model fields
     return UserResponse(
          id=created_user_data.id,
          username=created_user_data.username,
@@ -163,18 +159,17 @@ async def login_for_access_token(
     along with user information.
     """
     logger.info(f"Login attempt for user: {form_data.username}")
-    # Authenticate user using the logic from auth.py
+    # Authenticate user using the logic from auth.py (which correctly uses db manager)
     user = await auth.authenticate_user(form_data.username, form_data.password)
 
     if not user:
-        # authenticate_user already logs failure reasons
-        raise AuthenticationError(detail="Incorrect username or password") # Use custom exception
+        raise AuthenticationError(detail="Incorrect username or password")
 
     # User authenticated successfully, create token
     settings = auth.get_settings()
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = auth.create_access_token(
-        data={"sub": user.username}, # 'sub' claim typically holds username
+        data={"sub": user.username},
         expires_delta=access_token_expires
     )
     expires_at = datetime.now(timezone.utc) + access_token_expires
@@ -212,8 +207,6 @@ async def read_users_me(
     """
     Returns the details of the currently authenticated and active user.
     """
-    # The dependency already fetches and validates the user.
-    # We just need to format it as UserResponse.
     return UserResponse(
          id=current_user.id,
          username=current_user.username,
@@ -225,7 +218,6 @@ async def read_users_me(
          preferences=current_user.preferences
     )
 
-# TODO: Add PUT /me endpoint if needed for profile updates (similar to original file)
 
 @router.post(
      "/refresh-token",
@@ -266,10 +258,6 @@ async def logout(
     and potentially clear any client-side storage (like cookies).
     """
     logger.info(f"User logged out: {current_user.username} (ID: {current_user.id})")
-
-    # Optional: Clear an HttpOnly cookie if the token was stored there
-    # response.delete_cookie(key="access_token", httponly=True, secure=True, samesite="lax")
-
     return {"message": "Successfully logged out"}
 
 
@@ -286,11 +274,11 @@ async def change_password(
     Allows the currently authenticated user to change their password
     after verifying their old password.
     """
-    db = get_db_manager()
+    db = get_db_manager() # Get manager instance
     logger.info(f"Password change attempt for user: {current_user.username}")
 
-    # Fetch the user data including the hashed password
-    user_in_db = await db.get_user(current_user.id) # Fetch full user data again
+    # Fetch the user data including the hashed password using manager instance
+    user_in_db = await db.get_user(current_user.id) # Call method on manager
     if not user_in_db or not hasattr(user_in_db, 'hashed_password'):
          logger.error(f"Could not retrieve hashed password for user {current_user.username} during password change.")
          raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify user data.")
@@ -303,8 +291,8 @@ async def change_password(
     # Hash the new password
     new_hashed_password = auth.get_password_hash(password_data.new_password)
 
-    # Update the user's password in the database
-    success = await db.update_user(current_user.id, {"hashed_password": new_hashed_password})
+    # Update the user's password in the database using manager instance
+    success = await db.update_user(current_user.id, {"hashed_password": new_hashed_password}) # Call method on manager
 
     if not success:
         logger.error(f"Failed to update password in database for user {current_user.username}.")
@@ -326,22 +314,9 @@ async def verify_token(
     Confirms that the provided access token is valid and the user is active.
     Useful for client-side checks upon application load.
     """
-    # If the dependency `get_current_active_user` runs successfully, the token is valid.
     logger.debug(f"Token verified successfully for user: {current_user.username}")
     return {
         "valid": True,
         "user_id": current_user.id,
         "username": current_user.username
     }
-
-# TODO: Add endpoint for Google Sign-In if needed, using auth.validate_google_id_token
-# Example:
-# @router.post("/google-login")
-# async def google_login(token_request: Dict[str, str]):
-#     google_token = token_request.get("google_id_token")
-#     if not google_token: raise HTTPException(...)
-#     payload = await auth.validate_google_id_token(google_token)
-#     email = payload.get("email")
-#     # Find or create user based on email
-#     # Generate JWT token for the user
-#     # Return LoginResponse

@@ -19,7 +19,7 @@ from memory_manager import get_memory_manager
 from memory_extractor import get_memory_extractor, MemoryCommand # Import MemoryCommand if extractor returns it
 # Corrected import from models - Removed CoreMemory, EventMemory, Added MemoryCategory
 from models import Memory, User, MemorySource, MemoryCategory # Import MemoryCategory from models
-from config import get_settings
+from config import settings
 
 # Logger configuration
 logger = logging.getLogger(__name__)

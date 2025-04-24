@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, create_model
 
 # --- Local Imports ---
 from auth import get_current_user # Needed for context in execute
-from config import get_settings
+from config import settings
 from database import get_db_manager # Needed for Memory/Cleanup tools
 from exceptions import FunctionCallError, DatabaseError, NotFoundException # Use custom exceptions
 from models import User, Memory, MemorySource, MemoryCategory # Import necessary models
@@ -123,7 +123,7 @@ class WeatherTool(Tool):
     @staticmethod
     async def execute(args: Dict[str, Any], user: User) -> Dict[str, Any]:
         """Fetches weather using an external API (mocked for now)."""
-        settings = get_settings()
+        
         location = args.get("location")
         units = args.get("units", "metric") # Default to Celsius
 

@@ -13,7 +13,7 @@ from collections import defaultdict
 from fastapi import Depends, HTTPException, Request, status
 
 # --- Local Imports ---
-from config import get_settings
+from config import settings
 from exceptions import RateLimitError # Assuming you have this custom exception defined
 from models import User # Needed for user identification
 from auth import get_current_active_user # Dependency to identify user
@@ -33,7 +33,7 @@ class RateLimiter:
     RATE_LIMIT_USER_WINDOW_SECONDS.
     """
     def __init__(self):
-        settings = get_settings()
+        
         # Load limits from existing settings in config.py
         self.max_requests = settings.RATE_LIMIT_USER_REQUESTS
         self.window_seconds = settings.RATE_LIMIT_USER_WINDOW_SECONDS
@@ -47,7 +47,7 @@ class RateLimiter:
         user: Annotated[User, Depends(get_current_active_user)] # Require authenticated user
     ):
         """Checks and updates rate limits for the identified user."""
-        settings = get_settings() # Get settings again in case needed
+         # Get settings again in case needed
         if not settings.RATE_LIMIT_ENABLED:
             logger.debug(f"Rate limit check skipped for user {user.id} (globally disabled).")
             return # Skip check if rate limiting is disabled

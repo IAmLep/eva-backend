@@ -21,7 +21,7 @@ from pydantic import AnyHttpUrl, BaseModel, EmailStr, Field, field_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from config import get_settings as get_base_settings
+from config import settings as get_base_settings
 
 # Logger configuration
 logger = logging.getLogger(__name__)
@@ -586,7 +586,7 @@ def require_feature(feature: Union[str, FeatureFlag]) -> Callable:
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            settings = get_settings()
+            
             
             if not settings.is_feature_enabled(feature):
                 feature_name = feature.value if isinstance(feature, FeatureFlag) else feature
@@ -599,7 +599,7 @@ def require_feature(feature: Union[str, FeatureFlag]) -> Callable:
         
         @wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-            settings = get_settings()
+            
             
             if not settings.is_feature_enabled(feature):
                 feature_name = feature.value if isinstance(feature, FeatureFlag) else feature
@@ -626,7 +626,7 @@ def get_gemini_config() -> LLMConfig:
     Returns:
         LLMConfig: Gemini API configuration
     """
-    settings = get_settings()
+    
     return settings.gemini_config
 
 
@@ -637,7 +637,7 @@ def get_firebase_config() -> ServiceConfig:
     Returns:
         ServiceConfig: Firebase configuration
     """
-    settings = get_settings()
+    
     return settings.firebase_config
 
 
@@ -648,7 +648,7 @@ def is_maintenance_mode() -> bool:
     Returns:
         bool: True if maintenance mode is enabled
     """
-    settings = get_settings()
+    
     return settings.is_maintenance_mode()
 
 
@@ -659,7 +659,7 @@ def has_dynamic_settings_changed() -> bool:
     Returns:
         bool: True if any settings have been overridden
     """
-    settings = get_settings()
+    
     
     # Check if any settings are overridden
     for name, field in settings._overrides.items():

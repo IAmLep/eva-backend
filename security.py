@@ -1,39 +1,45 @@
 """
 Security module for EVA backend.
 
-Handles API key authentication, scope checking, and potentially other
-security mechanisms like headers (CSP, HSTS).
+Handles API key authentication, Google ID‑token & internal JWT (HS256) bearer tokens,
+scope checking, and sets security headers (CSP, HSTS, etc.).
 """
 
 import logging
 import secrets
-import time
-import asyncio # Import asyncio
-from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Dict, List, Optional, Tuple, Union, Callable # Import Callable
+import asyncio
+from datetime import datetime, timezone
+from typing import Annotated, Any, Dict, List, Optional, Tuple, Union, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.security import APIKeyHeader, APIKeyQuery, OAuth2PasswordBearer
+from fastapi.security import (
+    APIKeyHeader,
+    APIKeyQuery,
+    HTTPBearer,
+    HTTPAuthorizationCredentials
+)
 from passlib.context import CryptContext
-from starlette.middleware.base import BaseHTTPMiddleware # Import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
-# --- Local Imports ---
-from config import get_settings
+import jwt
+from jwt import PyJWTError
+
+# Google ID‑token verification
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
+
+from config import settings
 from database import get_db_manager, DatabaseManager
 from exceptions import AuthenticationError, AuthorizationError
 from models import User, ApiKey, ApiKeyScope
 
-# --- Setup ---
 logger = logging.getLogger(__name__)
-API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
-API_KEY_QUERY = APIKeyQuery(name="api_key", auto_error=False)
-api_key_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# --- Security Configuration ---
+# --- Security Headers Middleware ---
 class SecurityConfig:
     def __init__(self):
-        self.settings = get_settings()
-        self.hsts_enabled = self.settings.is_production
+        self.settings = settings
+        self.hsts_enabled = getattr(self.settings, "is_production", False)
         self.hsts_max_age = 31536000
 
     def apply_security_headers(self, response: Response) -> None:
@@ -42,32 +48,48 @@ class SecurityConfig:
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         if self.hsts_enabled:
-            response.headers["Strict-Transport-Security"] = f"max-age={self.hsts_max_age}; includeSubDomains"
+            response.headers[
+                "Strict-Transport-Security"
+            ] = f"max-age={self.hsts_max_age}; includeSubDomains"
 
 _security_config: Optional[SecurityConfig] = None
 def get_security_config() -> SecurityConfig:
     global _security_config
-    if _security_config is None: _security_config = SecurityConfig()
+    if _security_config is None:
+        _security_config = SecurityConfig()
     return _security_config
 
-# --- API Key Management Logic ---
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        response = await call_next(request)
+        get_security_config().apply_security_headers(response)
+        return response
+
+def setup_security(app: FastAPI) -> None:
+    app.add_middleware(SecurityHeadersMiddleware)
+    logger.info("Security headers middleware applied.")
+
+# --- API Key Scheme ---
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+API_KEY_QUERY = APIKeyQuery(name="api_key", auto_error=False)
+api_key_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 class APIKeyManager:
     PREFIX_LENGTH = 8
     SECRET_LENGTH = 32
 
-    def generate_api_key(self) -> Tuple[str, str, str]: # Added prefix return
+    def generate_api_key(self) -> Tuple[str, str, str]:
         prefix = secrets.token_urlsafe(self.PREFIX_LENGTH)
         secret_part = secrets.token_urlsafe(self.SECRET_LENGTH)
         full_key = f"{prefix}_{secret_part}"
-        hashed_key = self.hash_api_key(full_key)
-        return full_key, hashed_key, prefix # Return prefix
-
-    def hash_api_key(self, key: str) -> str:
-        return api_key_context.hash(key)
+        hashed_key = api_key_context.hash(full_key)
+        return full_key, hashed_key, prefix
 
     def verify_api_key(self, plain_key: str, hashed_key: str) -> bool:
-        try: return api_key_context.verify(plain_key, hashed_key)
-        except Exception: return False # Logged below
+        try:
+            return api_key_context.verify(plain_key, hashed_key)
+        except Exception:
+            return False
 
     def validate_api_key_format(self, key: str) -> bool:
         parts = key.split('_')
@@ -76,10 +98,10 @@ class APIKeyManager:
 _api_key_manager: Optional[APIKeyManager] = None
 def get_api_key_manager() -> APIKeyManager:
     global _api_key_manager
-    if _api_key_manager is None: _api_key_manager = APIKeyManager()
+    if _api_key_manager is None:
+        _api_key_manager = APIKeyManager()
     return _api_key_manager
 
-# --- Authentication Dependencies ---
 async def get_api_key(
     api_key_query: Annotated[Optional[str], Depends(API_KEY_QUERY)] = None,
     api_key_header: Annotated[Optional[str], Depends(API_KEY_HEADER)] = None,
@@ -87,91 +109,118 @@ async def get_api_key(
     return api_key_header or api_key_query
 
 async def validate_api_key(
-    request: Request, # Inject request to store state
-    api_key: Annotated[Optional[str], Depends(get_api_key)] = None,
+    request: Request,
+    api_key: Annotated[str, Depends(get_api_key)],
     db: DatabaseManager = Depends(get_db_manager),
     key_manager: APIKeyManager = Depends(get_api_key_manager)
 ) -> User:
-    """
-    Validates API key using prefix lookup and hash verification.
-    Stores validated ApiKey object in request.state.
-    """
-    if not api_key: raise AuthenticationError(detail="API key required")
+    if not api_key:
+        raise AuthenticationError(detail="API key required")
+
     if not key_manager.validate_api_key_format(api_key):
         raise AuthenticationError(detail="Invalid API key format")
 
-    prefix = api_key.split('_')[0]
-    potential_keys = await db.get_api_keys_by_prefix(prefix) # Requires DB implementation
-
-    validated_key_data: Optional[ApiKey] = None
-    for key_data in potential_keys:
+    prefix = api_key.split('_', 1)[0]
+    candidates = await db.get_api_keys_by_prefix(prefix)
+    validated: Optional[ApiKey] = None
+    for key_data in candidates:
         if key_manager.verify_api_key(api_key, key_data.hashed_key):
-            validated_key_data = key_data
-            break # Found matching key
+            validated = key_data
+            break
 
-    if not validated_key_data:
-        logger.warning(f"API key validation failed: No key found matching prefix '{prefix}' and provided secret.")
-        raise AuthenticationError(detail="Invalid API key") # Keep error generic
+    if not validated:
+        logger.warning("API key authentication failed for prefix %s", prefix)
+        raise AuthenticationError(detail="Invalid API key")
 
-    # --- Key Found - Perform Checks ---
-    if not validated_key_data.is_active:
-        raise AuthenticationError(detail="API key is inactive")
-    if validated_key_data.expires_at and validated_key_data.expires_at < datetime.now(timezone.utc):
-        raise AuthenticationError(detail="API key has expired")
+    if not validated.is_active or (validated.expires_at and validated.expires_at < datetime.now(timezone.utc)):
+        raise AuthenticationError(detail="API key inactive or expired")
 
-    # --- Fetch Associated User ---
-    user = await db.get_user(validated_key_data.user_id)
-    if not user: raise AuthenticationError(detail="User for API key not found")
-    if user.disabled: raise AuthenticationError(detail="User account is disabled")
+    user = await db.get_user(validated.user_id)
+    if not user or user.disabled:
+        raise AuthenticationError(detail="User not found or disabled")
 
-    # --- Store validated key in request state for scope checking ---
-    request.state.validated_api_key = validated_key_data
+    request.state.validated_api_key = validated
+    # update last used asynchronously
+    asyncio.create_task(db.update_api_key_usage(validated.key_id))
 
-    # --- Update Last Used Timestamp ---
-    asyncio.create_task(db.update_api_key_usage(validated_key_data.key_id))
-
-    logger.info(f"API key validated successfully for user {user.id} (Key ID: {validated_key_data.key_id})")
     return user
 
-# --- Authorization Dependency ---
-def require_api_scope(required_scope: Union[ApiKeyScope, str]):
-    async def dependency(
-        request: Request, # Inject request to access state
-        current_user: Annotated[User, Depends(validate_api_key)] # Ensures API key is validated first
-    ) -> None:
-        """Checks if the validated API key (from request.state) has the required scope."""
-        validated_key_data: Optional[ApiKey] = getattr(request.state, "validated_api_key", None)
+# --- Bearer Token Scheme (HS256 or Google ID‑token RS256) ---
+bearer_scheme = HTTPBearer(auto_error=False)
 
-        if not validated_key_data:
-            logger.error("Could not find validated API key data in request state for scope check.")
-            # This indicates an internal logic error if validate_api_key ran successfully
-            raise AuthorizationError(detail="Internal error checking API key scope")
+def verify_token(token: str) -> Dict[str, Any]:
+    # Try internal HS256 first
+    try:
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            audience=getattr(settings, "API_AUDIENCE", None),
+        )
+        logger.debug("Internal JWT validated")
+        return payload
+    except PyJWTError as e:
+        logger.debug("HS256 decode failed (%s), trying Google ID‑token", e)
 
-        try:
-            required_scope_enum = ApiKeyScope(required_scope) if isinstance(required_scope, str) else required_scope
-        except ValueError:
-             raise AuthorizationError(detail=f"Invalid scope required: {required_scope}")
+    # Fallback to Google ID‑token (RS256)
+    try:
+        req = google_requests.Request()
+        aud = settings.BACKEND_URL.rstrip('/')
+        payload = google_id_token.verify_oauth2_token(token, req, aud)
+        logger.debug("Google ID‑token validated for aud=%s", aud)
+        return payload
+    except Exception as e:
+        logger.warning("Google ID‑token validation failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-        # Check if the required scope (or admin scope) is present
-        has_scope = required_scope_enum in validated_key_data.scopes or ApiKeyScope.ADMIN in validated_key_data.scopes
+async def validate_bearer(
+    request: Request,
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)]
+) -> User:
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Bearer token missing",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-        if not has_scope:
-            logger.warning(f"Authorization failed: User {current_user.id} (Key {validated_key_data.key_id}) missing scope '{required_scope_enum.value}'.")
-            raise AuthorizationError(detail=f"Requires scope: {required_scope_enum.value}")
-        else:
-             logger.debug(f"Scope '{required_scope_enum.value}' authorized for user {current_user.id} (Key {validated_key_data.key_id}).")
+    data = verify_token(credentials.credentials)
+    # determine user identity from payload
+    user_id = data.get("sub") or data.get("user_id") or data.get("email")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing subject",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    return dependency
+    # load your User by ID or email
+    try:
+        user = User.get_by_id_or_email(user_id)
+    except Exception:
+        logger.exception("User lookup failed")
+        raise HTTPException(status_code=401, detail="Invalid user")
 
-# --- Security Middleware ---
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-         response = await call_next(request)
-         sec_config = get_security_config()
-         sec_config.apply_security_headers(response)
-         return response
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User is inactive")
 
-# --- Setup Function ---
-def setup_security(app: FastAPI) -> None:
-    app.add_middleware(SecurityHeadersMiddleware)
-    logger.info("Security headers middleware applied.")
+    return user
+
+# --- Combined Dependency ###
+async def get_current_user(
+    request: Request,
+    api_user: Optional[User] = Depends(validate_api_key),
+    bearer_user: Optional[User] = Depends(validate_bearer),
+) -> User:
+    """
+    Try API key first; if that fails, try bearer token.
+    """
+    # FastAPI will run both dependencies. If API key is valid, return that user.
+    if api_user:
+        return api_user
+    # otherwise fallback to bearer_user
+    return bearer_user

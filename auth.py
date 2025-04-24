@@ -8,14 +8,14 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 # Local imports
-from config import get_settings
+from config import settings
 # Corrected: Import the manager getter, not the specific function
 from database import get_db_manager
 from models import TokenData, User, UserInDB # Keep UserInDB
 from exceptions import DatabaseError, NotFoundException # Keep NotFoundException
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
+
 
 # --- Security Setup ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

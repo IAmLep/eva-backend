@@ -10,12 +10,12 @@ import os
 from pythonjsonlogger import jsonlogger # pip install python-json-logger
 
 # --- Local Imports ---
-from config import get_settings
+from config import settings
 
 # --- Configuration ---
 def configure_logging():
     """Configures the root logger based on application settings."""
-    settings = get_settings()
+    
     log_level_str = settings.LOG_LEVEL.upper()
     log_level = getattr(logging, log_level_str, logging.INFO) # Default to INFO if invalid
 

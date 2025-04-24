@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 # --- Local Imports ---
 from cache_manager import cached
-from config import get_settings
+from config import settings
 from exceptions import LLMServiceError, RateLimitError, AuthenticationError, ConfigurationError
 from models import Memory # Keep Memory import if used elsewhere, maybe not needed directly here
 
@@ -89,7 +89,7 @@ class GeminiService:
 
     def __init__(self):
         """Initialize Gemini service using settings."""
-        self.settings = get_settings()
+        self.settings = settings
         self.api_key = self.settings.GEMINI_API_KEY
         self.model_name = self.settings.GEMINI_MODEL
 

@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 # --- Local Imports ---
 from auth import get_current_user # Removed validate_request_auth as it wasn't used
-from config import get_settings
+from config import settings
 from conversation_handler import ConversationHandler
 from llm_service import transcribe_audio, generate_voice_response # Keep direct audio functions for now
 from models import User

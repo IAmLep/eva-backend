@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field, field_validator
 
 # --- Local Imports ---
-from config import get_settings
+from config import settings
 from llm_service import GeminiService
 from models import MemorySource, MemoryCategory
 from utils import parse_datetime_from_text
@@ -55,7 +55,7 @@ class MemoryCommand(BaseModel):
 
 class MemoryExtractor:
     def __init__(self):
-        self.settings = get_settings()
+        self.settings = settings
         self.gemini_service = GeminiService()
 
     async def extract_memory_command(self, text: str) -> Optional[MemoryCommand]:

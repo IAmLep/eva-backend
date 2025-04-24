@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 
 # --- Local Imports ---
-from config import get_settings
+from config import settings
 # Import specific types from memory_manager
 from memory_manager import get_memory_manager, MemoryType, MemoryCategory
 from models import User, Memory, Conversation # Import relevant models
@@ -66,7 +66,7 @@ class ContextWindow:
 
     def __init__(self):
         """Initialize context window manager using settings."""
-        self.settings = get_settings()
+        self.settings = settings
         self.max_tokens = self.settings.CONTEXT_MAX_TOKENS
         self.summarize_after_turns = self.settings.SUMMARIZE_AFTER_TURNS
         self.keep_recent_messages = 5 # Always keep at least N recent messages

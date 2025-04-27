@@ -20,7 +20,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Determine which .env file to load ---
-APP_ENV = os.getenv("APP_ENV", "development").lower()
+# support either APP_ENV or ENVIRONMENT env var, defaulting to "development"
+APP_ENV = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "development")).lower()
 logger.info(f"Application environment detected: {APP_ENV}")
 
 env_file = f".env.{APP_ENV}" if APP_ENV != "production" else ".env"
@@ -71,7 +72,10 @@ class Settings(BaseSettings):
     # --- Database / LLM / Rate Limiting / WebSockets / Caching ---
     FIREBASE_PROJECT_ID: Optional[str] = None
     FIREBASE_CREDENTIALS_PATH: Optional[str] = "/app/secrets/firebase-credentials.json"
-    USE_GCP_DEFAULT_CREDENTIALS: bool = False
+    USE_GCP_DEFAULT_CREDENTIALS: bool = Field(
+        default=False,
+        description="Use GCP default credentials when true"
+    )
     LLM_PROVIDER: str = Field(default="gemini")
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_MODEL: str = Field(default="gemini-1.5-flash-latest")
@@ -116,5 +120,5 @@ def get_settings() -> Settings:
     logger.info(f"Settings loaded: ENV={s.APP_ENV}, BACKEND_URL={s.BACKEND_URL}")
     return s
 
-# Module‐level singleton for easy import
+# Module‑level singleton for easy import
 settings = get_settings()

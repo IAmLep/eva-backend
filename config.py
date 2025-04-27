@@ -1,86 +1,120 @@
 """
-Application Configuration using Pydantic Settings.
+Configuration Management for EVA Backend.
 
-Loads configuration from environment variables and optional .env files.
-Provides a centralized Settings object for the application.
+Loads settings from environment variables and .env files using pydantic‑settings.
+Provides a centralized way to access configuration values throughout the application.
 """
-import os
 import logging
-from pathlib import Path
+import os
+from functools import lru_cache
 from typing import List, Optional
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from exceptions import ConfigurationError
 
+# --- Logger Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# --- .env File Detection ---
-PRIMARY_ENV_FILE = Path(__file__).parent / ".env"
-SECONDARY_ENV_FILE = "project.env"
+# --- Determine which .env file to load ---
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+logger.info(f"Application environment detected: {APP_ENV}")
 
-env_files = []
-if PRIMARY_ENV_FILE.is_file():
-    env_files.append(str(PRIMARY_ENV_FILE))
-    logger.info(f"Found primary .env file: {PRIMARY_ENV_FILE}")
+env_file = f".env.{APP_ENV}" if APP_ENV != "production" else ".env"
+if not os.path.exists(env_file) and APP_ENV != "production":
+    logger.warning(f"Environment file '{env_file}' not found. Trying default '.env'.")
+    env_file = ".env"
+if os.path.exists(env_file):
+    logger.info(f"Loading settings from environment file: {env_file}")
 else:
-    logger.warning(f"Primary .env file not found at: {PRIMARY_ENV_FILE}")
+    logger.warning(f"Environment file '{env_file}' not found. Relying solely on environment variables.")
+    env_file = None
 
-# Always include secondary (pydantic will ignore if missing)
-env_files.append(SECONDARY_ENV_FILE)
-
-# --- Settings Model ---
 class Settings(BaseSettings):
+    """Defines application settings, loaded from environment variables and .env files."""
+    # --- Core Application Settings ---
+    APP_NAME: str = "EVA Backend"
+    APP_VERSION: str = "0.1.0"
+    APP_ENV: str = Field(default=APP_ENV)
+    DEBUG: bool = Field(default=False)
+    LOG_LEVEL: str = Field(default="INFO")
+    API_TITLE: str = Field(default="EVA API")
+    API_DESCRIPTION: str = Field(default="Backend services for the EVA project")
+    API_VERSION: str = Field(default="0.1.0")
+
+    # --- API / Server Settings ---
+    API_V1_STR: str = "/api/v1"
+    PROJECT_NAME: str = Field(default="EVA Backend")
+    HOST: str = Field(default="0.0.0.0")
+    PORT: int = Field(default=8080)
+
+    # --- Security & Auth Settings ---
+    SECRET_KEY: str = Field(..., description="Secret key for internal JWT")
+    ALGORITHM: str = Field(default="HS256", description="JWT signing algorithm")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60 * 24 * 7, description="Token expiry (minutes)")
+    BACKEND_URL: Optional[str] = Field(
+        default=None,
+        description="Cloud Run service URL, used as audience for Google ID‑tokens."
+    )
+    API_AUDIENCE: Optional[str] = Field(default=None, description="HS256 token audience (if any)")
+    is_production: bool = Field(default=False, description="Enable production-only features (HSTS)")
+
+    # --- CORS Settings ---
+    CORS_ORIGINS: str = Field(default="*", description="Comma-separated CORS origins")
+    CORS_ALLOW_CREDENTIALS: bool = Field(default=True)
+    CORS_ALLOW_METHODS: List[str] = Field(default=["*"])
+    CORS_ALLOW_HEADERS: List[str] = Field(default=["*"])
+
+    # --- Database / LLM / Rate Limiting / WebSockets / Caching ---
+    FIREBASE_PROJECT_ID: Optional[str] = None
+    FIREBASE_CREDENTIALS_PATH: Optional[str] = "/app/secrets/firebase-credentials.json"
+    USE_GCP_DEFAULT_CREDENTIALS: bool = False
+    LLM_PROVIDER: str = Field(default="gemini")
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = Field(default="gemini-1.5-flash-latest")
+    LLM_TEMPERATURE: float = Field(default=0.7)
+    LLM_MAX_TOKENS: int = Field(default=2048)
+    RATE_LIMIT_USER_REQUESTS: int = Field(default=100)
+    RATE_LIMIT_USER_WINDOW_SECONDS: int = Field(default=60)
+    RATE_LIMIT_GLOBAL_REQUESTS: int = Field(default=1000)
+    RATE_LIMIT_GLOBAL_WINDOW_SECONDS: int = Field(default=60)
+    RATE_LIMIT_ENABLED: bool = Field(default=True)
+    WEBSOCKET_MAX_QUEUE_SIZE: int = Field(default=10)
+    WEBSOCKET_TIMEOUT_SECONDS: int = Field(default=600)
+    MEMORY_DEFAULT_RETENTION_DAYS: Optional[int] = Field(default=None)
+    MEMORY_SUMMARY_THRESHOLD: int = Field(default=10)
+    MEMORY_SEARCH_LIMIT: int = Field(default=10)
+    CACHE_ENABLED: bool = Field(default=True)
+    CACHE_DEFAULT_TTL_SECONDS: int = Field(default=300)
+
+    # --- Pydantic Settings Configuration ---
     model_config = SettingsConfigDict(
-        env_file=tuple(env_files),
+        env_file=env_file,
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
     )
 
-    # — Application Info —
-    PROJECT_NAME: str = "EVA Backend"
-    API_TITLE: str = "EVA API"
-    API_DESCRIPTION: str = "Backend services for the EVA project."
-    API_VERSION: str = "0.1.0"
+@lru_cache()
+def get_settings() -> Settings:
+    """Return a cached Settings instance, applying sane defaults if needed."""
+    try:
+        s = Settings()
+    except Exception as e:
+        logger.error("Failed to load application settings", exc_info=e)
+        raise
 
-    # — Server & Debug —
-    HOST: str = "0.0.0.0"
-    PORT: int = 8080
-    DEBUG: bool = False
-    LOG_LEVEL: str = "INFO"
+    if not s.BACKEND_URL:
+        # Default Cloud Run URL for local/dev
+        default_url = f"http://{s.HOST}:{s.PORT}"
+        logger.warning(f"BACKEND_URL not set; defaulting to {default_url}")
+        s.BACKEND_URL = default_url
 
-    # — Production Flag (for security.py) —
-    is_production: bool = False
+    logger.info(f"Settings loaded: ENV={s.APP_ENV}, BACKEND_URL={s.BACKEND_URL}")
+    return s
 
-    # — Firebase / Firestore —
-    PROJECT_ID: str = "default-project-id"
-    FIREBASE_PROJECT_ID: str = "default-firebase-project-id"
-    USE_GCP_DEFAULT_CREDENTIALS: bool = True
-    FIREBASE_CREDENTIALS_PATH: Optional[str] = None
-
-    # — External API Keys —
-    GEMINI_API_KEY: Optional[str] = None
-
-    # — Rate Limiting —
-    RATE_LIMIT_ENABLED: bool = True
-    RATE_LIMIT_USER_REQUESTS: int = 100
-    RATE_LIMIT_USER_WINDOW_SECONDS: int = 60
-
-    # — CORS —
-    CORS_ORIGINS: str = "*"  
-    CORS_ALLOW_CREDENTIALS: bool = True
-    CORS_ALLOW_METHODS: List[str] = ["*"]
-    CORS_ALLOW_HEADERS: List[str] = ["*"]
-
-    # — Security / Auth —
-    SECRET_KEY: str = "replace_me_with_secure_key"
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-
-try:
-    settings = Settings()
-    logger.info("Configuration loaded successfully.")
-    logger.debug(f"Settings snapshot: {settings.dict()}")
-except Exception as e:
-    logger.exception("Failed to load configuration", exc_info=e)
-    raise ConfigurationError(f"Configuration loading failed: {e}") from e
+# Module‐level singleton for easy import
+settings = get_settings()

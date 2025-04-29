@@ -20,7 +20,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Determine which .env file to load ---
-# support either APP_ENV or ENVIRONMENT env var, defaulting to "development"
 APP_ENV = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "development")).lower()
 logger.info(f"Application environment detected: {APP_ENV}")
 
@@ -55,13 +54,19 @@ class Settings(BaseSettings):
     # --- Security & Auth Settings ---
     SECRET_KEY: str = Field(..., description="Secret key for internal JWT")
     ALGORITHM: str = Field(default="HS256", description="JWT signing algorithm")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60 * 24 * 7, description="Token expiry (minutes)")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(
+        default=60 * 24 * 7, description="Token expiry (minutes)"
+    )
     BACKEND_URL: Optional[str] = Field(
         default=None,
         description="Cloud Run service URL, used as audience for Google ID‑tokens."
     )
-    API_AUDIENCE: Optional[str] = Field(default=None, description="HS256 token audience (if any)")
-    is_production: bool = Field(default=False, description="Enable production-only features (HSTS)")
+    API_AUDIENCE: Optional[str] = Field(
+        default=None, description="HS256 token audience (if any)"
+    )
+    is_production: bool = Field(
+        default=False, description="Enable production-only features (HSTS)"
+    )
 
     # --- CORS Settings ---
     CORS_ORIGINS: str = Field(default="*", description="Comma-separated CORS origins")
@@ -81,6 +86,21 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = Field(default="gemini-1.5-flash-latest")
     LLM_TEMPERATURE: float = Field(default=0.7)
     LLM_MAX_TOKENS: int = Field(default=2048)
+
+    # --- Context Window / Summarization Settings ---
+    CONTEXT_MAX_TOKENS: int = Field(
+        default=2048,
+        description="Maximum tokens allowed in the LLM context window"
+    )
+    SUMMARIZE_AFTER_TURNS: int = Field(
+        default=10,
+        description="Number of user turns before triggering summarization"
+    )
+    MEMORY_REFRESH_BATCH_SIZE: int = Field(
+        default=5,
+        description="Number of memories to fetch on each refresh"
+    )
+
     RATE_LIMIT_USER_REQUESTS: int = Field(default=100)
     RATE_LIMIT_USER_WINDOW_SECONDS: int = Field(default=60)
     RATE_LIMIT_GLOBAL_REQUESTS: int = Field(default=1000)
@@ -112,7 +132,6 @@ def get_settings() -> Settings:
         raise
 
     if not s.BACKEND_URL:
-        # Default Cloud Run URL for local/dev
         default_url = f"http://{s.HOST}:{s.PORT}"
         logger.warning(f"BACKEND_URL not set; defaulting to {default_url}")
         s.BACKEND_URL = default_url

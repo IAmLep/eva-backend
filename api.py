@@ -7,14 +7,15 @@ WebSocket interactions are handled by websocket_manager.py.
 
 import asyncio
 import logging
+import uuid
 from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 # --- Local Imports ---
-from auth import get_current_active_user # Use standard auth dependency
-from conversation_handler import ConversationHandler # Import the handler
+from auth import get_current_active_user  # Use standard auth dependency
+from conversation_handler import ConversationHandler  # Import the handler
 from models import User
 # Import exceptions if needed for specific handling
 from exceptions import LLMServiceError, RateLimitError
@@ -29,33 +30,32 @@ logger = logging.getLogger(__name__)
 class ConversationRequest(BaseModel):
     """Request model for the REST conversation endpoint."""
     message: str
-    session_id: Optional[str] = None # Allow client to provide session ID if resuming
-    metadata: Optional[Dict[str, Any]] = None # Optional metadata
+    session_id: Optional[str] = None  # Allow client to provide session ID if resuming
+    metadata: Optional[Dict[str, Any]] = None  # Optional metadata
 
 class ConversationResponse(BaseModel):
     """Response model for the REST conversation endpoint."""
     response: str
     session_id: str
-    function_calls: Optional[List[Dict[str, Any]]] = None # Include if function call occurred
-    error: Optional[str] = None # Include errors if any
+    function_calls: Optional[List[Dict[str, Any]]] = None  # Include if function call occurred
+    error: Optional[str] = None  # Include errors if any
 
 # --- REST Endpoint ---
-
 @router.post(
-    "/", # Keep it at the root of the /api/v1/conversation prefix defined in main.py
+    "/",  # Keep it at the root of the /api/v1/conversation prefix defined in main.py
     response_model=ConversationResponse,
     summary="Send a message and get a response (non-streaming)"
 )
 async def post_conversation(
     request_body: ConversationRequest,
-    request: Request, # Inject request for logging/state if needed
+    request: Request,  # Inject request for logging/state if needed
     current_user: Annotated[User, Depends(get_current_active_user)]
 ) -> ConversationResponse:
     """
     Processes a single user message via the ConversationHandler and returns
     the complete response. This is a non-streaming endpoint.
     """
-    session_id = request_body.session_id or str(uuid.uuid4()) # Use provided or generate new
+    session_id = request_body.session_id or str(uuid.uuid4())  # Use provided or generate new
     handler = ConversationHandler(current_user, session_id)
     user_message = request_body.message
 
@@ -77,18 +77,23 @@ async def post_conversation(
                 # NOTE: In a REST context, we typically return the function call info
                 # and expect the client to make another request to execute it or provide results.
                 # We won't execute it automatically here.
-                logger.info(f"REST request (Session: {session_id}): Function call requested: {chunk['function_call']['name']}")
+                logger.info(
+                    f"REST request (Session: {session_id}): "
+                    f"Function call requested: {chunk['function_call']['name']}"
+                )
             elif "error" in chunk:
                 # Capture the first error encountered
                 if not error_message:
                     error_message = chunk["error"]
-                logger.error(f"REST request (Session: {session_id}): Error during processing: {chunk['error']}")
-                # Optionally break or continue collecting text? Let's break on first error.
-                break
+                logger.error(
+                    f"REST request (Session: {session_id}): "
+                    f"Error during processing: {chunk['error']}"
+                )
+                break  # Stop on first error
 
-            # Check if the chunk indicates the final response (even if error occurred)
+            # If this chunk is marked final, break out
             if chunk.get("is_final"):
-                break # Exit loop once final chunk is processed
+                break
 
     except (LLMServiceError, RateLimitError) as e:
         logger.error(f"REST request (Session: {session_id}): Service Error: {e}", exc_info=True)
@@ -99,20 +104,16 @@ async def post_conversation(
 
     # --- Construct Final Response ---
     if error_message:
-        # If an error occurred, prioritize returning the error
         return ConversationResponse(
-            response="", # No successful response text
+            response="",  # No successful response text
             session_id=session_id,
             error=error_message
         )
-    else:
-        # Return successful response, including any function calls requested
-        return ConversationResponse(
-            response=full_response_text,
-            session_id=session_id,
-            function_calls=function_calls_list if function_calls_list else None,
-            error=None
-        )
+    return ConversationResponse(
+        response=full_response_text,
+        session_id=session_id,
+        function_calls=function_calls_list or None,
+        error=None
+    )
 
-# Note: The WebSocket endpoint previously in this file is now removed,
-# as it's handled entirely by websocket_manager.py
+# Note: The WebSocket endpoint previously in this file has been moved to websocket_manager.py

@@ -33,6 +33,7 @@ Thumbs.db
 .coverage
 htmlcov/
 .mypy_cache/
+tests/__pycache__/
 
 # Firebase
 firebase-credentials.json

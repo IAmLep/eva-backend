@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from fastapi import FastAPI, Request, Response, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # --- Configuration and Core Components ---
@@ -142,16 +143,24 @@ app.include_router(secrets_router.router, prefix="/api/v1/secrets", tags=["Secre
 app.include_router(websocket_manager.router, prefix="/ws", tags=["WebSocket"])
 
 # --- Root and Health Check Endpoints ---
-@app.get("/", tags=["General"], summary="Root endpoint")
-async def root():
-    """Provides a simple welcome message."""
-    return {"message": f"Welcome to {settings.PROJECT_NAME} API v{settings.API_VERSION}"}
-
 @app.get("/health", tags=["General"], summary="Health check endpoint", status_code=status.HTTP_200_OK)
 async def health_check(request: Request):
     """Returns the status of the application."""
-    # In a real app, you might check db connections, etc.
     return {"status": "ok", "request_id": request.state.request_id}
+
+# --- Static Files (Frontend) ---
+# Mount frontend static files - must be after API routes so API paths take priority
+import os
+frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
+if os.path.isdir(frontend_dir):
+    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
+    logger.info(f"Frontend static files served from: {frontend_dir}")
+else:
+    logger.warning(f"Frontend directory not found at {frontend_dir}. Static files not served.")
+    @app.get("/", tags=["General"], summary="Root endpoint")
+    async def root():
+        """Provides a simple welcome message when frontend is not available."""
+        return {"message": f"Welcome to {settings.PROJECT_NAME} API v{settings.API_VERSION}"}
 
 # --- Main Execution ---
 # This block allows running the app directly with uvicorn for local development

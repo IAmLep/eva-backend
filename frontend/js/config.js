@@ -1,0 +1,28 @@
+/**
+ * EVA Frontend Configuration
+ *
+ * Firebase and backend configuration.
+ * Replace these values with your actual Firebase project config.
+ */
+
+// Firebase configuration - REPLACE with your Firebase project settings
+const firebaseConfig = {
+    apiKey: "YOUR_FIREBASE_API_KEY",
+    authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+    projectId: "YOUR_PROJECT_ID",
+    storageBucket: "YOUR_PROJECT_ID.appspot.com",
+    messagingSenderId: "YOUR_SENDER_ID",
+    appId: "YOUR_APP_ID"
+};
+
+// Backend API configuration
+const API_CONFIG = {
+    // Base URL for the backend API - update for production
+    baseUrl: window.location.hostname === 'localhost'
+        ? 'http://localhost:8080'
+        : window.location.origin,
+    apiVersion: '/api/v1',
+};
+
+// Initialize Firebase
+firebase.initializeApp(firebaseConfig);

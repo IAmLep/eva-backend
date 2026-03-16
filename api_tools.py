@@ -4,6 +4,16 @@ API Tools module for EVA backend.
 This module provides tools and utilities for function calling
 integration with Gemini API, allowing LLM to execute actions.
 Includes implementation for basic tools.
+
+=============================================================================
+EXPERIMENTAL — Partially Implemented
+=============================================================================
+This module defines the tool/function-calling framework (ToolFunction,
+ToolCall, execute_function_call). It is imported by conversation_handler.py
+when available, but is NOT fully wired into all code paths yet.
+The import in main.py is currently commented out. Kept because it provides
+the foundation for Phase 2 tool execution.
+=============================================================================
 """
 
 import inspect

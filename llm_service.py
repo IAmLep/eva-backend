@@ -1,11 +1,25 @@
 """
 LLM Service module for EVA backend.
 
-Integrates with the configured LLM provider (Gemini) for text generation,
-streaming responses, and potentially function calling. Handles API key
-configuration, error handling, and basic mocking.
+Provides an abstract LLMProvider interface and a concrete GeminiProvider
+implementation. Additional providers (OpenAI, Anthropic, etc.) can be
+added by subclassing LLMProvider.
+
+The get_llm_provider() factory function returns the active provider based
+on the LLM_PROVIDER setting in config.py (default: "gemini").
+
+=============================================================================
+PROVIDER ABSTRACTION
+=============================================================================
+To add a new LLM provider:
+  1. Create a class that extends LLMProvider (see below)
+  2. Implement generate_text() and stream_conversation()
+  3. Register it in _PROVIDER_REGISTRY at the bottom of this file
+  4. Set LLM_PROVIDER=<name> in your environment
+=============================================================================
 """
 
+import abc
 import asyncio
 import base64
 import json
@@ -17,15 +31,13 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union, Callable, AsyncGenerator
 
-import google.generativeai as genai
-from google.api_core.exceptions import GoogleAPIError, ResourceExhausted, PermissionDenied, Unauthenticated
 from pydantic import BaseModel, Field
 
 # --- Local Imports ---
 from cache_manager import cached
 from config import settings
 from exceptions import LLMServiceError, RateLimitError, AuthenticationError, ConfigurationError
-from models import Memory # Keep Memory import if used elsewhere, maybe not needed directly here
+from models import Memory
 
 # Corrected: Logger configuration should be defined BEFORE it's used below
 logger = logging.getLogger(__name__)
@@ -49,6 +61,16 @@ except ImportError:
         function: Dict[str, Any] # e.g., {"name": "...", "description": "..."}
         args: Dict[str, Any]
 
+
+# --- Gemini-specific imports (only needed by GeminiProvider) ---
+try:
+    import google.generativeai as genai
+    from google.api_core.exceptions import GoogleAPIError, ResourceExhausted, PermissionDenied, Unauthenticated
+    GEMINI_SDK_AVAILABLE = True
+except ImportError:
+    GEMINI_SDK_AVAILABLE = False
+    genai = None
+    logger.warning("google.generativeai SDK not installed. Gemini provider unavailable.")
 
 # --- Gemini API Type Imports ---
 # Consolidate type imports with fallbacks
@@ -79,13 +101,79 @@ class StreamProgress(BaseModel):
     token_count: int = 0
 
 
-class GeminiService:
+# =============================================================================
+# Abstract LLM Provider Interface
+# =============================================================================
+class LLMProvider(abc.ABC):
     """
-    Service for interacting with the Google Gemini API.
+    Abstract base class for LLM providers.
+
+    To swap LLM providers, implement this interface and register the new
+    provider in _PROVIDER_REGISTRY at the bottom of this file.
+    """
+
+    @abc.abstractmethod
+    async def generate_text(
+        self,
+        prompt: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Union[ToolFunction, Dict]]] = None,
+    ) -> Tuple[str, Dict[str, int], Optional[List[Dict]]]:
+        """
+        Generate text from a prompt.
+
+        Returns:
+            Tuple of (generated_text, token_info_dict, tool_calls_or_none)
+        """
+        ...
+
+    @abc.abstractmethod
+    async def stream_conversation(
+        self,
+        context: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Union[ToolFunction, Dict]]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream conversation response chunks.
+
+        Yields dicts with keys like "text", "function_call", "usage_metadata".
+        """
+        ...
+
+    @property
+    @abc.abstractmethod
+    def provider_name(self) -> str:
+        """Human-readable name of the provider (e.g. 'Gemini', 'OpenAI')."""
+        ...
+
+    @property
+    @abc.abstractmethod
+    def is_available(self) -> bool:
+        """Whether the provider is configured and ready to use."""
+        ...
+
+
+# =============================================================================
+# Gemini Provider Implementation
+# =============================================================================
+class GeminiProvider(LLMProvider):
+    """
+    LLM provider for Google Gemini API.
 
     Handles API key configuration, text generation, streaming,
     basic function calling setup, and error management.
     """
+
+    @property
+    def provider_name(self) -> str:
+        return "Gemini"
+
+    @property
+    def is_available(self) -> bool:
+        return not self.use_mock and self.client is not None
 
     def __init__(self):
         """Initialize Gemini service using settings."""
@@ -443,7 +531,7 @@ class GeminiService:
 
 
 # --- Helper Functions (Placeholders - Transcribe/Generate Voice) ---
-# These remain unchanged as they are placeholders outside the core GeminiService logic
+# These remain unchanged as they are placeholders outside the core provider logic
 
 async def transcribe_audio(audio_data: bytes) -> str:
     """
@@ -468,3 +556,40 @@ async def generate_voice_response(text: str) -> bytes:
     await asyncio.sleep(0.1) # Simulate processing time
     mock_audio = f"AUDIO_FOR:[{text}]".encode('utf-8') * 3
     return mock_audio
+
+
+# =============================================================================
+# Provider Registry and Factory
+# =============================================================================
+
+# Registry of available providers. Add new providers here.
+_PROVIDER_REGISTRY: Dict[str, type] = {
+    "gemini": GeminiProvider,
+}
+
+# Backward-compatible alias so existing code using GeminiService still works.
+GeminiService = GeminiProvider
+
+
+def get_llm_provider(provider_name: Optional[str] = None) -> LLMProvider:
+    """
+    Factory function that returns an LLM provider instance.
+
+    Args:
+        provider_name: Name of the provider (e.g. "gemini"). If None, uses
+                       the LLM_PROVIDER setting from config.py.
+
+    Returns:
+        An instance of the requested LLMProvider.
+
+    Raises:
+        ConfigurationError: If the requested provider is unknown.
+    """
+    name = (provider_name or settings.LLM_PROVIDER).lower()
+    provider_cls = _PROVIDER_REGISTRY.get(name)
+    if provider_cls is None:
+        available = ", ".join(_PROVIDER_REGISTRY.keys())
+        raise ConfigurationError(
+            f"Unknown LLM provider '{name}'. Available providers: {available}"
+        )
+    return provider_cls()

@@ -149,7 +149,16 @@ async def health_check(request: Request):
     return {"status": "ok", "request_id": request.state.request_id}
 
 # --- Static Files (Frontend) ---
-# Mount frontend static files - must be after API routes so API paths take priority
+# =============================================================================
+# TEMPORARY DEVELOPMENT SETUP
+# =============================================================================
+# Serving the frontend from FastAPI via StaticFiles is a convenience for local
+# development only. In production, the frontend should be deployed separately
+# via Firebase Hosting, and the backend (Cloud Run) should only serve the API.
+#
+# Do NOT rely on this mount for production deployments.
+# See README.md "Deployment" section for the intended architecture.
+# =============================================================================
 import os
 frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
 if os.path.isdir(frontend_dir):

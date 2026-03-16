@@ -4,6 +4,17 @@ Secrets Management Router for EVA backend.
 Provides endpoints for creating, retrieving, updating, and deleting
 secret categories and individual secrets (like API keys, passwords, etc.).
 Secrets are encrypted before storage.
+
+=============================================================================
+WARNING - ENCRYPTION IS CURRENTLY PLACEHOLDER ONLY
+=============================================================================
+The encrypt_data / decrypt_data functions in utils.py are NON-PRODUCTION
+placeholders. They do NOT provide real security. These endpoints will refuse
+to encrypt/decrypt when APP_ENV == "production".
+
+Before enabling in production, replace the encryption layer with a real
+implementation (e.g. cryptography.fernet or Google Cloud KMS).
+=============================================================================
 """
 
 import logging

@@ -63,10 +63,21 @@ eva-backend/
 ## Backend Modules
 
 ### Authentication (`auth.py`, `auth_router.py`, `firebase_auth.py`)
-- JWT token-based auth for API requests
-- Firebase Auth integration for Google sign-in
-- User registration and password management
-- Multi-method authentication (JWT, Firebase, Cloud Run headers)
+
+**Primary auth flow (Firebase → internal JWT):**
+1. Frontend: Google sign-in via Firebase Auth → Firebase ID token
+2. Backend: `POST /api/v1/auth/firebase` verifies the Firebase token (`firebase_auth.py`)
+3. Backend: Issues an internal HS256 JWT (`auth.py`)
+4. All subsequent API requests use the internal JWT as a Bearer token
+
+**Secondary / legacy auth paths (in `auth.py`):**
+- Cloud Run `X-Goog-Authenticated-User-Email` header (infrastructure-level)
+- Direct Google ID token RS256 verification (fallback)
+- Username/password login (development convenience, not primary for production)
+
+> **Note:** `security.py` contains legacy/unused duplicates of the auth functions.
+> All routers depend on `auth.py`'s `get_current_active_user()`. Do not use
+> `security.py` auth functions for new code.
 
 ### Conversation System (`conversation_handler.py`, `api.py`)
 - Processes user messages through the LLM
@@ -82,16 +93,20 @@ eva-backend/
 - Memory management endpoints (CRUD)
 
 ### Mode System (`modes.py`)
-- **Chat Mode**: Standard AI conversation with memory and tools
-- **Game Mode**: Interactive story/game experience (stub for future)
+- **Chat Mode**: Standard AI conversation with memory and tools *(active)*
+- **Game Mode**: Interactive story/game experience *(stub only — not yet implemented)*
 - Each mode has its own system prompt and features
 - Mode switching via API
+- `GameState` model is a scaffold for future use
 
 ### LLM Integration (`llm_service.py`)
-- Google Gemini API integration
+- **Abstract `LLMProvider` interface** for swapping AI providers
+- **`GeminiProvider`** implementation (Google Gemini API)
 - Streaming response support
 - Function/tool calling
 - Mock mode for development without API key
+- Factory function `get_llm_provider()` selects provider via `LLM_PROVIDER` setting
+- To add a new provider: subclass `LLMProvider`, register in `_PROVIDER_REGISTRY`
 
 ### Tool System (`api_tools.py`)
 - Extensible tool framework
@@ -163,6 +178,7 @@ eva-backend/
 |----------|----------|---------|-------------|
 | `SECRET_KEY` | Yes | - | Secret key for JWT signing |
 | `GEMINI_API_KEY` | Yes* | - | Google Gemini API key (*mock mode if absent) |
+| `LLM_PROVIDER` | No | `gemini` | LLM provider name (currently only "gemini" supported) |
 | `APP_ENV` | No | `development` | Environment (development/staging/production) |
 | `PORT` | No | `8080` | Server port |
 | `FIREBASE_PROJECT_ID` | No | - | Firebase/GCP project ID |
@@ -260,26 +276,37 @@ pytest tests/ -v
      --set-env-vars "SECRET_KEY=your-secret,GEMINI_API_KEY=your-key"
    ```
 
-### Firebase Hosting (Frontend)
+### Firebase Hosting (Frontend — Production)
 
-For separate frontend hosting:
+In production, the frontend should be hosted separately via Firebase Hosting.
+The FastAPI backend's StaticFiles mount is for **local development only**.
 
 1. Install Firebase CLI: `npm install -g firebase-tools`
 2. Initialize: `firebase init hosting` (set `frontend/` as public directory)
 3. Deploy: `firebase deploy --only hosting`
+4. Update `frontend/js/config.js` to point `baseUrl` to your Cloud Run URL
 
 ## Development Phases
 
-### Phase 1 (Current) ✅
+### Phase 1 (Current) — In Progress
 - [x] Backend API with FastAPI
 - [x] Firebase Auth (Google login)
-- [x] Chat interface (web)
+- [x] Chat interface (web) — *served via FastAPI for dev; Firebase Hosting for prod*
 - [x] Conversation processing with Gemini
 - [x] Firestore conversation storage
 - [x] Memory system (detection + storage)
-- [x] Tool system (time, weather, memory)
-- [x] Mode switching architecture
+- [x] Tool system (time, weather, memory) — *experimental, partially wired*
+- [x] Mode switching architecture — *Chat active, Game is stub only*
 - [x] EVA personality/system prompt
+- [x] LLM provider abstraction (`LLMProvider` base class)
+
+> **Note on encryption:** The secrets management feature uses placeholder
+> encryption that is NOT safe for production. See `utils.py` and
+> `secrets_router.py` for details. Replace before deploying.
+
+> **Note on frontend serving:** The frontend is currently served by the
+> FastAPI backend (StaticFiles). In production, deploy via Firebase Hosting
+> separately.
 
 ### Phase 2 (Planned)
 - [ ] Game Mode implementation
@@ -287,6 +314,7 @@ For separate frontend hosting:
 - [ ] Memory management UI
 - [ ] Conversation history in sidebar
 - [ ] Enhanced emotional awareness
+- [ ] Real encryption for secrets (replace placeholder)
 
 ### Phase 3 (Future)
 - [ ] Live voice conversation
@@ -294,6 +322,29 @@ For separate frontend hosting:
 - [ ] Desktop application
 - [ ] Advanced game scenarios
 - [ ] Vector embeddings for memory search
+
+## Module Status
+
+| Module | Status | Notes |
+|--------|--------|-------|
+| `auth.py` | **Active** | Primary auth module for all routers |
+| `firebase_auth.py` | **Active** | Firebase token verification |
+| `auth_router.py` | **Active** | Login/register/Firebase endpoints |
+| `api.py` | **Active** | Conversation + modes endpoints |
+| `modes.py` | **Active** | Chat active; Game is stub only |
+| `database.py` | **Active** | Firestore + in-memory fallback |
+| `llm_service.py` | **Active** | LLMProvider abstraction + GeminiProvider |
+| `conversation_handler.py` | **Active** | Orchestrates LLM + memory + context |
+| `memory_manager.py` | **Active** | Memory CRUD operations |
+| `memory_extractor.py` | **Active** | Detects memories from conversation |
+| `config.py` | **Active** | Primary settings |
+| `security.py` | **Partial** | Middleware active; auth functions are legacy/unused |
+| `secrets_router.py` | **Experimental** | Uses placeholder encryption — not production-safe |
+| `utils.py` | **Active** | Date parsing active; encryption is placeholder |
+| `settings.py` | **Legacy** | Extended settings layer — not imported by core modules |
+| `api_sync.py` | **Legacy** | Sync endpoints for future mobile/offline support |
+| `api_tools.py` | **Experimental** | Tool framework — partially wired |
+| `websocket_manager.py` | **Experimental** | WebSocket endpoints — frontend uses REST instead |
 
 ## License
 

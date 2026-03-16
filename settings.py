@@ -4,6 +4,18 @@ Settings module for EVA backend.
 This module provides configuration utilities beyond what's in config.py,
 including environment-specific settings management and override capabilities.
 
+=============================================================================
+LEGACY / OPTIONAL — Extended Settings Layer
+=============================================================================
+This module wraps config.py with an ExtendedSettings class that adds
+feature flags, runtime overrides, and per-environment JSON config files.
+It is NOT imported by any core module (main.py, auth.py, api.py, etc.)
+and is therefore not required for the Phase 1 MVP. Kept because it may
+be useful in future phases.
+
+The primary settings used by the application come from config.py directly.
+=============================================================================
+
 Version 3 working
 """
 

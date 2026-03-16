@@ -3,6 +3,15 @@
  *
  * Firebase and backend configuration.
  * Replace these values with your actual Firebase project config.
+ *
+ * =========================================================================
+ * TEMPORARY DEVELOPMENT NOTE
+ * =========================================================================
+ * During development, this frontend is served directly by the FastAPI
+ * backend via StaticFiles. In production, this frontend will be deployed
+ * separately via Firebase Hosting, and the baseUrl below should point to
+ * the Cloud Run backend URL.
+ * =========================================================================
  */
 
 // Firebase configuration - REPLACE with your Firebase project settings

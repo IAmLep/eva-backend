@@ -3,6 +3,15 @@ API Sync Router for EVA backend.
 
 Provides endpoints for clients to synchronize data (primarily memories)
 with the server, supporting offline-first approaches.
+
+=============================================================================
+LEGACY / EXPERIMENTAL — Phase 2+
+=============================================================================
+This module provides sync endpoints for potential mobile/offline support.
+It is NOT required for the current Phase 1 MVP (web-only). The router is
+registered in main.py but the endpoints are not exercised by the frontend.
+Kept as-is because it is functional and harmless.
+=============================================================================
 """
 
 import asyncio # Import asyncio if needed for other async operations

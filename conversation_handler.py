@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 from context_window import get_context_window, ContextWindow
 from memory_manager import get_memory_manager, MemoryManager
 from memory_extractor import get_memory_extractor, MemoryExtractor, MemoryCommand
-from llm_service import GeminiService
+from llm_service import GeminiService, LLMProvider, get_llm_provider
 from models import User, MemoryCategory
 from exceptions import LLMServiceError, RateLimitError, FunctionCallError
 
@@ -55,7 +55,7 @@ class ConversationHandler:
         self.context_window: ContextWindow = get_context_window()
         self.memory_manager: MemoryManager = get_memory_manager()
         self.memory_extractor: MemoryExtractor = get_memory_extractor()
-        self.gemini_service: GeminiService = GeminiService()
+        self.gemini_service: LLMProvider = get_llm_provider()
         # Initialize history for the current processing turn (resets per message)
         self.current_history: List[Dict] = []
         logger.debug(f"ConversationHandler initialized for session {session_id}, user {user.id}")

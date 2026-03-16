@@ -58,6 +58,12 @@ acknowledge it naturally in conversation. The memory system will handle storing 
 You are designed to be a consistent companion across web, desktop, and mobile platforms.
 Your personality should feel natural and personal, like talking to a thoughtful friend."""
 
+# =============================================================================
+# GAME MODE SYSTEM PROMPT - STUB
+# =============================================================================
+# This prompt is defined for future use. Game Mode is NOT yet implemented.
+# The prompt will be used when Game Mode becomes available.
+# =============================================================================
 EVA_GAME_SYSTEM_PROMPT = """You are EVA, acting as a Game Master for an interactive story experience.
 
 In Game Mode, you:
@@ -85,10 +91,10 @@ CHAT_MODE_CONFIG = ModeConfig(
 GAME_MODE_CONFIG = ModeConfig(
     mode=AssistantMode.GAME,
     display_name="Game",
-    description="Interactive story and game experience with EVA as Game Master",
+    description="Interactive story and game experience with EVA as Game Master (not yet implemented — stub only)",
     system_prompt=EVA_GAME_SYSTEM_PROMPT,
     features=["narration", "game_state", "choices"],
-    is_available=False,  # Not yet implemented
+    is_available=False,  # STUB: Not yet implemented
 )
 
 # Registry of all modes
@@ -127,8 +133,14 @@ class GameState(BaseModel):
     Structured game state for Game Mode.
     Stored in Firestore, not sent to LLM.
     Only relevant portions are included in context.
-    
-    This is a stub for future implementation.
+
+    ==========================================================================
+    STUB — NOT YET IMPLEMENTED
+    ==========================================================================
+    This model defines the *planned* schema for game state. No backend logic
+    reads or writes GameState yet. It exists only as a scaffold so the data
+    model is ready when Game Mode is implemented in a future phase.
+    ==========================================================================
     """
     game_id: str
     user_id: str

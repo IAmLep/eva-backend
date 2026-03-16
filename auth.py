@@ -1,3 +1,29 @@
+"""
+Authentication module for EVA backend.
+
+=============================================================================
+AUTH FLOW (Primary)
+=============================================================================
+This is the ACTIVE authentication module used by all API routers.
+
+Intended auth flow:
+  1. Frontend: User signs in with Google via Firebase Auth
+  2. Frontend sends Firebase ID token to POST /api/v1/auth/firebase
+     (handled by firebase_auth.py + auth_router.py)
+  3. Backend verifies the Firebase token, creates/finds the user in
+     Firestore, and returns an internal HS256 JWT (created here)
+  4. All subsequent API requests include the HS256 JWT as a Bearer token
+  5. get_current_user() (below) validates the JWT on each request
+
+Legacy / secondary auth paths also handled here:
+  - Cloud Run X-Goog-Authenticated-User-Email header (for infra-level auth)
+  - Google ID token RS256 (direct Google token, fallback)
+  - Username/password login (for development; not primary for production)
+
+Note: security.py contains LEGACY duplicates of these functions that are
+NOT used by any router.
+=============================================================================
+"""
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
@@ -134,13 +160,22 @@ async def get_current_active_user(current_user: UserInDB = Depends(get_current_u
     """Returns the authenticated user (can add disabled checks here)."""
     return current_user
 
-# --- Placeholder for encryption key retrieval ---
+# --- Placeholder encryption key retrieval ---
+# =============================================================================
+# WARNING - NON-PRODUCTION PLACEHOLDER
+# =============================================================================
+# This derives a key from the user_id + SECRET_KEY using SHA-256.
+# This is NOT a secure key management strategy for production.
+# Replace with Google Cloud KMS, HashiCorp Vault, or similar before deploying.
+# =============================================================================
 async def get_user_encryption_key(user_id: str) -> bytes:
     """
-    Placeholder function to retrieve user-specific encryption key.
-    WARNING: Implement proper key management. This is NOT secure.
+    NON-PRODUCTION placeholder to derive a per-user encryption key.
+
+    TODO: Replace with proper key management (e.g. Google Cloud KMS envelope
+          encryption) before using the secrets feature in production.
     """
-    logger.warning("Using placeholder encryption key retrieval; implement secure KMS.")
+    logger.warning("Using placeholder encryption key derivation. NOT SECURE for production.")
     import hashlib
     material = f"{user_id}-{settings.SECRET_KEY}".encode()
     return hashlib.sha256(material).digest()

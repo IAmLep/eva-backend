@@ -1,8 +1,27 @@
 """
 Security module for EVA backend.
 
-Handles API key authentication, scope checking, and potentially other
-security mechanisms like headers (CSP, HSTS).
+Provides security headers middleware and API key validation utilities.
+
+=============================================================================
+AUTH NOTE - LEGACY AUTHENTICATION FUNCTIONS
+=============================================================================
+The verify_token(), validate_bearer(), and get_current_user() functions in
+this file are LEGACY / UNUSED duplicates of the primary auth in auth.py.
+
+The intended authentication flow for EVA is:
+  1. Frontend: Google sign-in via Firebase Auth (firebase_auth.py)
+  2. Frontend sends Firebase ID token to POST /api/v1/auth/firebase
+  3. Backend verifies token, returns internal HS256 JWT (auth.py)
+  4. All subsequent API calls use the internal JWT via auth.py's
+     get_current_user() / get_current_active_user()
+
+The functions below (verify_token, validate_bearer, get_current_user) are
+kept for reference but are NOT wired into any router. Do not add new
+dependencies on them. Use auth.py instead.
+
+The SecurityHeadersMiddleware and setup_security() ARE actively used.
+=============================================================================
 """
 import logging
 import secrets
@@ -30,11 +49,15 @@ settings = get_settings()
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 API_KEY_QUERY = APIKeyQuery(name="api_key", auto_error=False)
 
-# --- Bearer Token ---
+# --- LEGACY: Bearer Token Verification ---
+# These are NOT used by any router. auth.py's get_current_user is the
+# active auth dependency. Kept for reference only.
 bearer_scheme = HTTPBearer(auto_error=False)
 
 def verify_token(token: str) -> Dict[str, Any]:
     """
+    LEGACY - NOT USED. See auth.py for active token verification.
+
     Verifies the provided token using either HS256 (internal) or RS256 (Google ID token).
 
     Args:
@@ -81,6 +104,8 @@ async def validate_bearer(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)
 ) -> User:
     """
+    LEGACY - NOT USED. See auth.py for active bearer validation.
+
     Validates a bearer token and retrieves the associated user.
 
     Args:
@@ -107,12 +132,13 @@ async def validate_bearer(
 
     return user
 
-# --- Combined User Dependency ---
+# --- LEGACY: Combined User Dependency ---
 async def get_current_user(
     bearer_user: Optional[User] = Depends(validate_bearer),
 ) -> User:
     """
-    Retrieves the current user, validating their token.
+    LEGACY - NOT USED. See auth.py's get_current_user() for the active
+    auth dependency used by all routers.
 
     Args:
         bearer_user (Optional[User]): The bearer-authenticated user.

@@ -7,12 +7,15 @@ then send the Firebase ID token to the backend for verification.
 """
 
 import logging
+import uuid
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from config import settings
 from database import get_db_manager
 from models import User, UserInDB, UserRole
 from exceptions import AuthenticationError, DatabaseError
+from auth import get_password_hash
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +89,7 @@ async def get_or_create_firebase_user(decoded_token: Dict[str, Any]) -> UserInDB
             # Update metadata with latest Firebase info if needed
             updates = {
                 "metadata": {
-                    **existing_user.metadata,
+                    **(existing_user.metadata or {}),
                     "firebase_uid": firebase_uid,
                     "picture": picture,
                 },
@@ -113,10 +116,6 @@ async def get_or_create_firebase_user(decoded_token: Dict[str, Any]) -> UserInDB
         counter += 1
         if counter > 100:
             raise DatabaseError("Could not generate unique username")
-    
-    from datetime import datetime, timezone
-    import uuid
-    from auth import get_password_hash
     
     # Create a placeholder hashed password (user authenticates via Firebase, not password)
     placeholder_password = get_password_hash(str(uuid.uuid4()))

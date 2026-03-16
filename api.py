@@ -11,12 +11,13 @@ import uuid
 from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # --- Local Imports ---
 from auth import get_current_active_user  # Use standard auth dependency
 from conversation_handler import ConversationHandler  # Import the handler
 from models import User
+from modes import AssistantMode, get_available_modes, get_all_modes, get_system_prompt, ModeConfig
 # Import exceptions if needed for specific handling
 from exceptions import LLMServiceError, RateLimitError
 
@@ -31,14 +32,44 @@ class ConversationRequest(BaseModel):
     """Request model for the REST conversation endpoint."""
     message: str
     session_id: Optional[str] = None  # Allow client to provide session ID if resuming
+    mode: AssistantMode = Field(default=AssistantMode.CHAT, description="Interaction mode")
     metadata: Optional[Dict[str, Any]] = None  # Optional metadata
 
 class ConversationResponse(BaseModel):
     """Response model for the REST conversation endpoint."""
     response: str
     session_id: str
+    mode: AssistantMode = AssistantMode.CHAT
     function_calls: Optional[List[Dict[str, Any]]] = None  # Include if function call occurred
     error: Optional[str] = None  # Include errors if any
+
+class ModeResponse(BaseModel):
+    """Response model for available modes."""
+    mode: str
+    display_name: str
+    description: str
+    features: List[str]
+    is_available: bool
+
+# --- Modes Endpoint ---
+@router.get(
+    "/modes",
+    response_model=List[ModeResponse],
+    summary="Get available assistant modes"
+)
+async def get_modes() -> List[ModeResponse]:
+    """Returns all assistant modes with their availability status."""
+    modes = get_all_modes()
+    return [
+        ModeResponse(
+            mode=m.mode.value,
+            display_name=m.display_name,
+            description=m.description,
+            features=m.features,
+            is_available=m.is_available,
+        )
+        for m in modes
+    ]
 
 # --- REST Endpoint ---
 @router.post(
@@ -54,12 +85,14 @@ async def post_conversation(
     """
     Processes a single user message via the ConversationHandler and returns
     the complete response. This is a non-streaming endpoint.
+    Supports mode switching via the 'mode' field.
     """
     session_id = request_body.session_id or str(uuid.uuid4())  # Use provided or generate new
+    mode = request_body.mode
     handler = ConversationHandler(current_user, session_id)
     user_message = request_body.message
 
-    logger.info(f"REST request (Session: {session_id}): User {current_user.id} message: '{user_message[:50]}...'")
+    logger.info(f"REST request (Session: {session_id}, Mode: {mode.value}): User {current_user.id} message: '{user_message[:50]}...'")
 
     full_response_text = ""
     function_calls_list = []
@@ -74,9 +107,6 @@ async def post_conversation(
             elif "function_call" in chunk:
                 # Store function calls encountered
                 function_calls_list.append(chunk["function_call"])
-                # NOTE: In a REST context, we typically return the function call info
-                # and expect the client to make another request to execute it or provide results.
-                # We won't execute it automatically here.
                 logger.info(
                     f"REST request (Session: {session_id}): "
                     f"Function call requested: {chunk['function_call']['name']}"
@@ -107,11 +137,13 @@ async def post_conversation(
         return ConversationResponse(
             response="",  # No successful response text
             session_id=session_id,
+            mode=mode,
             error=error_message
         )
     return ConversationResponse(
         response=full_response_text,
         session_id=session_id,
+        mode=mode,
         function_calls=function_calls_list or None,
         error=None
     )

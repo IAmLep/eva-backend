@@ -25,6 +25,7 @@ from exceptions import AuthenticationError, AuthorizationError, DatabaseError, D
 from models import User, UserInDB, UserRole
 # Import Pydantic schemas used for request/response validation
 from schemas import UserCreate, UserResponse, Token # Use schemas defined there
+from firebase_auth import verify_firebase_token, get_or_create_firebase_user, FIREBASE_AUTH_AVAILABLE
 
 # --- Router Setup ---
 router = APIRouter()
@@ -41,6 +42,10 @@ class LoginResponse(BaseModel):
     token_type: str = "bearer"
     expires_at: datetime
     user: UserResponse # Include user details on login
+
+class FirebaseLoginRequest(BaseModel):
+    """Request model for Firebase/Google authentication."""
+    id_token: str = Field(..., description="Firebase ID token from client-side Google sign-in")
 
 class PasswordChangeRequest(BaseModel):
     """Request model for changing password."""
@@ -189,6 +194,63 @@ async def login_for_access_token(
     )
 
     # Return the combined LoginResponse
+    return LoginResponse(
+        access_token=access_token,
+        expires_at=expires_at,
+        user=user_response
+    )
+
+
+@router.post(
+    "/firebase",
+    response_model=LoginResponse,
+    summary="Authenticate with Firebase (Google sign-in)"
+)
+async def firebase_login(request_data: FirebaseLoginRequest) -> LoginResponse:
+    """
+    Authenticates a user using a Firebase ID token from Google sign-in.
+
+    - Verifies the Firebase ID token
+    - Gets or creates the user in the database
+    - Returns an internal JWT access token for subsequent API calls
+    """
+    logger.info("Firebase authentication attempt")
+
+    if not FIREBASE_AUTH_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Firebase authentication is not configured on this server"
+        )
+
+    # Verify the Firebase token
+    decoded_token = await verify_firebase_token(request_data.id_token)
+
+    # Get or create user from Firebase claims
+    user = await get_or_create_firebase_user(decoded_token)
+
+    # Create internal JWT token
+    from config import settings as app_settings
+    access_token_expires = timedelta(minutes=app_settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = auth.create_access_token(
+        data={"sub": user.username},
+        expires_delta=access_token_expires
+    )
+    expires_at = datetime.now(timezone.utc) + access_token_expires
+
+    logger.info(f"Firebase user '{user.email}' authenticated successfully.")
+
+    user_response = UserResponse(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        full_name=user.full_name,
+        created_at=user.created_at,
+        updated_at=user.updated_at,
+        is_active=not user.disabled,
+        role=user.role,
+        preferences=user.preferences
+    )
+
     return LoginResponse(
         access_token=access_token,
         expires_at=expires_at,

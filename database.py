@@ -491,16 +491,157 @@ class DatabaseManager:
         # identifying duplicates, keeping one, and deleting others.
         return 0
 
-    # --- Conversation Operations (Stubs - Implement as needed) ---
-    async def create_conversation(self, conversation: Conversation) -> bool:
-        logger.warning("create_conversation not implemented.")
-        return False
+    # --- Conversation Operations ---
+    async def create_conversation(self, conversation: Conversation) -> str:
+        """Create a new conversation record. Returns the conversation_id."""
+        conv_id = conversation.conversation_id
+        conv_data = conversation.model_dump(exclude={"conversation_id"}, exclude_none=True)
+        # Ensure datetime fields are serialized
+        for key in ("start_time", "last_updated"):
+            if key in conv_data and isinstance(conv_data[key], datetime):
+                conv_data[key] = conv_data[key].isoformat()
+        try:
+            if self.db:
+                doc_ref = self.db.collection("conversations").document(conv_id)
+                await asyncio.to_thread(doc_ref.set, conv_data)
+            else:
+                self.in_memory_db["conversations"][conv_id] = conv_data
+            logger.info(f"Created conversation {conv_id} for user {conversation.user_id}")
+            return conv_id
+        except Exception as e:
+            logger.error(f"Failed to create conversation {conv_id}: {e}", exc_info=True)
+            raise DatabaseError(f"Failed to create conversation: {e}")
+
     async def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        logger.warning("get_conversation not implemented.")
-        return None
+        """Retrieve a conversation by its ID."""
+        try:
+            if self.db:
+                doc_ref = self.db.collection("conversations").document(conversation_id)
+                doc = await asyncio.to_thread(doc_ref.get)
+                if doc.exists:
+                    data = doc.to_dict()
+                    data["conversation_id"] = doc.id
+                    return Conversation(**data)
+                return None
+            else:
+                data = self.in_memory_db["conversations"].get(conversation_id)
+                if data:
+                    data["conversation_id"] = conversation_id
+                    return Conversation(**data)
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving conversation {conversation_id}: {e}", exc_info=True)
+            return None
+
     async def update_conversation(self, conversation_id: str, updates: Dict[str, Any]) -> bool:
-        logger.warning("update_conversation not implemented.")
-        return False
+        """Update a conversation record."""
+        updates["last_updated"] = datetime.now(timezone.utc).isoformat()
+        try:
+            if self.db:
+                doc_ref = self.db.collection("conversations").document(conversation_id)
+                await asyncio.to_thread(doc_ref.update, updates)
+            else:
+                if conversation_id in self.in_memory_db["conversations"]:
+                    self.in_memory_db["conversations"][conversation_id].update(updates)
+                else:
+                    return False
+            return True
+        except Exception as e:
+            logger.error(f"Error updating conversation {conversation_id}: {e}", exc_info=True)
+            return False
+
+    async def get_user_conversations(self, user_id: str, limit: int = 50) -> List[Conversation]:
+        """Retrieve conversations for a user, ordered by last_updated descending."""
+        try:
+            if self.db:
+                if not FIRESTORE_FIELD_FILTER_AVAILABLE:
+                    return []
+                query = (
+                    self.db.collection("conversations")
+                    .where(filter=FieldFilter("user_id", "==", user_id))
+                    .order_by("last_updated", direction=FirestoreQuery.DESCENDING)
+                    .limit(limit)
+                )
+                results = await asyncio.to_thread(query.stream)
+                conversations = []
+                for doc in results:
+                    data = doc.to_dict()
+                    data["conversation_id"] = doc.id
+                    conversations.append(Conversation(**data))
+                return conversations
+            else:
+                convs = []
+                for conv_id, data in self.in_memory_db["conversations"].items():
+                    if data.get("user_id") == user_id:
+                        data_copy = {**data, "conversation_id": conv_id}
+                        convs.append(Conversation(**data_copy))
+                convs.sort(key=lambda c: c.last_updated, reverse=True)
+                return convs[:limit]
+        except Exception as e:
+            logger.error(f"Error retrieving conversations for user {user_id}: {e}", exc_info=True)
+            return []
+
+    async def add_message_to_conversation(
+        self, conversation_id: str, role: str, content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Add a message to a conversation's messages subcollection."""
+        message_id = str(uuid.uuid4())
+        message_data = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "metadata": metadata or {},
+        }
+        try:
+            if self.db:
+                doc_ref = (
+                    self.db.collection("conversations")
+                    .document(conversation_id)
+                    .collection("messages")
+                    .document(message_id)
+                )
+                await asyncio.to_thread(doc_ref.set, message_data)
+            else:
+                key = f"{conversation_id}_messages"
+                if key not in self.in_memory_db:
+                    self.in_memory_db[key] = {}
+                self.in_memory_db[key][message_id] = message_data
+            return True
+        except Exception as e:
+            logger.error(f"Error adding message to conversation {conversation_id}: {e}", exc_info=True)
+            return False
+
+    async def get_conversation_messages(
+        self, conversation_id: str, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Retrieve messages from a conversation, ordered by timestamp."""
+        try:
+            if self.db:
+                query = (
+                    self.db.collection("conversations")
+                    .document(conversation_id)
+                    .collection("messages")
+                    .order_by("timestamp")
+                    .limit(limit)
+                )
+                results = await asyncio.to_thread(query.stream)
+                messages = []
+                for doc in results:
+                    msg = doc.to_dict()
+                    msg["message_id"] = doc.id
+                    messages.append(msg)
+                return messages
+            else:
+                key = f"{conversation_id}_messages"
+                msgs = self.in_memory_db.get(key, {})
+                result = [
+                    {**v, "message_id": k} for k, v in msgs.items()
+                ]
+                result.sort(key=lambda m: m.get("timestamp", ""))
+                return result[:limit]
+        except Exception as e:
+            logger.error(f"Error retrieving messages for conversation {conversation_id}: {e}", exc_info=True)
+            return []
 
     # --- Sync Operations (Stubs - Implement as needed) ---
     async def get_sync_state(self, user_id: str, device_id: str) -> Optional[SyncState]:

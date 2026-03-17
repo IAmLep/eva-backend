@@ -6,6 +6,7 @@ and placeholder encryption/decryption functions.
 """
 
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Union
@@ -150,26 +151,60 @@ async def parse_datetime_from_text(text: str) -> Optional[datetime]:
 
 
 # --- Placeholder Encryption/Decryption ---
-# WARNING: These are NOT secure. Replace with a real cryptographic library like 'cryptography'.
+# =============================================================================
+# WARNING - NON-PRODUCTION PLACEHOLDER
+# =============================================================================
+# These functions provide NO real security. They exist only so the codebase
+# compiles and basic tests can run without a real cryptography backend.
+#
+# Before enabling real secret storage (secrets_router.py), replace these with
+# a proper implementation using the `cryptography` library (Fernet or AES-GCM)
+# or Google Cloud KMS.
+#
+# These functions will REFUSE to operate when APP_ENV == "production" to
+# prevent accidental use of fake encryption in a live environment.
+# =============================================================================
+
+_PLACEHOLDER_SUFFIX = b"_placeholder_not_encrypted"
+
+
+def _check_production_guard(operation: str) -> None:
+    """Raise an error if placeholder crypto is called in production."""
+    app_env = os.environ.get("APP_ENV", "development").lower()
+    if app_env == "production":
+        raise RuntimeError(
+            f"Placeholder {operation} cannot be used in production. "
+            "Implement real encryption (e.g. cryptography.fernet or Cloud KMS) "
+            "before deploying."
+        )
+
 
 def encrypt_data(data: bytes, key: bytes) -> bytes:
     """
-    Placeholder encryption function. Does NOT provide real security.
-    Reverses the data as a trivial example.
+    NON-PRODUCTION placeholder encryption. Does NOT provide real security.
+    Will raise RuntimeError if APP_ENV == 'production'.
+
+    TODO: Replace with cryptography.fernet.Fernet or Google Cloud KMS before
+          enabling the secrets feature in production.
     """
-    logger.warning("Using placeholder encryption. THIS IS NOT SECURE.")
-    # Example: Simple reverse (DO NOT USE IN PRODUCTION)
-    return data[::-1] + b"_placeholder" # Add suffix to distinguish
+    _check_production_guard("encryption")
+    logger.warning("Using placeholder encryption. THIS IS NOT SECURE. Do not use for real secrets.")
+    return data[::-1] + _PLACEHOLDER_SUFFIX
+
 
 def decrypt_data(encrypted_data: bytes, key: bytes) -> bytes:
     """
-    Placeholder decryption function. Only works with the placeholder encryption.
+    NON-PRODUCTION placeholder decryption. Only works with the placeholder above.
+    Will raise RuntimeError if APP_ENV == 'production'.
+
+    TODO: Replace with cryptography.fernet.Fernet or Google Cloud KMS before
+          enabling the secrets feature in production.
     """
-    logger.warning("Using placeholder decryption. THIS IS NOT SECURE.")
-    # Example: Reverse the reverse (DO NOT USE IN PRODUCTION)
-    if not encrypted_data.endswith(b"_placeholder"):
+    _check_production_guard("decryption")
+    logger.warning("Using placeholder decryption. THIS IS NOT SECURE. Do not use for real secrets.")
+    if not encrypted_data.endswith(_PLACEHOLDER_SUFFIX):
         raise ValueError("Data was not encrypted with the placeholder function.")
-    original_data = encrypted_data[:-len(b"_placeholder")]
+    original_data = encrypted_data[:-len(_PLACEHOLDER_SUFFIX)]
     return original_data[::-1]
 
 # --- Other Utilities ---

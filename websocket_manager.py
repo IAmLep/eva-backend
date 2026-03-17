@@ -4,6 +4,15 @@ WebSocket Manager for EVA backend.
 Handles real-time WebSocket connections for chat and audio streaming,
 integrating with ConversationHandler for processing and response generation,
 including handling the function calling loop.
+
+=============================================================================
+EXPERIMENTAL — Partially Implemented
+=============================================================================
+WebSocket chat (/ws/chat) and audio (/ws/audio) endpoints are registered
+in main.py and functional for basic streaming. However, the frontend
+currently uses the REST endpoint (POST /api/v1/conversation/) instead.
+WebSocket support is kept for future real-time/voice features in Phase 2+.
+=============================================================================
 """
 
 import asyncio

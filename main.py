@@ -25,7 +25,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from config import settings
 from database import get_db_manager
 from memory_manager import get_memory_manager
-from context_window import get_context_window
 from logging_config import configure_logging, get_logger, request_id_var
 from error_middleware import ErrorHandlerMiddleware
 from security import setup_security

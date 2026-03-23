@@ -63,3 +63,43 @@ class TestLLMProviderAbstraction:
         """LLMProvider should not be directly instantiatable."""
         with pytest.raises(TypeError):
             LLMProvider()
+
+
+class TestStreamConversationWithHistory:
+    """Tests for the stream_conversation_with_history method."""
+
+    def test_gemini_provider_has_stream_with_history_method(self):
+        """GeminiProvider must implement stream_conversation_with_history."""
+        provider = GeminiProvider()
+        assert hasattr(provider, "stream_conversation_with_history")
+        assert callable(provider.stream_conversation_with_history)
+
+    @pytest.mark.asyncio
+    async def test_stream_with_history_mock_yields_chunks(self):
+        """In mock mode, stream_conversation_with_history should yield text chunks."""
+        provider = GeminiProvider()
+        assert provider.use_mock is True  # no API key in test env
+
+        history = [
+            {"role": "user", "parts": [{"text": "Hello EVA"}]},
+        ]
+        chunks = []
+        async for chunk in provider.stream_conversation_with_history(history=history):
+            chunks.append(chunk)
+
+        assert len(chunks) > 0
+        # At least one chunk should contain text
+        text_chunks = [c for c in chunks if "text" in c]
+        assert len(text_chunks) > 0
+
+    @pytest.mark.asyncio
+    async def test_stream_with_history_empty_history_does_not_crash(self):
+        """stream_conversation_with_history should handle an empty history list gracefully."""
+        provider = GeminiProvider()
+        assert provider.use_mock is True
+
+        chunks = []
+        async for chunk in provider.stream_conversation_with_history(history=[]):
+            chunks.append(chunk)
+
+        assert len(chunks) > 0

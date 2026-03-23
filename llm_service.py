@@ -143,6 +143,25 @@ class LLMProvider(abc.ABC):
         """
         ...
 
+    @abc.abstractmethod
+    async def stream_conversation_with_history(
+        self,
+        history: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Union["ToolFunction", Dict]]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream a conversation response given a structured message history.
+
+        history: list of dicts in Gemini contents format, e.g.:
+            [{"role": "user", "parts": [{"text": "..."}]},
+             {"role": "model", "parts": [{"text": "..."}]}]
+
+        Yields dicts with keys: "text", "function_call", "usage_metadata".
+        """
+        ...
+
     @property
     @abc.abstractmethod
     def provider_name(self) -> str:
@@ -489,6 +508,102 @@ class GeminiProvider(LLMProvider):
              raise
         except Exception as e:
             logger.exception(f"Unexpected error during Gemini streaming: {e}", exc_info=True)
+            raise LLMServiceError(f"Unexpected error streaming conversation: {e}")
+
+    async def stream_conversation_with_history(
+        self,
+        history: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Union[ToolFunction, Dict]]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream conversation response chunks from Gemini using structured history.
+        history should be a list of content dicts in Gemini format:
+            [{"role": "user", "parts": [{"text": "..."}]}, ...]
+        """
+        if self.use_mock:
+            # Extract last user message text for mock context, fallback gracefully
+            mock_context = "conversation history"
+            for entry in reversed(history):
+                if entry.get("role") == "user":
+                    parts = entry.get("parts", [])
+                    if parts and isinstance(parts[0], dict):
+                        mock_context = parts[0].get("text", mock_context)
+                    break
+            mock_tools_list = []
+            if tools:
+                for t in tools:
+                    if isinstance(t, dict):
+                        mock_tools_list.append(t)
+                    elif hasattr(t, 'dict'):
+                        mock_tools_list.append(t.dict())
+            async for chunk in self._mock_stream_conversation(mock_context, mock_tools_list):
+                yield chunk
+            return
+
+        if not self.client:
+            raise ConfigurationError("Gemini client is not initialized. Check API key and configuration.")
+
+        generation_config = self._get_generation_config(temperature, max_tokens)
+        gemini_tools = self._prepare_tools(tools)
+
+        logger.debug(f"Streaming conversation (with history) using model {self.model_name}. History length: {len(history)}")
+        try:
+            config_arg = generation_config if not isinstance(generation_config, dict) else None
+            config_kwarg = generation_config if isinstance(generation_config, dict) else {}
+
+            stream = await asyncio.to_thread(
+                self.client.generate_content,
+                contents=history,
+                generation_config=config_arg,
+                tools=gemini_tools if gemini_tools else None,
+                stream=True,
+                **config_kwarg
+            )
+
+            async for chunk in stream:
+                if hasattr(chunk, 'prompt_feedback') and getattr(chunk.prompt_feedback, 'block_reason', None):
+                    block_reason = chunk.prompt_feedback.block_reason
+                    logger.error(f"Gemini stream blocked. Reason: {block_reason}")
+                    raise LLMServiceError(f"Content blocked by API: {block_reason}")
+
+                if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
+                    for part in chunk.candidates[0].content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            yield {"text": part.text}
+                        elif hasattr(part, 'function_call'):
+                            fc = part.function_call
+                            try:
+                                args_dict = dict(fc.args)
+                            except Exception as args_ex:
+                                logger.error(f"Could not convert streaming function call args to dict for {fc.name}. Error: {args_ex}")
+                                args_dict = {}
+                            yield {"function_call": {"name": fc.name, "args": args_dict}}
+
+                usage_metadata = getattr(chunk, 'usage_metadata', None)
+                if usage_metadata:
+                    token_info = {
+                        "input_tokens": usage_metadata.prompt_token_count,
+                        "output_tokens": usage_metadata.candidates_token_count,
+                        "total_tokens": usage_metadata.total_token_count
+                    }
+                    yield {"usage_metadata": token_info}
+
+        except (ResourceExhausted, GoogleAPIError) as e:
+            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                logger.warning(f"Gemini API rate limit exceeded during streaming (with history): {e}")
+                raise RateLimitError(f"Gemini API rate limit exceeded: {e}")
+            else:
+                logger.error(f"Gemini API error during streaming (with history): {e}", exc_info=True)
+                raise LLMServiceError(f"Gemini API streaming error: {e}")
+        except (PermissionDenied, Unauthenticated) as e:
+            logger.error(f"Gemini API authentication/permission error during streaming (with history): {e}", exc_info=True)
+            raise AuthenticationError(f"Gemini API authentication error: {e}")
+        except LLMServiceError:
+            raise
+        except Exception as e:
+            logger.exception(f"Unexpected error during Gemini streaming (with history): {e}", exc_info=True)
             raise LLMServiceError(f"Unexpected error streaming conversation: {e}")
 
     # --- Mock Methods ---

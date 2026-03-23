@@ -15,7 +15,7 @@ from typing import Dict, Any, Optional, Union, AsyncGenerator, List
 logger = logging.getLogger(__name__)
 
 # --- Local Imports ---
-from context_window import get_context_window, ContextWindow
+from context_window import ContextWindow
 from memory_manager import get_memory_manager, MemoryManager
 from memory_extractor import get_memory_extractor, MemoryExtractor, MemoryCommand
 from llm_service import GeminiService, LLMProvider, get_llm_provider
@@ -51,8 +51,8 @@ class ConversationHandler:
         """
         self.user = user
         self.session_id = session_id
-        # Get instances of dependencies (assumed to be singletons or managed elsewhere)
-        self.context_window: ContextWindow = get_context_window()
+        self.context_window: ContextWindow = ContextWindow()
+        # Get singleton instances of shared dependencies
         self.memory_manager: MemoryManager = get_memory_manager()
         self.memory_extractor: MemoryExtractor = get_memory_extractor()
         self.gemini_service: LLMProvider = get_llm_provider()

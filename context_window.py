@@ -291,14 +291,3 @@ class ContextWindow:
                 self.recent_messages.remove(rem)
             self._remove_item(rem)
         logger.debug(f"After prune: {self.current_token_count}/{self.max_tokens} tokens")
-
-
-# Singleton accessor
-_context_window: Optional[ContextWindow] = None
-
-def get_context_window() -> ContextWindow:
-    """Returns the singleton ContextWindow."""
-    global _context_window
-    if _context_window is None:
-        _context_window = ContextWindow()
-    return _context_window
